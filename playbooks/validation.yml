@@ -9,6 +9,10 @@
       when: validation.run_test_vm | d(true)
     - role: storage-benchmark
       when: validation.run_storage_benchmark | d(true)
+    - role: ldap_auth
+      when: validation.run_ldap_auth | d(false)
+      tags:
+        - ldap_auth
     - role: validation_frontend
 
 # Run connectivity tests between virtual machines

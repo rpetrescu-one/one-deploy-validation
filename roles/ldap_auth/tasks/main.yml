@@ -1,0 +1,407 @@
+---
+- name: Ensure LDAP auth validation variables are set with defaults
+  ansible.builtin.set_fact:
+    validation: >-
+      {{
+        validation | default({}) | combine({
+          'run_ldap_auth': validation.run_ldap_auth | default(false),
+          'ldap_auth': validation.ldap_auth | default({}) | combine({
+            'server': validation.ldap_auth.server | default('127.0.0.1'),
+            'port': validation.ldap_auth.port | default(389),
+            'base_dn': validation.ldap_auth.base_dn | default('dc=example,dc=com'),
+            'bind_dn': validation.ldap_auth.bind_dn | default(''),
+            'bind_pass': validation.ldap_auth.bind_pass | default(''),
+            'ldap_user': validation.ldap_auth.ldap_user | default(''),
+            'ldap_pass': validation.ldap_auth.ldap_pass | default(''),
+            'local_user': validation.ldap_auth.local_user | default('oneadmin'),
+            'local_auth_file': validation.ldap_auth.local_auth_file | default('/var/lib/one/.one/one_auth'),
+            'group_mapping': validation.ldap_auth.group_mapping | default({}) | combine({
+              'expected_group_name': validation.ldap_auth.group_mapping.expected_group_name | default(''),
+              'expected_group_id': validation.ldap_auth.group_mapping.expected_group_id | default(''),
+              'ldap_group_dn': validation.ldap_auth.group_mapping.ldap_group_dn | default(''),
+              'ldap_group_member_attr': validation.ldap_auth.group_mapping.ldap_group_member_attr | default('memberUid')
+            }, recursive=True),
+            'fireedge_host': validation.ldap_auth.fireedge_host | default(''),
+            'fireedge_port': validation.ldap_auth.fireedge_port | default(''),
+            'fireedge_proto': validation.ldap_auth.fireedge_proto | default('https'),
+            'fireedge_login_endpoint': validation.ldap_auth.fireedge_login_endpoint | default('/api/login'),
+            'fireedge_skip_tls_verify': validation.ldap_auth.fireedge_skip_tls_verify | default(true),
+            'rpc2_host': validation.ldap_auth.rpc2_host | default(''),
+            'rpc2_port': validation.ldap_auth.rpc2_port | default(''),
+            'rpc2_proto': validation.ldap_auth.rpc2_proto | default('http'),
+            'rpc2_path': validation.ldap_auth.rpc2_path | default('/RPC2'),
+            'rpc2_skip_tls_verify': validation.ldap_auth.rpc2_skip_tls_verify | default(true)
+          }, recursive=True)
+        }, recursive=True)
+      }}
+
+- name: LDAP authentication checks (primary frontend only)
+  when:
+    - validation.run_ldap_auth | d(false)
+    - hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host
+  block:
+    - name: Gather minimal facts for OS family
+      ansible.builtin.setup:
+        gather_subset:
+          - min
+
+    - name: Select LDAP client package list
+      ansible.builtin.set_fact:
+        _ldap_packages: >-
+          {{
+            (ansible_os_family == 'RedHat') | ternary(
+              ['openldap-clients', 'curl'],
+              ['ldap-utils', 'curl']
+            )
+          }}
+
+    - name: Install LDAP client dependencies
+      ansible.builtin.package:
+        name: "{{ _ldap_packages }}"
+        state: present
+
+    - name: Parse LDAP server host and port
+      ansible.builtin.set_fact:
+        _ldap_server: "{{ validation.ldap_auth.server | default('127.0.0.1') }}"
+        _ldap_host: "{{ (validation.ldap_auth.server | default('127.0.0.1')).split(':')[0] }}"
+        _ldap_port: >-
+          {{
+            ((validation.ldap_auth.server | default('127.0.0.1')).split(':') | length > 1)
+            | ternary((validation.ldap_auth.server | default('127.0.0.1')).split(':')[1], validation.ldap_auth.port | default(389))
+          }}
+
+    - name: Verify LDAP bind to server
+      ansible.builtin.shell: >
+        ldapsearch -x -H ldap://{{ _ldap_host }}:{{ _ldap_port }} -D "{{ validation.ldap_auth.bind_dn }}" -w "{{ validation.ldap_auth.bind_pass }}" -b "{{ validation.ldap_auth.base_dn }}" -s base "(objectClass=*)" -z 1
+      register: ldap_bind_check
+      no_log: true
+      changed_when: false
+      failed_when: ldap_bind_check.rc != 0
+
+    - name: Save LDAP bind result
+      ansible.builtin.set_fact:
+        verification_result: "{{ (verification_result | default({})) | combine({'LDAP bind to server': 'ok'}) }}"
+
+    - name: Verify OpenNebula LDAP auth driver is configured
+      ansible.builtin.shell: >
+        awk 'BEGIN{in_auth=0} /^AUTH_MAD/ {in_auth=1} in_auth && /AUTHN/ && /ldap/ {found=1} in_auth && /\]/ {if (found) exit 0; in_auth=0} END{exit (found?0:1)}' /etc/one/oned.conf
+      register: oned_ldap_auth
+      changed_when: false
+      failed_when: oned_ldap_auth.rc != 0
+
+    - name: Save OpenNebula LDAP auth config check
+      ansible.builtin.set_fact:
+        verification_result: "{{ verification_result | combine({'OpenNebula LDAP auth driver configured': 'ok'}) }}"
+
+    - name: Create temporary auth file for LDAP user
+      ansible.builtin.tempfile:
+        state: file
+        suffix: .one_auth_ldap
+      register: ldap_auth_file
+      when:
+        - validation.ldap_auth.ldap_user | length > 0
+        - validation.ldap_auth.ldap_pass | length > 0
+
+    - name: Write LDAP auth credentials
+      ansible.builtin.copy:
+        dest: "{{ ldap_auth_file.path }}"
+        content: "{{ validation.ldap_auth.ldap_user }}:{{ validation.ldap_auth.ldap_pass }}"
+        mode: "0600"
+      no_log: true
+      when: ldap_auth_file is defined
+
+    - name: Validate OpenNebula login with LDAP user
+      ansible.builtin.shell: >
+        ONE_AUTH="{{ ldap_auth_file.path }}" oneuser show "{{ validation.ldap_auth.ldap_user }}"
+      register: ldap_login_check
+      changed_when: false
+      no_log: true
+      failed_when: ldap_login_check.rc != 0
+      when: ldap_auth_file is defined
+
+    - name: Save LDAP user login result
+      ansible.builtin.set_fact:
+        verification_result: "{{ verification_result | combine({'LDAP user login to XML-RPC': 'ok'}) }}"
+      when: ldap_auth_file is defined
+
+    - name: Read LDAP group membership for user
+      ansible.builtin.shell: >
+        ldapsearch -x -H ldap://{{ _ldap_host }}:{{ _ldap_port }} -D "{{ validation.ldap_auth.bind_dn }}" -w "{{ validation.ldap_auth.bind_pass }}" -b "{{ validation.ldap_auth.group_mapping.ldap_group_dn }}" "(objectClass=posixGroup)" {{ validation.ldap_auth.group_mapping.ldap_group_member_attr }}
+      register: ldap_group_lookup
+      no_log: true
+      changed_when: false
+      failed_when: ldap_group_lookup.rc != 0
+      when:
+        - ldap_auth_file is defined
+        - validation.ldap_auth.group_mapping.ldap_group_dn | length > 0
+
+    - name: Validate LDAP group membership contains user
+      ansible.builtin.set_fact:
+        verification_result: >-
+          {{
+            verification_result
+            | combine({
+                'LDAP group membership (directory)':
+                (ldap_group_lookup.stdout is search(validation.ldap_auth.group_mapping.ldap_group_member_attr ~ ': ' ~ validation.ldap_auth.ldap_user))
+                | ternary('ok', 'failed')
+              })
+          }}
+      when:
+        - ldap_auth_file is defined
+        - validation.ldap_auth.group_mapping.ldap_group_dn | length > 0
+
+    - name: Lookup OpenNebula group by name
+      ansible.builtin.shell: >
+        onegroup show -j "{{ validation.ldap_auth.group_mapping.expected_group_name }}"
+      register: onegroup_show
+      changed_when: false
+      failed_when: onegroup_show.rc != 0
+      when:
+        - ldap_auth_file is defined
+        - validation.ldap_auth.group_mapping.expected_group_name | length > 0
+
+    - name: Normalize expected OpenNebula group id
+      ansible.builtin.set_fact:
+        _expected_group_id: >-
+          {{
+            (validation.ldap_auth.group_mapping.expected_group_id | string | length > 0)
+            | ternary(validation.ldap_auth.group_mapping.expected_group_id, (onegroup_show.stdout | from_json).GROUP.ID | default(''))
+          }}
+      when:
+        - ldap_auth_file is defined
+        - validation.ldap_auth.group_mapping.expected_group_name | length > 0
+
+    - name: Read OpenNebula user info (JSON)
+      ansible.builtin.shell: >
+        ONE_AUTH="{{ ldap_auth_file.path }}" oneuser show -j "{{ validation.ldap_auth.ldap_user }}"
+      register: oneuser_show_json
+      changed_when: false
+      no_log: true
+      failed_when: oneuser_show_json.rc != 0
+      when:
+        - ldap_auth_file is defined
+        - validation.ldap_auth.group_mapping.expected_group_name | length > 0
+
+    - name: Validate OpenNebula group mapping for user
+      ansible.builtin.set_fact:
+        verification_result: >-
+          {{
+            verification_result
+            | combine({
+                'OpenNebula group mapping':
+                (
+                  ((oneuser_show_json.stdout | from_json).USER.GNAME | default('') == validation.ldap_auth.group_mapping.expected_group_name)
+                  or
+                  (
+                    (oneuser_show_json.stdout | from_json).USER.GROUPS.ID | default([])
+                    is string
+                    and ((oneuser_show_json.stdout | from_json).USER.GROUPS.ID | default('') == _expected_group_id)
+                  )
+                  or
+                  (
+                    (oneuser_show_json.stdout | from_json).USER.GROUPS.ID | default([])
+                    is sequence
+                    and (_expected_group_id in ((oneuser_show_json.stdout | from_json).USER.GROUPS.ID | default([])))
+                  )
+                )
+                | ternary('ok', 'failed')
+              })
+          }}
+      when:
+        - ldap_auth_file is defined
+        - validation.ldap_auth.group_mapping.expected_group_name | length > 0
+
+    - name: Read oned XML-RPC port from config
+      ansible.builtin.shell: "awk -F '=' '/^PORT/ {gsub(/ /, \"\", $2); print $2; exit}' /etc/one/oned.conf"
+      register: oned_port_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Normalize oned XML-RPC port
+      ansible.builtin.set_fact:
+        _rpc2_port_from_config: "{{ oned_port_cmd.stdout | default('') }}"
+
+    - name: Build XML-RPC (RPC2) host and port
+      ansible.builtin.set_fact:
+        _rpc2_host: >-
+          {{
+            (validation.ldap_auth.rpc2_host | default('') | length > 0)
+            | ternary(validation.ldap_auth.rpc2_host, (ansible_host | default(inventory_hostname)))
+          }}
+        _rpc2_port: >-
+          {{
+            (validation.ldap_auth.rpc2_port | default('') | string | length > 0)
+            | ternary(validation.ldap_auth.rpc2_port,
+              (_rpc2_port_from_config | string | length > 0) | ternary(_rpc2_port_from_config, '2633')
+            )
+          }}
+
+    - name: Build XML-RPC (RPC2) URL
+      ansible.builtin.set_fact:
+        _rpc2_url: "{{ validation.ldap_auth.rpc2_proto }}://{{ _rpc2_host }}:{{ _rpc2_port }}{{ validation.ldap_auth.rpc2_path }}"
+
+    - name: Validate XML-RPC (RPC2) login with LDAP user
+      ansible.builtin.uri:
+        url: "{{ _rpc2_url }}"
+        method: POST
+        headers:
+          Content-Type: "text/xml"
+        body: |
+          <?xml version="1.0"?>
+          <methodCall>
+            <methodName>one.user.info</methodName>
+            <params>
+              <param>
+                <value><string>{{ validation.ldap_auth.ldap_user }}:{{ validation.ldap_auth.ldap_pass }}</string></value>
+              </param>
+              <param>
+                <value><int>-1</int></value>
+              </param>
+            </params>
+          </methodCall>
+        validate_certs: "{{ not validation.ldap_auth.rpc2_skip_tls_verify }}"
+        status_code: [200]
+        return_content: true
+      register: rpc2_login_result
+      no_log: true
+      failed_when:
+        - rpc2_login_result.status != 200
+        - rpc2_login_result.content is search('<fault>')
+      when: ldap_auth_file is defined
+
+    - name: Save XML-RPC (RPC2) login result
+      ansible.builtin.set_fact:
+        verification_result: "{{ verification_result | combine({'XML-RPC (RPC2) login (LDAP)': 'ok'}) }}"
+      when: ldap_auth_file is defined
+
+    - name: Report missing LDAP user credentials
+      ansible.builtin.set_fact:
+        verification_result: "{{ verification_result | combine({'LDAP user login to XML-RPC': 'skipped (missing ldap_user/ldap_pass)'}) }}"
+      when: ldap_auth_file is not defined
+
+    - name: Report skipped XML-RPC (RPC2) login
+      ansible.builtin.set_fact:
+        verification_result: "{{ verification_result | combine({'XML-RPC (RPC2) login (LDAP)': 'skipped (missing ldap_user/ldap_pass)'}) }}"
+      when: ldap_auth_file is not defined
+
+    - name: Read FireEdge port from config
+      ansible.builtin.shell: "awk '/^port:/ {print $2; exit}' /etc/one/fireedge-server.conf"
+      register: fireedge_port_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Normalize FireEdge port
+      ansible.builtin.set_fact:
+        _fireedge_port_from_config: "{{ fireedge_port_cmd.stdout | default('') }}"
+
+    - name: Build FireEdge host and port
+      ansible.builtin.set_fact:
+        _fireedge_host: >-
+          {{
+            (validation.ldap_auth.fireedge_host | default('') | length > 0)
+            | ternary(validation.ldap_auth.fireedge_host, (ansible_host | default(inventory_hostname)))
+          }}
+        _fireedge_port: >-
+          {{
+            (validation.ldap_auth.fireedge_port | default('') | string | length > 0)
+            | ternary(validation.ldap_auth.fireedge_port,
+              (_fireedge_port_from_config | string | length > 0) | ternary(_fireedge_port_from_config, '2616')
+            )
+          }}
+
+    - name: Build FireEdge login endpoint list
+      ansible.builtin.set_fact:
+        _fireedge_login_endpoints: >-
+          {{
+            [
+              validation.ldap_auth.fireedge_login_endpoint | default('/fireedge/api/auth/'),
+              '/fireedge/api/auth/',
+              '/api/login',
+              '/login'
+            ]
+            | map('regex_replace', '^$', '/api/login')
+            | unique
+            | list
+          }}
+
+    - name: Validate FireEdge UI login with LDAP user
+      ansible.builtin.uri:
+        url: "{{ validation.ldap_auth.fireedge_proto }}://{{ _fireedge_host }}:{{ _fireedge_port }}{{ item }}"
+        method: POST
+        body_format: json
+        body:
+          user: "{{ validation.ldap_auth.ldap_user }}"
+          token: "{{ validation.ldap_auth.ldap_pass }}"
+          remember: false
+        validate_certs: "{{ not validation.ldap_auth.fireedge_skip_tls_verify }}"
+      loop: "{{ _fireedge_login_endpoints }}"
+      register: fireedge_login_attempts
+      no_log: true
+      failed_when: false
+      when: ldap_auth_file is defined
+
+    - name: Select first successful FireEdge login attempt
+      ansible.builtin.set_fact:
+        fireedge_login_result: >-
+          {{
+            (fireedge_login_attempts.results
+              | selectattr('status', 'defined')
+              | selectattr('status', 'in', [200, 201])
+              | list
+              | first) | default({})
+          }}
+      when: ldap_auth_file is defined
+
+    - name: Fail when FireEdge UI login failed
+      ansible.builtin.fail:
+        msg: "FireEdge UI login failed for endpoints {{ _fireedge_login_endpoints }}"
+      when:
+        - ldap_auth_file is defined
+        - fireedge_login_result is not defined or fireedge_login_result == {}
+
+    - name: Save FireEdge UI login result
+      ansible.builtin.set_fact:
+        verification_result: >-
+          {{
+            verification_result
+            | combine({
+                'FireEdge UI login (LDAP)':
+                (fireedge_login_result.status is defined and fireedge_login_result.status in [200, 201])
+                | ternary('ok', 'failed')
+              })
+          }}
+      when: ldap_auth_file is defined
+
+    - name: Report skipped FireEdge UI login
+      ansible.builtin.set_fact:
+        verification_result: "{{ verification_result | combine({'FireEdge UI login (LDAP)': 'skipped (missing ldap_user/ldap_pass)'}) }}"
+      when: ldap_auth_file is not defined
+
+    - name: Check local auth file exists
+      ansible.builtin.stat:
+        path: "{{ validation.ldap_auth.local_auth_file }}"
+      register: local_auth_file
+
+    - name: Validate local auth fallback
+      ansible.builtin.shell: >
+        ONE_AUTH="{{ validation.ldap_auth.local_auth_file }}" oneuser show "{{ validation.ldap_auth.local_user }}"
+      register: local_auth_check
+      changed_when: false
+      failed_when: local_auth_check.rc != 0
+      when: local_auth_file.stat.exists
+
+    - name: Save local auth fallback result
+      ansible.builtin.set_fact:
+        verification_result: "{{ verification_result | combine({'Local auth fallback': 'ok'}) }}"
+      when: local_auth_file.stat.exists
+
+    - name: Report missing local auth file
+      ansible.builtin.set_fact:
+        verification_result: "{{ verification_result | combine({'Local auth fallback': 'skipped (missing local auth file)'}) }}"
+      when: not local_auth_file.stat.exists
+
+    - name: Remove temporary LDAP auth file
+      ansible.builtin.file:
+        path: "{{ ldap_auth_file.path }}"
+        state: absent
+      when: ldap_auth_file is defined
