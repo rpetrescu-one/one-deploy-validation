@@ -1,0 +1,104 @@
+---
+- name: Get list of all zones
+  ansible.builtin.shell: onezone list -j
+  register: zone_list_json
+  become: true
+  become_user: oneadmin
+  changed_when: false
+
+- name: Parse zone list
+  set_fact:
+    federation_zones: "{{ zone_list_json.stdout | from_json | json_query('ZONE_POOL.ZONE') }}"
+    federation_zone_count: "{{ (zone_list_json.stdout | from_json | json_query('ZONE_POOL.ZONE') | length) | default(0) }}"
+
+- name: Display federation zones
+  ansible.builtin.debug:
+    msg: "Found {{ federation_zone_count }} zone(s) in federation"
+
+- name: Save zone count to verification results
+  set_fact:
+    verification_result: "{{ verification_result | combine({
+      'Federation total zones on ' ~ inventory_hostname: 
+        federation_zone_count | int if (federation_zone_count | int) >= (_federation_min_zones | int)
+        else ('warning - only ' ~ (federation_zone_count | int) ~ ' zones, expected ' ~ _federation_min_zones)
+    }) }}"
+
+- name: Extract zone IDs and names
+  set_fact:
+    federation_zone_ids: "{{ federation_zones | map(attribute='ID') | list }}"
+    federation_zone_names: "{{ federation_zones | map(attribute='NAME') | list }}"
+    federation_zone_endpoints: "{{ federation_zones | map(attribute='TEMPLATE.ENDPOINT') | list }}"
+
+- name: Display federation zones details
+  ansible.builtin.debug:
+    msg:
+      - "Zone IDs: {{ federation_zone_ids }}"
+      - "Zone names: {{ federation_zone_names }}"
+      - "Zone endpoints: {{ federation_zone_endpoints }}"
+
+- name: Get FED_INDEX for each zone
+  ansible.builtin.shell: onezone list -l ID,FED_INDEX --csv --no-header
+  register: zone_fed_indices
+  become: true
+  become_user: oneadmin
+  changed_when: false
+
+- name: Parse FED_INDEX values
+  set_fact:
+    federation_fed_index_map: >-
+      {{
+        dict(
+          zone_fed_indices.stdout_lines
+          | map('split', ',')
+          | map('first')
+          | zip(
+              zone_fed_indices.stdout_lines
+              | map('split', ',')
+              | map('last')
+            )
+        )
+      }}
+
+- name: Display FED_INDEX values
+  ansible.builtin.debug:
+    msg: "FED_INDEX map: {{ federation_fed_index_map }}"
+
+- name: Check if zones are synchronized (FED_INDEX)
+  set_fact:
+    fed_indices_list: "{{ federation_fed_index_map.values() | list | reject('equalto', '-') | list }}"
+
+- name: Check FED_INDEX consistency (all non-dash values should be the same)
+  set_fact:
+    fed_index_unique_values: "{{ fed_indices_list | unique | list }}"
+
+- name: Save FED_INDEX consistency to verification results
+  set_fact:
+    verification_result: "{{ verification_result | combine({
+      'Federation FED_INDEX consistency on ' ~ inventory_hostname: 
+        'ok - all zones at index ' ~ fed_index_unique_values[0] if fed_index_unique_values | length == 1
+        else ('info - no FED_INDEX data (HA follower)' if fed_indices_list | length == 0
+        else 'warning - inconsistent FED_INDEX: ' ~ (fed_index_unique_values | join(', ')))
+    }) }}"
+
+- name: Verify current zone ID matches configuration
+  block:
+    - name: Get current zone info
+      ansible.builtin.shell: onezone show {{ one_federation_zone_id }} -j
+      register: current_zone_json
+      become: true
+      become_user: oneadmin
+      changed_when: false
+
+    - name: Parse current zone name
+      set_fact:
+        current_zone_name: "{{ (current_zone_json.stdout | from_json).ZONE.NAME }}"
+        current_zone_endpoint: "{{ (current_zone_json.stdout | from_json).ZONE.TEMPLATE.ENDPOINT }}"
+
+    - name: Save zone verification to results
+      set_fact:
+        verification_result: "{{ verification_result | combine({
+          'Federation zone ID verification on ' ~ inventory_hostname: 
+            'ok - zone ' ~ one_federation_zone_id ~ ' (' ~ current_zone_name ~ ')' if one_federation_zone_id in federation_zone_ids
+            else 'failed - zone ' ~ one_federation_zone_id ~ ' not in federation'
+        }) }}"
+  when: one_federation_zone_id is defined

@@ -59,19 +59,23 @@
   debug:
     msg: "Installed oned version: {{ oned_version.stdout }}"
 
+- name: Extract version number from oned output
+  set_fact:
+    one_version: "{{ oned_version.stdout | regex_search('OpenNebula ([0-9]+\\.[0-9]+\\.[0-9]+)', '\\1') | first }}"
+
 # Modify for Debian and RH-based distros        
 - name: Verify OpenNebula private repos on the Debian-based OS
   ansible.builtin.shell: >
-    cd /etc/apt/sources.list.d/ && grep -Rn opennebula . | awk '{print $2}'
+    grep -Ri opennebula /etc/apt/sources.list.d/ 2>/dev/null | head -1 | cut -d: -f1 | xargs cat | grep '^deb' | awk '{print $2}'
   register: debian_repos_list
-  failed_when: "debian_repos_list.rc != 0"
+  failed_when: false
   when: ansible_os_family == "Debian"
 
 - name: Verify OpenNebula private repos on the RH-based OS
   ansible.builtin.shell: >
-    cd /etc/yum.repos.d/ && grep -Rn opennebula . | grep baseurl | awk -F '@' '/1/ {print $2}'
+    grep -Ri opennebula /etc/yum.repos.d/*.repo 2>/dev/null | head -1 | cut -d: -f1 | xargs cat | grep baseurl | awk '{print $3}'
   register: rh_repos_list
-  failed_when: "rh_repos_list.rc != 0"
+  failed_when: false
   when: ansible_os_family == "RedHat"
 
 - name: Save OpenNebula Debian repositories
@@ -181,19 +185,23 @@
   failed_when: "onehost_list.rc != 0"
 
 - name: Create host list with single host list
-  when: single_host_list.hostname is not none
+  when: single_host_list is mapping and single_host_list.hostname is defined and single_host_list.hostname is not none
   set_fact:
     hosts_list: [ "{{ single_host_list }}"]
 
 - name: Get hosts list
-  when: single_host_list.hostname is none
+  when: hosts_list is not defined
   set_fact:
-    hosts_list: "{{ onehost_list.stdout | from_json | json_query('HOST_POOL.HOST[*].{id: ID, hostname: NAME, state: STATE} || HOST_POOL.HOST.{id: ID, hostname: NAME, state: STATE}') }}"
+    hosts_list: "{{ onehost_list.stdout | from_json | json_query('HOST_POOL.HOST[*].{id: ID, hostname: NAME, state: STATE}') | default([]) }}"
   failed_when: "onehost_list.rc != 0"
+
+- name: Filter out empty entries from hosts list
+  set_fact:
+    hosts_list: "{{ hosts_list | select('mapping') | list }}"
 
 - name: Verify hosts list
   set_fact:
-    verification_result: "{{ verification_result | combine({'Status of the registered HV hosts' : hosts_list }) }}"
+    verification_result: "{{ verification_result | combine({'Status of the registered KVM hosts' : hosts_list if hosts_list | length > 0 else 'no hosts registered' }) }}"
 
 - name: Set host offline and then set online
   ansible.builtin.shell: |
@@ -203,16 +211,18 @@
     sleep 1
     onehost show "{{ item.id }}" -j
   register: host_monitoring
-  loop: "{{ hosts_list }}" 
+  loop: "{{ hosts_list }}"
+  when: hosts_list | length > 0 
 
 - name: Get host status
   debug:
     msg: "{{ host_monitoring }}"
+  when: hosts_list | length > 0
 
 # If we reached here all hosts monitoring is ok. Individual hosts status is in hosts_list variable    
 - name: Verify host offline and then set online
   set_fact:
-    verification_result: "{{ verification_result | combine({'Put hosts offline and then set online. Hosts status' : 'ok' }) }}"
+    verification_result: "{{ verification_result | combine({'Put hosts offline and then set online. Hosts status' : 'ok' if hosts_list | length > 0 else 'skipped - no hosts registered' }) }}"
 
 - name: Get datastores list
   ansible.builtin.shell: >

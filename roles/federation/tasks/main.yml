@@ -1,0 +1,22 @@
+---
+- name: Initialize validation results
+  set_fact:
+    verification_result: "{{ verification_result | default({}) }}"
+
+- name: Check federation configuration
+  include_tasks: check_federation_config.yml
+
+- name: Validate zones
+  include_tasks: check_zones.yml
+
+- name: Check endpoint connectivity
+  include_tasks: check_endpoints.yml
+
+- name: Verify federated data synchronization
+  include_tasks: check_data_sync.yml
+
+- name: Advanced federation consistency checks
+  include_tasks: check_advanced_sync.yml
+
+- name: Compare federation consistency across all zones
+  include_tasks: check_consistency.yml

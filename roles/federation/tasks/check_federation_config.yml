@@ -1,0 +1,113 @@
+---
+- name: Extract FEDERATION configuration from oned.conf
+  ansible.builtin.shell: |
+    awk '/^FEDERATION[[:space:]]*=/{flag=1; print; next} 
+         flag && /^[[:space:]]*\]/{print; flag=0} 
+         flag{print}' {{ _federation_oned_conf }}
+  register: federation_config
+  changed_when: false
+
+- name: Parse federation MODE
+  set_fact:
+    federation_mode_actual: "{{ federation_config.stdout | regex_search('MODE\\s*=\\s*\"([^\"]+)\"', '\\1') | default([''], true) | first }}"
+
+- name: Parse federation ZONE_ID
+  set_fact:
+    federation_zone_id_actual: "{{ federation_config.stdout | regex_search('ZONE_ID\\s*=\\s*(\\d+)', '\\1') | default([''], true) | first }}"
+
+- name: Parse federation MASTER_ONED
+  set_fact:
+    federation_master_oned_actual: "{{ federation_config.stdout | regex_search('MASTER_ONED\\s*=\\s*\"([^\"]+)\"', '\\1') | default([''], true) | first }}"
+
+- name: Verify federation mode is set
+  ansible.builtin.assert:
+    that:
+      - federation_mode_actual != ""
+      - federation_mode_actual in ['MASTER', 'SLAVE']
+    fail_msg: "Federation MODE not properly configured in {{ _federation_oned_conf }}"
+    success_msg: "Federation MODE is {{ federation_mode_actual }}"
+
+- name: Save federation mode to verification results
+  set_fact:
+    verification_result: "{{ verification_result | combine({'Federation MODE on ' ~ inventory_hostname: federation_mode_actual}) }}"
+    one_federation_mode: "{{ federation_mode_actual }}"
+    one_federation_zone_id: "{{ federation_zone_id_actual }}"
+    one_federation_master_oned: "{{ federation_master_oned_actual if federation_master_oned_actual != '' else 'N/A' }}"
+
+- name: Verify ZONE_ID is set
+  ansible.builtin.assert:
+    that:
+      - federation_zone_id_actual != ""
+    fail_msg: "Federation ZONE_ID not properly configured in {{ _federation_oned_conf }}"
+    success_msg: "Federation ZONE_ID is {{ federation_zone_id_actual }}"
+
+- name: Save federation ZONE_ID to verification results
+  set_fact:
+    verification_result: "{{ verification_result | combine({'Federation ZONE_ID on ' ~ inventory_hostname: federation_zone_id_actual}) }}"
+
+- name: Check MASTER_ONED on slave zones
+  block:
+    - name: Verify MASTER_ONED is set on slave
+      ansible.builtin.assert:
+        that:
+          - federation_master_oned_actual != ""
+          - "'http://' in federation_master_oned_actual or 'https://' in federation_master_oned_actual"
+        fail_msg: "MASTER_ONED not properly configured on slave zone in {{ _federation_oned_conf }}"
+        success_msg: "MASTER_ONED is {{ federation_master_oned_actual }}"
+    
+    - name: Save MASTER_ONED to verification results
+      set_fact:
+        verification_result: "{{ verification_result | combine({'Federation MASTER_ONED on ' ~ inventory_hostname: federation_master_oned_actual}) }}"
+  when: federation_mode_actual == 'SLAVE'
+
+- name: Check FireEdge configuration
+  block:
+    - name: Parse FireEdge zone ID
+      ansible.builtin.shell: |
+        grep -A 3 "default_zone:" {{ _federation_fireedge_conf }} | grep "id:" | grep -oP '\d+'
+      register: fireedge_zone_id
+      changed_when: false
+      failed_when: false
+
+    - name: Parse FireEdge zone name
+      ansible.builtin.shell: |
+        grep -A 3 "default_zone:" {{ _federation_fireedge_conf }} | grep "name:" | grep -oP "'.*'" | tr -d "'"
+      register: fireedge_zone_name
+      changed_when: false
+      failed_when: false
+
+    - name: Parse FireEdge zone endpoint
+      ansible.builtin.shell: |
+        grep -A 3 "default_zone:" {{ _federation_fireedge_conf }} | grep "endpoint:" | grep -oP "'.*'" | tr -d "'"
+      register: fireedge_zone_endpoint
+      changed_when: false
+      failed_when: false
+
+    - name: Verify FireEdge zone ID matches oned configuration
+      set_fact:
+        fireedge_zone_match: "{{ 'ok' if fireedge_zone_id.stdout == one_federation_zone_id else 'warning - mismatch' }}"
+        fireedge_zone_status: "{{ 'FireEdge zone ID (' ~ fireedge_zone_id.stdout ~ ') matches oned.conf ZONE_ID (' ~ one_federation_zone_id ~ ')' if fireedge_zone_id.stdout == one_federation_zone_id else 'FireEdge zone ID (' ~ fireedge_zone_id.stdout ~ ') does not match oned.conf ZONE_ID (' ~ one_federation_zone_id ~ ')' }}"
+
+    - name: Display FireEdge zone ID verification
+      ansible.builtin.debug:
+        msg: "{{ fireedge_zone_status }}"
+
+    - name: Save FireEdge configuration to verification results
+      set_fact:
+        verification_result: "{{ verification_result | combine({
+          'Federation FireEdge zone ID on ' ~ inventory_hostname: fireedge_zone_id.stdout,
+          'Federation FireEdge zone name on ' ~ inventory_hostname: fireedge_zone_name.stdout,
+          'Federation FireEdge zone ID verification on ' ~ inventory_hostname: fireedge_zone_match
+        }) }}"
+  when: _federation_check_fireedge | bool
+
+- name: Check FireEdge service status
+  ansible.builtin.systemd:
+    name: opennebula-fireedge.service
+  register: fireedge_service
+  failed_when: false
+
+- name: Save FireEdge service status to verification results
+  set_fact:
+    verification_result: "{{ verification_result | combine({'Federation FireEdge service on ' ~ inventory_hostname: 'active' if fireedge_service.status.ActiveState == 'active' else 'inactive'}) }}"
+  when: fireedge_service.status is defined

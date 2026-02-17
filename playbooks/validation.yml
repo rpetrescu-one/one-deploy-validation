@@ -45,7 +45,13 @@
 - hosts: "{{ frontend_group | d('frontend') }}"
   roles:
     - role: fe_ha
-      when: validation.run_fe_ha == true
+      when: validation.run_fe_ha | d(false)
+
+# Run Federation validation when variable run_federation is set to true
+- hosts: "{{ frontend_group | d('frontend') }}"
+  roles:
+    - role: federation
+      when: validation.run_federation | d(false)
 
 # Render verification report
 - hosts: localhost
@@ -80,6 +86,17 @@
       loop_control:
         label: "{{ item }}"
 
+    - name: Collect federation results from all frontend hosts
+      # Build a map of frontend -> verification_result for federation checks
+      ansible.builtin.set_fact:
+        all_federation_results: "{{ all_federation_results | default({}) | combine({item: hostvars[item].verification_result | default({})}) }}"
+      loop: "{{ groups[frontend_group | d('frontend')] }}"
+      when: 
+        - hostvars[item].verification_result is defined
+        - validation.run_federation | d(false)
+      loop_control:
+        label: "{{ item }}"
+
     - name: Build IP -> hostname mapping for report
       ansible.builtin.set_fact:
         ip_to_hostname: "{{ ip_to_hostname | default({}) | combine({ (hostvars[item].get('ansible_host')): item }) }}"
@@ -94,8 +111,8 @@
         dest: /tmp/cloud_verification_report.html
       vars:
         repo_version: "{{ repo_version_cmd.stdout }}"
-        # pass collected network benchmark results to the template
-        network_benchmark: "{{ network_benchmark | default({}) }}"
+        date: "{{ lookup('pipe', 'date +%Y-%m-%d\\ %H:%M:%S') }}"
+        verification_result: "{{ hostvars[groups[frontend_group | d('frontend')][0]].verification_result }}"
 
     - name: Print report location
       ansible.builtin.debug:

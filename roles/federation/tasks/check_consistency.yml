@@ -1,0 +1,46 @@
+---
+- name: Check if federated resources are consistent across zones
+  block:
+    - name: Extract user counts from all zones
+      set_fact:
+        all_user_counts: "{{ groups[_federation_zone_group] | map('extract', hostvars) | map(attribute='verification_result', default={}) | map('dict2items') | flatten | selectattr('key', 'search', '^Federation users count on') | map(attribute='value') | list }}"
+
+    - name: Extract group counts from all zones
+      set_fact:
+        all_group_counts: "{{ groups[_federation_zone_group] | map('extract', hostvars) | map(attribute='verification_result', default={}) | map('dict2items') | flatten | selectattr('key', 'search', '^Federation groups count on') | map(attribute='value') | list }}"
+
+    - name: Extract ACL counts from all zones
+      set_fact:
+        all_acl_counts: "{{ groups[_federation_zone_group] | map('extract', hostvars) | map(attribute='verification_result', default={}) | map('dict2items') | flatten | selectattr('key', 'search', '^Federation ACL rules count on') | map(attribute='value') | list }}"
+
+    - name: Check users consistency
+      set_fact:
+        users_consistent: "{{ all_user_counts | unique | length == 1 }}"
+      when: all_user_counts | length > 0
+
+    - name: Check groups consistency
+      set_fact:
+        groups_consistent: "{{ all_group_counts | unique | length == 1 }}"
+      when: all_group_counts | length > 0
+
+    - name: Check ACLs consistency
+      set_fact:
+        acls_consistent: "{{ all_acl_counts | unique | length == 1 }}"
+      when: all_acl_counts | length > 0
+
+    - name: Save users consistency result
+      set_fact:
+        verification_result: "{{ verification_result | combine({'Federation users consistency across zones on ' ~ inventory_hostname: 'ok - consistent' if users_consistent else 'warning - inconsistent counts: ' ~ (all_user_counts | unique | join(', '))}) }}"
+      when: users_consistent is defined
+
+    - name: Save groups consistency result
+      set_fact:
+        verification_result: "{{ verification_result | combine({'Federation groups consistency across zones on ' ~ inventory_hostname: 'ok - consistent' if groups_consistent else 'warning - inconsistent counts: ' ~ (all_group_counts | unique | join(', '))}) }}"
+      when: groups_consistent is defined
+
+    - name: Save ACLs consistency result
+      set_fact:
+        verification_result: "{{ verification_result | combine({'Federation ACLs consistency across zones on ' ~ inventory_hostname: 'ok - consistent' if acls_consistent else 'warning - inconsistent counts: ' ~ (all_acl_counts | unique | join(', '))}) }}"
+      when: acls_consistent is defined
+
+  when: groups[_federation_zone_group] | length > 1

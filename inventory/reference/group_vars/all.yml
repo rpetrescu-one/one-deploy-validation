@@ -132,3 +132,31 @@ validation:
       - /etc/one
       - /var/lib/one/remotes/etc
     one_zone_name: OpenNebula
+
+  # TEST CASE NAME: Federation Validation
+  # DESCRIPTION: Validates OpenNebula Federation configuration and data synchronization across zones.
+  # Checks federation configuration (MODE, ZONE_ID, MASTER_ONED), zone discovery, endpoint connectivity,
+  # federated data synchronization (users, groups, VDCs, ACL rules, marketplaces), database backend consistency,
+  # FireEdge configuration, and oneadmin user consistency across zones.
+  # OUTPUT: HTML document at /tmp/cloud_verification_report.html
+  run_federation: false
+  federation:
+    # Minimum number of zones expected in the federation
+    min_zones: 2
+    # Timeout for endpoint connectivity tests (seconds)
+    endpoint_timeout: 10
+    # Check FireEdge configuration
+    check_fireedge: true
+    # Check database backend consistency
+    check_db_backend: true
+    # Verify oneadmin user consistency
+    verify_oneadmin: true
+    # Zone group (defaults to frontend_group or 'frontend')
+    zone_group: frontend
+    # XML-RPC port (default: 2633)
+    xmlrpc_port: 2633
+    # gRPC port (default: 2634)
+    grpc_port: 2634
+    # Configuration files
+    oned_conf: /etc/one/oned.conf
+    fireedge_conf: /etc/one/fireedge-server.conf
