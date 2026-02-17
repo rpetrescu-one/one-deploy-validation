@@ -136,6 +136,53 @@
 </table>
 </div>
 
+
+{% if validation_vars['networks_verification'] == true and network_verification_results | length > 0 %}
+
+<div class="table_component" role="region" tabindex="0">
+
+  <h2 class="western">Virtual Networks validation results</h2>
+<table width="656" cellpadding="3" cellspacing="0" style="page-break-before: auto; page-break-after: auto">
+       <col width="281"/>
+        <col width="200"/>
+        <col width="260"/>
+        <tr valign="top">
+
+                <td width="300" bgcolor="#666666" style="background: #666666; border: 1.00pt solid #000000; padding: 0.07in"><p align="left" style="page-break-inside: auto; orphans: 0; widows: 0; border: none; padding: 0in; background: transparent; page-break-after: auto">
+                        <font color="#ffffff"><font size="3" style="font-size: 12pt"><b>Network name</b></font></font></p>
+                </td>
+                <td width="90" bgcolor="#666666" style="background: #666666; border: 1.00pt solid #000000; padding: 0.07in"><p align="left" style="page-break-inside: auto; orphans: 0; widows: 0; border: none; padding: 0in; background: transparent; page-break-after: auto">
+                        <font color="#ffffff"><font size="3" style="font-size: 12pt"><b>Result</b></font></font></p>
+                </td>
+                <td width="260" bgcolor="#666666" style="background: #666666; border: 1.00pt solid #000000; padding: 0.07in"><p align="left" style="page-break-inside: auto; orphans: 0; widows: 0; border: none; padding: 0in; background: transparent; page-break-after: auto">
+                        <font color="#ffffff"><font size="3" style="font-size: 12pt"><b>Comments</b></font></font></p>
+                </td>
+        </tr>
+         {% for k, v in network_verification_results.items() %}
+        <tr valign="top">
+                <td width="300" height="21" style="background: transparent; border: 1.00pt solid #000000; padding: 0.07in"><p align="left" style="page-break-inside: auto; orphans: 0; widows: 0; border: none; padding: 0in; background: transparent; page-break-after: auto">
+			<b>{{ k }}</b></p>
+                </td>
+                <td width="90" style="background: transparent; border: 1.00pt solid #000000; padding: 0.07in"><p align="left" style="page-break-inside: auto; orphans: 0; widows: 0; border: none; padding: 0in; background: transparent; page-break-after: auto">
+			{% for test, value in v.items() %}
+                        <b>{{ test }}</b>: {{ value }}</p>
+                        {% endfor %}
+                </td>
+                <td width="260" style="background: transparent; border: 1.00pt solid #000000; padding: 0.07in"><p align="left" style="page-break-inside: auto; orphans: 0; widows: 0; border: none; padding: 0in; background: transparent; page-break-after: auto">
+
+                        </p>
+                </td>
+        </tr>
+        {% endfor %}
+
+        </p>
+</table>
+</div>
+
+{% endif %}
+
+
+
 {% if storage_benchmark is defined and storage_benchmark | length > 0 %}
 <div class="table_component" role="region" tabindex="0">
 

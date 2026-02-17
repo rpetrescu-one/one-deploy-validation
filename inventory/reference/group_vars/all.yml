@@ -39,6 +39,14 @@ validation:
       # Add other services if more should be checked.
     check_fireedge_ui: true
 
+  # TEST CASE NAME: Networking subsystem validation
+  # DESCRIPTION: Instantiates a VM at each OpenNebula vNET, checks external connectivity
+  # from the test VM
+  # OUTPUT: HTML document at /tmp/cloud_verification_report.html
+  networks_verification: true
+  network:
+    ext_host: 'google.com'
+
   # TEST CASE NAME: Storage Benchmark
   # DESCRIPTION: Instantiates a VM for running storage benchmark from it. The VM needs to
   # have public internet access to install dependencies. The VM's connected network can

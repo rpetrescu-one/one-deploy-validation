@@ -14,6 +14,8 @@
       tags:
         - ldap_auth
     - role: validation_frontend
+    - role: network_validation
+      when: validation.networks_verification | d(true)
 
 # Run connectivity tests between virtual machines
 - hosts: "{{ node_group | d('node') }},{{ frontend_group | d('frontend') }}"
@@ -57,6 +59,7 @@
   become: false
   vars:
     verification_result: "{{ hostvars[groups[frontend_group | d('frontend')][0]].verification_result | default({'No verification results were found': 'N/A'})}}"
+    network_verification_results: "{{ hostvars[groups[frontend_group | d('frontend')][0]].network_verification_results | default({'No Network verification results were found': {'N/A':'N/A'}})}}"
     date: "{{ lookup('pipe', 'date +%Y-%m-%d\\ %H:%M:%S') }}"
     validation_vars: "{{ hostvars[groups[frontend_group | d('frontend')][0]].validation | default({}) }}"
   tasks:
