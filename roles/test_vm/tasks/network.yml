@@ -18,7 +18,7 @@
     - name: Render vnet config
       template:
         src: test_vnet.j2
-        dest: /var/tmp/vnet_{{ validation.test_vm.vnet.name }}.template
+        dest: /var/tmp/vnet_{{ validation.test_vm.vnet_name }}.template
 
     - name: Verify connection to the VNET default gateway
       ansible.builtin.shell: >
@@ -31,21 +31,21 @@
 
     - name: Update network
       ansible.builtin.shell: >
-        cat /var/tmp/vnet_{{ validation.test_vm.vnet.name }}.template | onevnet update {{ validation.test_vm.vnet.name }}
+        cat /var/tmp/vnet_{{ validation.test_vm.vnet_name }}.template | onevnet update {{ validation.test_vm.vnet_name }}
       register: test_network
       failed_when: "test_network.rc != 0"
-      when: validation.test_vm.vnet.name in vnet_names
+      when: validation.test_vm.vnet_name in vnet_names
 
     - name: Create network
       ansible.builtin.shell: >
-        onevnet create /var/tmp/vnet_{{ validation.test_vm.vnet.name }}.template
+        onevnet create /var/tmp/vnet_{{ validation.test_vm.vnet_name }}.template
       register: test_network
       failed_when: "test_network.rc != 0"
-      when: validation.test_vm.vnet.name not in vnet_names
+      when: validation.test_vm.vnet_name not in vnet_names
     
     - name: Delete vnet definition
       file:
-        path: /var/tmp/vnet_{{ validation.test_vm.vnet.name }}.template
+        path: /var/tmp/vnet_{{ validation.test_vm.vnet_name }}.template
         state: absent
 
     - name: Verify test network creation

@@ -3,7 +3,7 @@
   block:
   - name: Attach NIC to test VM
     ansible.builtin.shell: >
-      onevm nic-attach -n '{{ validation.test_vm.vnet.name }}' {{ vm_id.stdout.split(':')[1] | trim }}
+      onevm nic-attach -n '{{ validation.test_vm.vnet_name }}' {{ vm_id.stdout.split(':')[1] | trim }}
 
   - name: Wait until NIC is attached
     ansible.builtin.shell: >
