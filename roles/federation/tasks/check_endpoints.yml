@@ -1,0 +1,97 @@
+---
+- name: Fetch federation zones from first frontend
+  set_fact:
+    federation_zones: "{{ hostvars[groups[_federation_zone_group][0]]['federation_zones'] }}"
+    federation_zone_endpoints: "{{ hostvars[groups[_federation_zone_group][0]]['federation_zone_endpoints'] }}"
+  when: hostvars[groups[_federation_zone_group][0]]['ansible_host'] != ansible_host
+
+- name: Parse endpoint URLs and prepare connectivity tests
+  set_fact:
+    endpoint_checks: []
+
+- name: Build endpoint checks list
+  set_fact:
+    endpoint_checks: "{{ endpoint_checks + [{'host': item | regex_search('https?://([^:]+):', '\\1') | first, 'port': item | regex_search(':([0-9]+)/', '\\1') | first, 'url': item}] }}"
+  loop: "{{ federation_zone_endpoints }}"
+
+- name: Display endpoints to check
+  ansible.builtin.debug:
+    msg: "Will check connectivity to: {{ endpoint_checks }}"
+
+- name: Test connectivity to each zone endpoint (XML-RPC port)
+  ansible.builtin.wait_for:
+    host: "{{ item.host }}"
+    port: "{{ item.port | int }}"
+    timeout: "{{ _federation_endpoint_timeout }}"
+  loop: "{{ endpoint_checks }}"
+  register: endpoint_connectivity
+  failed_when: false
+
+- name: Save endpoint connectivity results
+  set_fact:
+    verification_result: "{{ verification_result | combine({'Federation endpoint ' ~ item.item.url: 'reachable' if not item.failed else 'unreachable'}) }}"
+  loop: "{{ endpoint_connectivity.results }}"
+  loop_control:
+    label: "{{ item.item.url }}"
+
+- name: Verify all endpoints are reachable
+  ansible.builtin.assert:
+    that:
+      - endpoint_connectivity.results | selectattr('failed', 'equalto', true) | list | length == 0
+    fail_msg: "Some federation endpoints are unreachable"
+    success_msg: "All federation endpoints are reachable"
+
+- name: Test XML-RPC API on master zone (if this is slave)
+  block:
+    - name: Parse master endpoint
+      set_fact:
+        master_endpoint_url: "{{ one_federation_master_oned }}"
+        master_endpoint_ip: "{{ one_federation_master_oned | regex_search('://([0-9.]+):', '\\1') | first }}"
+
+    - name: Check network connectivity to master
+      ansible.builtin.shell: |
+        ping -c 1 -W 2 {{ master_endpoint_ip }} > /dev/null 2>&1 && echo "reachable" || echo "unreachable"
+      register: master_network_check
+      changed_when: false
+      failed_when: false
+
+    - name: Read oneadmin credentials from remote host
+      ansible.builtin.slurp:
+        src: /var/lib/one/.one/one_auth
+      register: oneadmin_auth_file
+      when: master_network_check.stdout == 'reachable'
+
+    - name: Test XML-RPC API call to master
+      ansible.builtin.uri:
+        url: "{{ master_endpoint_url }}"
+        method: POST
+        body: '<?xml version="1.0"?><methodCall><methodName>one.system.version</methodName><params><param><value><string>{{ oneadmin_auth }}</string></value></param></params></methodCall>'
+        headers:
+          Content-Type: "text/xml"
+        timeout: "{{ _federation_endpoint_timeout }}"
+        validate_certs: false
+      register: master_api_test
+      failed_when: false
+      vars:
+        oneadmin_auth: "{{ oneadmin_auth_file.content | b64decode | trim }}"
+      when: master_network_check.stdout == 'reachable'
+
+    - name: Save master API connectivity result (network unreachable)
+      set_fact:
+        verification_result: "{{ verification_result | combine({'Federation master API accessible': 'info - no L2 route to master'}) }}"
+      when: 
+        - master_network_check.stdout is defined
+        - master_network_check.stdout == 'unreachable'
+
+    - name: Save master API connectivity result (network reachable)
+      set_fact:
+        verification_result: "{{ verification_result | combine({'Federation master API accessible': 'ok' if master_api_test.status == 200 else 'failed'}) }}"
+      when: 
+        - master_network_check.stdout is defined
+        - master_network_check.stdout == 'reachable'
+        - master_api_test is defined
+  when:
+    - one_federation_mode is defined
+    - one_federation_mode == 'SLAVE'
+    - one_federation_master_oned is defined
+    - one_federation_master_oned != 'N/A'

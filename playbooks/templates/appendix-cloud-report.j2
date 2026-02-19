@@ -99,16 +99,43 @@
 
 <h2 class="western"><a name="_cgnw9t1vnxc8"></a> Verification of the OpenNebula cloud</h2></br>
 
-<table width="656" cellpadding="3" cellspacing="0" style="page-break-before: auto; page-break-after: auto">
-	
+{# Categorize verification results for better readability #}
+{% set ns = namespace(
+    core_services=[],
+    vm_tests=[],
+    vm_ha=[],
+    fe_ha=[],
+    federation=[],
+    other=[]
+) %}
+
+{% for k, v in verification_result.items() %}
+    {% if 'service' in k.lower() or 'opennebula version' in k.lower() or 'xml-rpc' in k.lower() %}
+        {% set _ = ns.core_services.append((k, v)) %}
+    {% elif 'test vm' in k.lower() or 'storage' in k.lower() and 'benchmark' not in k.lower() %}
+        {% set _ = ns.vm_tests.append((k, v)) %}
+    {% elif 'vm ha' in k.lower() or 'fencing' in k.lower() or 'host error' in k.lower() %}
+        {% set _ = ns.vm_ha.append((k, v)) %}
+    {% elif 'fe ha' in k.lower() or 'raft' in k.lower() or 'leader' in k.lower() %}
+        {% set _ = ns.fe_ha.append((k, v)) %}
+    {% elif 'federation' in k.lower() %}
+        {% set _ = ns.federation.append((k, v)) %}
+    {% else %}
+        {% set _ = ns.other.append((k, v)) %}
+    {% endif %}
+{% endfor %}
+
+{# Macro to render a table section #}
+{% macro render_verification_table(items, section_title) %}
+{% if items | length > 0 %}
+<h3 class="western">{{ section_title }}</h3>
+<table width="656" cellpadding="3" cellspacing="0" style="page-break-before: auto; page-break-after: auto; margin-bottom: 0.25in">
 	<col width="281"/>
 	<col width="200"/>
 	<col width="260"/>
 	<tr valign="top">
-		
 		<td width="300" bgcolor="#666666" style="background: #666666; border: 1.00pt solid #000000; padding: 0.07in"><p align="left" style="page-break-inside: auto; orphans: 0; widows: 0; border: none; padding: 0in; background: transparent; page-break-after: auto">
-			<font color="#ffffff"><font size="3" style="font-size: 12pt"><b>Verification
-			Point</b></font></font></p>
+			<font color="#ffffff"><font size="3" style="font-size: 12pt"><b>Verification Point</b></font></font></p>
 		</td>
 		<td width="90" bgcolor="#666666" style="background: #666666; border: 1.00pt solid #000000; padding: 0.07in"><p align="left" style="page-break-inside: auto; orphans: 0; widows: 0; border: none; padding: 0in; background: transparent; page-break-after: auto">
 			<font color="#ffffff"><font size="3" style="font-size: 12pt"><b>Result</b></font></font></p>
@@ -117,7 +144,7 @@
 			<font color="#ffffff"><font size="3" style="font-size: 12pt"><b>Comments</b></font></font></p>
 		</td>
 	</tr>
-         {% for k, v in verification_result.items() %}	
+	{% for k, v in items %}
 	<tr valign="top">
 		<td width="300" height="21" style="background: transparent; border: 1.00pt solid #000000; padding: 0.07in"><p align="left" style="page-break-inside: auto; orphans: 0; widows: 0; border: none; padding: 0in; background: transparent; page-break-after: auto">
 			<b>{{ k }}</b></p>
@@ -126,14 +153,82 @@
 			{{ v }}</p>
 		</td>
 		<td width="260" style="background: transparent; border: 1.00pt solid #000000; padding: 0.07in"><p align="left" style="page-break-inside: auto; orphans: 0; widows: 0; border: none; padding: 0in; background: transparent; page-break-after: auto">
-
 			</p>
 		</td>
 	</tr>
 	{% endfor %}
-
-	</p>
 </table>
+{% endif %}
+{% endmacro %}
+
+{# Render tables in logical order #}
+{{ render_verification_table(ns.core_services, "Core Services") }}
+{{ render_verification_table(ns.vm_tests, "VM Instantiation Tests") }}
+{{ render_verification_table(ns.vm_ha, "VM High Availability") }}
+{{ render_verification_table(ns.fe_ha, "Frontend High Availability") }}
+{{ render_verification_table(ns.federation, "Federation Configuration") }}
+{{ render_verification_table(ns.other, "Other Checks") }}
+
+{% if all_federation_results is defined and all_federation_results | length > 0 %}
+<h3 class="western">Federation Detailed Results (All Zones)</h3>
+<p style="margin-bottom: 0.15in"><i>Consolidated federation validation results across all zones/frontends.</i></p>
+
+{# Normalize check names by removing " on <hostname>" suffix and group by base check name #}
+{% set ns_fed = namespace(normalized_checks={}) %}
+{% for host, results in all_federation_results.items() %}
+	{% for check, value in results.items() %}
+		{# Remove " on <hostname>" from check name to normalize it #}
+		{% set base_check = check | regex_replace(' on [^\\s]+$', '') %}
+		{% if base_check not in ns_fed.normalized_checks %}
+			{% set _ = ns_fed.normalized_checks.update({base_check: {}}) %}
+		{% endif %}
+		{# Store value for this host under the normalized check name #}
+		{% set _ = ns_fed.normalized_checks[base_check].update({host: value}) %}
+	{% endfor %}
+{% endfor %}
+
+{# Get list of hosts #}
+{% set fed_hosts = all_federation_results.keys() | list %}
+
+<div class="table_component" role="region" tabindex="0">
+	<table style="border: 1px solid #dededf; width: 100%; border-collapse: collapse; border-spacing: 1px; font-size: 10pt;">
+		<colgroup>
+			<col style="width: 250px; min-width: 200px;">
+			{% for host in fed_hosts %}
+				<col style="width: auto;">
+			{% endfor %}
+		</colgroup>
+		<tr>
+			<th style="background-color: #666666; color: #ffffff; border: 1.00pt solid #000000; padding: 8px; text-align: left; font-size: 11pt; white-space: normal; word-wrap: break-word;">Check</th>
+			{% for host in fed_hosts %}
+				<th style="background-color: #666666; color: #ffffff; border: 1.00pt solid #000000; padding: 8px; text-align: center; font-size: 11pt; white-space: normal; word-wrap: break-word;">{{ host }}</th>
+			{% endfor %}
+		</tr>
+		{% for check, host_values in ns_fed.normalized_checks.items() %}
+		<tr>
+			<td style="border: 1.00pt solid #000000; padding: 8px; font-weight: normal; font-size: 10pt; white-space: normal; word-wrap: break-word; vertical-align: top;">{{ check }}</td>
+			{% for host in fed_hosts %}
+				{% set result = host_values.get(host, 'N/A') %}
+				{% set result_str = result|string|lower %}
+				{# Determine status type for color coding #}
+				{% if result == 'ok' or result == 'reachable' or result == 'active' or result == 'enabled' or result == 'running' or 'ok -' in result_str %}
+					{% set status_color = '#d4edda' %}
+				{% elif result == 'unreachable' or result == 'inactive' or result == 'failed' or result == 'unknown' or 'error' in result_str %}
+					{% set status_color = '#f8d7da' %}
+				{% elif 'warning' in result_str %}
+					{% set status_color = '#fff3cd' %}
+				{% elif result == 'N/A' %}
+					{% set status_color = '#e9ecef' %}
+				{% else %}
+					{% set status_color = '#ffffff' %}
+				{% endif %}
+				<td style="background: {{ status_color }}; border: 1.00pt solid #000000; padding: 8px; text-align: center; font-size: 10pt; white-space: normal; word-wrap: break-word; vertical-align: top;">{{ result }}</td>
+			{% endfor %}
+		</tr>
+		{% endfor %}
+	</table>
+</div>
+{% endif %}
 </div>
 
 

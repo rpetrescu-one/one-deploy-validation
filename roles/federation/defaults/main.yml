@@ -1,0 +1,44 @@
+---
+# Federation validation default variables
+
+# Zone group name (default 'frontend')
+_federation_zone_group: "{{ validation.federation.zone_group | d(frontend_group | d('frontend')) }}"
+
+# Timeout for endpoint connectivity tests (seconds)
+_federation_endpoint_timeout: "{{ validation.federation.endpoint_timeout | d(10) }}"
+
+# Expected federation mode (MASTER or SLAVE)
+_federation_expected_mode: "{{ validation.federation.expected_mode | d(omit) }}"
+
+# Expected zone count
+_federation_min_zones: "{{ validation.federation.min_zones | d(2) }}"
+
+# Check FireEdge configuration
+_federation_check_fireedge: "{{ validation.federation.check_fireedge | d(true) }}"
+
+# Check database backend consistency
+_federation_check_db_backend: "{{ validation.federation.check_db_backend | d(true) }}"
+
+# Verify oneadmin user consistency
+_federation_verify_oneadmin: "{{ validation.federation.verify_oneadmin | d(true) }}"
+
+# XML-RPC port
+_federation_xmlrpc_port: "{{ validation.federation.xmlrpc_port | d(2633) }}"
+
+# gRPC port
+_federation_grpc_port: "{{ validation.federation.grpc_port | d(2634) }}"
+
+# Federation configuration file
+_federation_oned_conf: "{{ validation.federation.oned_conf | d('/etc/one/oned.conf') }}"
+
+# FireEdge configuration file
+_federation_fireedge_conf: "{{ validation.federation.fireedge_conf | d('/etc/one/fireedge-server.conf') }}"
+
+# Advanced sync checks
+_federation_check_vdc_sync: "{{ validation.federation.check_vdc_sync | d(true) }}"
+_federation_check_marketplace_apps: "{{ validation.federation.check_marketplace_apps | d(true) }}"
+_federation_check_datastores: "{{ validation.federation.check_datastores | d(true) }}"
+_federation_check_vnets: "{{ validation.federation.check_vnets | d(true) }}"
+_federation_check_time_sync: "{{ validation.federation.check_time_sync | d(true) }}"
+_federation_max_time_drift: "{{ validation.federation.max_time_drift | d(60) }}"  # seconds
+_federation_max_replication_lag: "{{ validation.federation.max_replication_lag | d(300) }}"  # 5 minutes

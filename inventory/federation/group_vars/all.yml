@@ -1,0 +1,56 @@
+---
+# Federation Cluster Configuration
+
+# Disable tests not needed for federation validation
+validation:
+  # Disable VM and storage tests
+  run_test_vm: false
+  run_storage_benchmark: false
+  run_conn_matrix: false
+  run_vm_ha: false
+  run_fe_ha: false
+  
+  # Enable federation validation
+  run_federation: true
+  
+  # Federation specific configuration
+  federation:
+    # Expected minimum zones (you have 3 zones: 0, 100, 101)
+    min_zones: 2
+    
+    # Timeout for endpoint connectivity tests (seconds)
+    endpoint_timeout: 15
+    
+    # Check FireEdge configuration
+    check_fireedge: true
+    
+    # Check database backend consistency (you use MySQL)
+    check_db_backend: true
+    
+    # Verify oneadmin user consistency
+    verify_oneadmin: true
+    
+    # Zone group (defaults to frontend_group or 'frontend')
+    zone_group: frontend
+    
+    # XML-RPC port (default: 2633)
+    xmlrpc_port: 2633
+    
+    # gRPC port (default: 2634)
+    grpc_port: 2634
+    
+    # oned configuration file
+    oned_conf: /etc/one/oned.conf
+    
+    # FireEdge configuration file
+    fireedge_conf: /etc/one/fireedge-server.conf
+
+# Frontend and node group names
+frontend_group: frontend
+node_group: node
+
+# Ansible configuration
+ansible_python_interpreter: /usr/bin/python3
+
+# SSH connection settings
+ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
