@@ -16,7 +16,7 @@
 # Delete test network only when it was created by us
 - name: Cleanup created test network
   ansible.builtin.shell: |
-    onevnet delete "{{ validation.test_vm.vnet.name }}"
+    onevnet delete "{{ validation.test_vm.vnet_name }}"
   register: cleanup_result
   failed_when: "cleanup_result.rc != 0"
   when: validation.test_vm.create_vnet and not validation.test_vm.vm.check_connection

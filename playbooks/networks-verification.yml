@@ -1,0 +1,5 @@
+---
+- hosts: "{{ frontend_group | d('frontend') }}"
+  roles:
+    - role: validation
+

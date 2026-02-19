@@ -1,0 +1,145 @@
+---
+- name: Get user count
+  ansible.builtin.shell: oneuser list --no-header | wc -l
+  register: user_count
+  become: true
+  become_user: oneadmin
+  changed_when: false
+
+- name: Get group count
+  ansible.builtin.shell: onegroup list --no-header | wc -l
+  register: group_count
+  become: true
+  become_user: oneadmin
+  changed_when: false
+
+- name: Get VDC count
+  ansible.builtin.shell: onevdc list --no-header | wc -l
+  register: vdc_count
+  become: true
+  become_user: oneadmin
+  changed_when: false
+  failed_when: false
+
+- name: Display federated data counts
+  ansible.builtin.debug:
+    msg:
+      - "Users: {{ user_count.stdout }}"
+      - "Groups: {{ group_count.stdout }}"
+      - "VDCs: {{ vdc_count.stdout | default('N/A') }}"
+
+- name: Verify basic federated data exists
+  ansible.builtin.assert:
+    that:
+      - user_count.stdout | int > 0
+      - group_count.stdout | int > 0
+    fail_msg: "No users or groups found, federation data may not be synchronized"
+    success_msg: "Federated data present: {{ user_count.stdout }} users, {{ group_count.stdout }} groups"
+
+- name: Save federated data counts to verification results
+  set_fact:
+    verification_result: "{{ verification_result | combine({
+      'Federation users count on ' ~ inventory_hostname: user_count.stdout | int,
+      'Federation groups count on ' ~ inventory_hostname: group_count.stdout | int
+    }) }}"
+
+- name: Verify oneadmin user exists
+  block:
+    - name: Get oneadmin user details
+      ansible.builtin.shell: oneuser show oneadmin -j
+      register: oneadmin_user_json
+      become: true
+      become_user: oneadmin
+      changed_when: false
+
+    - name: Parse oneadmin user ID and auth driver
+      set_fact:
+        oneadmin_user_id: "{{ (oneadmin_user_json.stdout | from_json).USER.ID }}"
+        oneadmin_auth_driver: "{{ (oneadmin_user_json.stdout | from_json).USER.AUTH_DRIVER }}"
+
+    - name: Verify oneadmin user ID is 0
+      ansible.builtin.assert:
+        that:
+          - oneadmin_user_id == "0"
+        fail_msg: "oneadmin user ID is {{ oneadmin_user_id }}, expected 0"
+        success_msg: "oneadmin user is properly configured (ID: {{ oneadmin_user_id }})"
+
+    - name: Save oneadmin verification to results
+      set_fact:
+        verification_result: "{{ verification_result | combine({'Federation oneadmin user': 'ok'}) }}"
+  when: _federation_verify_oneadmin | bool
+
+- name: Check database backend type
+  ansible.builtin.shell: grep -E "^DB\s*=\s*\[" {{ _federation_oned_conf }} -A 10 | grep -oP 'BACKEND\s*=\s*"\K[^"]+' | head -n 1
+  register: db_backend_actual
+  changed_when: false
+  failed_when: false
+
+- name: Save database backend to verification results
+  set_fact:
+    verification_result: "{{ verification_result | combine({'Federation database backend on ' ~ inventory_hostname: db_backend_actual.stdout | default('unknown')}) }}"
+    one_db_backend: "{{ db_backend_actual.stdout | default('sqlite') }}"
+  when: db_backend_actual.stdout is defined
+
+- name: Check federation log status (MySQL/MariaDB only)
+  block:
+    - name: Get MySQL credentials
+      ansible.builtin.shell: grep -E "^DB\s*=\s*\[" {{ _federation_oned_conf }} -A 10 | grep -oP '(USER|PASSWD|DB_NAME)\s*=\s*"\K[^"]+'
+      register: mysql_config
+      changed_when: false
+      failed_when: false
+
+    - name: Parse MySQL connection details
+      set_fact:
+        mysql_user: "{{ mysql_config.stdout_lines[0] | default('oneadmin') }}"
+        mysql_password: "{{ mysql_config.stdout_lines[1] | default('') }}"
+        mysql_database: "{{ mysql_config.stdout_lines[2] | default('opennebula') }}"
+      when: mysql_config.stdout_lines | length >= 3
+
+    - name: Check federation log table
+      ansible.builtin.shell: |
+        mysql -u {{ mysql_user }} {% if mysql_password != '' %}-p'{{ mysql_password }}'{% endif %} {{ mysql_database }} -e "SELECT COUNT(*) as log_count FROM logdb;" | tail -n 1
+      register: federation_log_count
+      changed_when: false
+      failed_when: false
+      when: mysql_user is defined
+
+    - name: Save federation log status to verification results
+      set_fact:
+        verification_result: "{{ verification_result | combine({'Federation log entries on ' ~ inventory_hostname: federation_log_count.stdout | default('N/A')}) }}"
+      when: federation_log_count.stdout is defined and federation_log_count.stdout != ''
+
+    - name: Display federation log count
+      ansible.builtin.debug:
+        msg: "Federation log has {{ federation_log_count.stdout | default('N/A') }} entries"
+      when: federation_log_count.stdout is defined
+  when:
+    - _federation_check_db_backend | bool
+    - one_db_backend is defined
+    - one_db_backend == 'mysql'
+
+- name: Get marketplace count (federated resource)
+  ansible.builtin.shell: onemarket list --no-header | wc -l
+  register: marketplace_count
+  become: true
+  become_user: oneadmin
+  changed_when: false
+  failed_when: false
+
+- name: Save marketplace count to verification results
+  set_fact:
+    verification_result: "{{ verification_result | combine({'Federation marketplaces count on ' ~ inventory_hostname: marketplace_count.stdout | int}) }}"
+  when: marketplace_count.stdout is defined
+
+- name: Check ACL rules count (federated resource)
+  ansible.builtin.shell: oneacl list --no-header | wc -l
+  register: acl_count
+  become: true
+  become_user: oneadmin
+  changed_when: false
+  failed_when: false
+
+- name: Save ACL count to verification results
+  set_fact:
+    verification_result: "{{ verification_result | combine({'Federation ACL rules count on ' ~ inventory_hostname: acl_count.stdout | int}) }}"
+  when: acl_count.stdout is defined

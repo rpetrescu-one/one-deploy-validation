@@ -1,0 +1,29 @@
+---
+# Default variables for LDAP authentication checks
+validation:
+  run_ldap_auth: false
+  ldap_auth:
+    server: "127.0.0.1"
+    port: 389
+    base_dn: "dc=example,dc=com"
+    bind_dn: ""
+    bind_pass: ""
+    ldap_user: ""
+    ldap_pass: ""
+    local_user: "oneadmin"
+    local_auth_file: "/var/lib/one/.one/one_auth"
+    group_mapping:
+      expected_group_name: ""
+      expected_group_id: ""
+      ldap_group_dn: ""
+      ldap_group_member_attr: "memberUid"
+    fireedge_host: ""
+    fireedge_port: ""
+    fireedge_proto: "https"
+    fireedge_login_endpoint: "/fireedge/api/auth/"
+    fireedge_skip_tls_verify: true
+    rpc2_host: ""
+    rpc2_port: ""
+    rpc2_proto: "http"
+    rpc2_path: "/RPC2"
+    rpc2_skip_tls_verify: true

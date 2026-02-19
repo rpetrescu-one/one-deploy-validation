@@ -39,6 +39,14 @@ validation:
       # Add other services if more should be checked.
     check_fireedge_ui: true
 
+  # TEST CASE NAME: Networking subsystem validation
+  # DESCRIPTION: Instantiates a VM at each OpenNebula vNET, checks external connectivity
+  # from the test VM
+  # OUTPUT: HTML document at /tmp/cloud_verification_report.html
+  networks_verification: true
+  network:
+    ext_host: 'google.com'
+
   # TEST CASE NAME: Storage Benchmark
   # DESCRIPTION: Instantiates a VM for running storage benchmark from it. The VM needs to
   # have public internet access to install dependencies. The VM's connected network can
@@ -90,13 +98,14 @@ validation:
           TOKEN="YES" 
         ]
     create_vnet: false
+    vnet_name: 'public'
     vnet:
       name: 'public'
       desc: 'A test network for post-deployment cloud verification'
-      bridge: 'br-test'
+      bridge: 'br0'
       vn_mad: 'dummy'
-      phydev: 'eth1'
-      network_address: '192.168.150.100'
+      phydev: ''
+      network_address: '192.168.150.0'
       network_mask: '255.255.255.0'
       dns: '8.8.8.8'
       gateway: '192.168.150.1'
@@ -104,6 +113,32 @@ validation:
         - type: "IP4"
           ip: '192.168.150.100'
           size: '10'
+
+  # TEST CASE NAME: LDAP Authentication
+  # DESCRIPTION: Validates LDAP bind, OpenNebula LDAP auth configuration, LDAP login to XML-RPC,
+  # FireEdge UI login via LDAP, and verifies local auth fallback.
+  # OUTPUT: HTML document at /tmp/cloud_verification_report.html
+  run_ldap_auth: true
+  ldap_auth:
+    server: "172.20.0.7:389"
+    base_dn: "dc=example,dc=com"
+    bind_dn: "uid=admin,dc=example,dc=com"
+    bind_pass: "newpassword"
+    ldap_user: "oneuser"
+    ldap_pass: "onepassword"
+    local_user: "oneadmin"
+    local_auth_file: "/var/lib/one/.one/one_auth"
+    group_mapping:
+      expected_group_name: "opennebula-group"
+      expected_group_id: ""
+      ldap_group_dn: "cn=opennebula-group,ou=group,dc=example,dc=com"
+      ldap_group_member_attr: "memberUid"
+    fireedge_proto: "http"
+    fireedge_login_endpoint: "/fireedge/api/auth/"
+    fireedge_skip_tls_verify: true
+    rpc2_proto: "http"
+    rpc2_path: "/RPC2"
+    rpc2_skip_tls_verify: true
 
   # TEST CASE NAME: VM High Availability
   # DESCRIPTION: The prerequisite is to have VM HA configured, see details in OpenNebula documentation.
@@ -132,3 +167,31 @@ validation:
       - /etc/one
       - /var/lib/one/remotes/etc
     one_zone_name: OpenNebula
+
+  # TEST CASE NAME: Federation Validation
+  # DESCRIPTION: Validates OpenNebula Federation configuration and data synchronization across zones.
+  # Checks federation configuration (MODE, ZONE_ID, MASTER_ONED), zone discovery, endpoint connectivity,
+  # federated data synchronization (users, groups, VDCs, ACL rules, marketplaces), database backend consistency,
+  # FireEdge configuration, and oneadmin user consistency across zones.
+  # OUTPUT: HTML document at /tmp/cloud_verification_report.html
+  run_federation: false
+  federation:
+    # Minimum number of zones expected in the federation
+    min_zones: 2
+    # Timeout for endpoint connectivity tests (seconds)
+    endpoint_timeout: 10
+    # Check FireEdge configuration
+    check_fireedge: true
+    # Check database backend consistency
+    check_db_backend: true
+    # Verify oneadmin user consistency
+    verify_oneadmin: true
+    # Zone group (defaults to frontend_group or 'frontend')
+    zone_group: frontend
+    # XML-RPC port (default: 2633)
+    xmlrpc_port: 2633
+    # gRPC port (default: 2634)
+    grpc_port: 2634
+    # Configuration files
+    oned_conf: /etc/one/oned.conf
+    fireedge_conf: /etc/one/fireedge-server.conf

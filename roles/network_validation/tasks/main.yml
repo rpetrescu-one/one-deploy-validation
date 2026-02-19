@@ -1,0 +1,123 @@
+---
+
+# Gather min subset of facts for datetime
+- setup:
+    gather_subset:
+    - min
+
+# These tasks are used to test networks, reachability of the default gw, DNS and external connectivity
+- name: Get all OpenNebula networks
+  ansible.builtin.shell: >
+    onevnet list -j | jq .VNET_POOL.VNET[].NAME -r
+  register: one_networks
+  failed_when: "one_networks.rc != 0"
+  run_once: true
+    
+- name: Print network list
+  debug:
+    msg: "Virtual Networks for testing: {{ one_networks.stdout }}"
+  run_once: true
+
+# We'll use VM template from the test_vm role 
+#
+- name: Instantiate VM at each network
+  ansible.builtin.shell: >
+    onetemplate instantiate '{{ validation.test_vm.vm.market_name }}' --nic '{{ item }}'
+  register: vms
+  failed_when: "vms.rc != 0"
+  loop: "{{ one_networks.stdout.splitlines() }}"
+  run_once: true
+
+- name: Wait for VM come up
+  ansible.builtin.shell: >
+    onevm list --f ID={{ item.stdout.split(':')[1] | trim}} -l STAT --no-header
+  register: vm_state
+  failed_when: "vm_state.rc != 0"
+  until: vm_state.stdout == "runn"
+  retries: 10
+  delay: 10
+  loop: "{{ vms.results }}"
+  run_once: true
+
+- name: Get VM IP
+  ansible.builtin.shell: >
+    onevm list --f ID={{item.stdout.split(':')[1] | trim}} -l IP --no-header
+  register: vm_ip
+  loop: "{{ vms.results }}"
+  run_once: true
+
+- name: Verify ssh connection to the test VM
+  ansible.builtin.shell: >
+    ssh -i ~oneadmin/.ssh/id_rsa -o StrictHostKeyChecking=no root@{{item.stdout}} hostname
+  register: vm_ssh_result
+  until: vm_ssh_result.rc == 0
+  retries: 10
+  delay: 10
+  loop: "{{ vm_ip.results }}"
+  run_once: true
+
+- name: Save VM IPs to list
+  set_fact:
+    vm_ips_list: "{{ vm_ip.results | map(attribute='stdout') | list }}"
+
+- name: Install required packages
+  ansible.builtin.shell: |
+    ssh -i ~oneadmin/.ssh/id_rsa -o StrictHostKeyChecking=no root@{{item.stdout}} apk update
+    ssh -i ~oneadmin/.ssh/id_rsa -o StrictHostKeyChecking=no root@{{item.stdout}} apk add bind-tools jq jc
+  register: installation_result
+  loop: "{{ vm_ip.results }}"
+  run_once: true
+
+- name: Check GW reachability from VM
+  ansible.builtin.shell: |
+    ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{item.stdout}} ping -c 3 $(ip route show default | awk '/default/ {print $3}') | jc --ping --pretty
+  register: gw_reachability
+  loop: "{{ vm_ip.results }}"
+  run_once: true
+
+- name: Check DNS resolvation
+  ansible.builtin.shell: |
+    ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{item.stdout}} dig {{ validation.network.ext_host  }}   | jc --dig -p | jq .[].answer.[].data
+  register: dns_reachability
+  loop: "{{ vm_ip.results }}"
+  run_once: true
+
+- name: Check external host reachability from the test VM
+  ansible.builtin.shell: |
+    ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{item.stdout}} ping -c 3 {{ validation.network.ext_host  }} | jc --ping --pretty
+  register: ext_host_reachability
+  loop: "{{ vm_ip.results }}"
+  run_once: true
+
+- name: Save GW test results to list
+  set_fact:
+    gw_reachability_list: "{{ gw_reachability_list | default([]) + [item.stdout] }}"
+  loop: "{{ gw_reachability.results }}"
+  run_once: true
+
+- name: Save ext host ping test results to list
+  set_fact:
+    ext_host_reachability_list: "{{ ext_host_reachability_list | default([]) + [item.stdout] }}"
+  loop: "{{ ext_host_reachability.results }}"
+  run_once: true
+
+- name: Save DNS resolvation test results to list
+  set_fact:
+    dns_reachability_list: "{{ dns_reachability_list | default([]) + [item.stdout] }}"
+  loop: "{{ dns_reachability.results }}"
+  run_once: true
+
+- name: Save VM IPs for report
+  set_fact:
+    network_verification_results: "{{ (network_verification_results | default({})) | combine({item.0: {'Test VM IP': item.1, '\nNetwork GW ping, packet received': item.2, '\nExternal Host ping: ': item.3, '\nExternal host DNS resolvation':item.4}}) }}"
+  loop: "{{ one_networks.stdout.splitlines() | zip(vm_ips_list, gw_reachability_list, ext_host_reachability_list, dns_reachability_list) | list }}"
+
+
+- name: Remove test VMs
+  ansible.builtin.shell: >
+    onevm terminate '{{ item.stdout.split(':')[1] | trim }}'
+  register: terminated_vms
+  failed_when: "terminated_vms.rc != 0"
+  loop: "{{ vms.results }}"
+  run_once: true
+

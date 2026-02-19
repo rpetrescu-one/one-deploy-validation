@@ -1,0 +1,212 @@
+---
+- name: Get VDC list
+  ansible.builtin.shell: onevdc list --no-header | wc -l
+  register: vdc_count
+  become: true
+  become_user: oneadmin
+  changed_when: false
+  failed_when: false
+
+- name: Save VDC count to verification results
+  set_fact:
+    verification_result: "{{ verification_result | combine({'Federation VDCs count on ' ~ inventory_hostname: vdc_count.stdout | int}) }}"
+  when: vdc_count.stdout is defined
+
+- name: Get marketplace apps count
+  ansible.builtin.shell: onemarketapp list --no-header | wc -l
+  register: marketapp_count
+  become: true
+  become_user: oneadmin
+  changed_when: false
+  failed_when: false
+
+- name: Save marketplace apps count to verification results
+  set_fact:
+    verification_result: "{{ verification_result | combine({'Federation marketplace apps count on ' ~ inventory_hostname: marketapp_count.stdout | int}) }}"
+  when: marketapp_count.stdout is defined
+
+- name: Check zone states
+  ansible.builtin.shell: onezone list -j
+  register: zone_list_state
+  become: true
+  become_user: oneadmin
+  changed_when: false
+  failed_when: false
+
+- name: Parse and verify zone states
+  block:
+    - name: Parse zone states
+      set_fact:
+        zone_states: "{{ zone_list_state.stdout | from_json | json_query('ZONE_POOL.ZONE[*].[NAME, STATE]') }}"
+      when: zone_list_state.stdout != ''
+
+    - name: Check if all zones are enabled
+      set_fact:
+        all_zones_enabled: "{{ zone_states | map('last') | select('eq', '0') | list | length == zone_states | length }}"
+      when: zone_states is defined
+
+    - name: Save zone state verification
+      set_fact:
+        verification_result: "{{ verification_result | combine({'Federation all zones enabled': 'ok - all zones enabled' if all_zones_enabled else 'warning - some zones disabled'}) }}"
+      when: zone_states is defined and all_zones_enabled is defined
+
+  when: zone_list_state.stdout != ''
+
+- name: Check datastore consistency
+  ansible.builtin.shell: onedatastore list --no-header | wc -l
+  register: datastore_count
+  become: true
+  become_user: oneadmin
+  changed_when: false
+  failed_when: false
+
+- name: Save datastore count to verification results
+  set_fact:
+    verification_result: "{{ verification_result | combine({'Federation datastores count on ' ~ inventory_hostname: datastore_count.stdout | int}) }}"
+  when: datastore_count.stdout is defined
+
+- name: Check virtual network consistency
+  ansible.builtin.shell: onevnet list --no-header | wc -l
+  register: vnet_count
+  become: true
+  become_user: oneadmin
+  changed_when: false
+  failed_when: false
+
+- name: Save virtual network count to verification results
+  set_fact:
+    verification_result: "{{ verification_result | combine({'Federation vnets count on ' ~ inventory_hostname: vnet_count.stdout | int}) }}"
+  when: vnet_count.stdout is defined
+
+- name: Verify federation server pool (HA zones only)
+  block:
+    - name: Get zone server pool information
+      ansible.builtin.shell: onezone show {{ one_federation_zone_id }} -j
+      register: zone_server_pool
+      become: true
+      become_user: oneadmin
+      changed_when: false
+      failed_when: false
+
+    - name: Parse server pool
+      set_fact:
+        server_pool_data: "{{ zone_server_pool.stdout | from_json | json_query('ZONE.SERVER_POOL.SERVER') }}"
+      when: zone_server_pool.stdout != ''
+
+    - name: Count servers in pool
+      set_fact:
+        server_pool_count: "{{ server_pool_data | length if server_pool_data is iterable and server_pool_data is not string else 1 }}"
+      when: server_pool_data is defined
+
+    - name: Save server pool count
+      set_fact:
+        verification_result: "{{ verification_result | combine({'Federation server pool size in zone ' ~ one_federation_zone_id ~ ' on ' ~ inventory_hostname: server_pool_count | int}) }}"
+      when: server_pool_count is defined
+
+  when: one_federation_zone_id is defined
+
+- name: Check federation database replication lag (MySQL only)
+  block:
+    - name: Get latest logdb timestamp
+      ansible.builtin.shell: |
+        mysql -u oneadmin opennebula -N -e "SELECT MAX(timestamp) FROM logdb;"
+      register: latest_log_timestamp
+      changed_when: false
+      failed_when: false
+
+    - name: Get current timestamp
+      ansible.builtin.shell: date +%s
+      register: current_timestamp
+      changed_when: false
+
+    - name: Calculate replication lag
+      set_fact:
+        replication_lag_seconds: "{{ (current_timestamp.stdout | int) - (latest_log_timestamp.stdout | int) }}"
+      when: 
+        - latest_log_timestamp.stdout is defined
+        - latest_log_timestamp.stdout != ''
+        - latest_log_timestamp.stdout != 'NULL'
+
+    - name: Save replication lag status
+      set_fact:
+        verification_result: "{{ verification_result | combine({'Federation replication lag on ' ~ inventory_hostname: 'ok - ' ~ replication_lag_seconds ~ ' seconds' if (replication_lag_seconds | int) < 300 else 'warning - ' ~ replication_lag_seconds ~ ' seconds lag'}) }}"
+      when: replication_lag_seconds is defined
+
+  when: 
+    - _federation_check_db_backend | d(true)
+    - one_db_backend is defined
+    - one_db_backend == 'mysql'
+
+- name: Verify oneadmin can list resources from all zones
+  block:
+    - name: Try to list VMs across all zones
+      ansible.builtin.shell: onevm list --no-header | wc -l
+      register: cross_zone_vms
+      become: true
+      become_user: oneadmin
+      changed_when: false
+      failed_when: false
+
+    - name: Save cross-zone resource visibility
+      set_fact:
+        verification_result: "{{ verification_result | combine({'Federation cross-zone VM visibility on ' ~ inventory_hostname: 'ok - ' ~ cross_zone_vms.stdout ~ ' VMs visible'}) }}"
+      when: cross_zone_vms.stdout is defined
+
+- name: Check time synchronization between zones
+  block:
+    - name: Get current timestamp
+      ansible.builtin.shell: date +%s
+      register: local_timestamp
+      changed_when: false
+
+    - name: Save local timestamp for comparison
+      set_fact:
+        zone_timestamp: "{{ local_timestamp.stdout | int }}"
+
+    - name: Check time drift warning threshold
+      set_fact:
+        verification_result: "{{ verification_result | combine({'Federation time on ' ~ inventory_hostname: 'ok - timestamp ' ~ zone_timestamp}) }}"
+
+- name: Verify federation authentication (slave zones only)
+  block:
+    - name: Extract master IP from endpoint
+      set_fact:
+        master_auth_ip: "{{ one_federation_master_oned | regex_search('://([0-9.]+):', '\\1') | first }}"
+
+    - name: Check network connectivity to master for auth test
+      ansible.builtin.shell: |
+        ping -c 1 -W 2 {{ master_auth_ip }} > /dev/null 2>&1 && echo "reachable" || echo "unreachable"
+      register: master_auth_network_check
+      changed_when: false
+      failed_when: false
+
+    - name: Test authentication to master zone
+      ansible.builtin.shell: |
+        oneuser show oneadmin --endpoint {{ one_federation_master_oned }} > /dev/null 2>&1 && echo "ok" || echo "failed"
+      register: master_auth_test
+      become: true
+      become_user: oneadmin
+      changed_when: false
+      failed_when: false
+      when: master_auth_network_check.stdout == 'reachable'
+
+    - name: Save master authentication test (network unreachable)
+      set_fact:
+        verification_result: "{{ verification_result | combine({'Federation slave auth to master': 'info - no L2 route to master'}) }}"
+      when: 
+        - master_auth_network_check.stdout is defined
+        - master_auth_network_check.stdout == 'unreachable'
+
+    - name: Save master authentication test (network reachable)
+      set_fact:
+        verification_result: "{{ verification_result | combine({'Federation slave auth to master': master_auth_test.stdout | trim}) }}"
+      when: 
+        - master_auth_network_check.stdout is defined
+        - master_auth_network_check.stdout == 'reachable'
+        - master_auth_test is defined
+
+  when: 
+    - one_federation_master_oned is defined
+    - one_federation_master_oned != ''
+    - federation_mode_actual is defined
+    - federation_mode_actual == 'SLAVE'

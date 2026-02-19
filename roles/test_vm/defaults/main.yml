@@ -3,8 +3,10 @@ _test_vm_name: "{{ validation.test_vm.vm.market_name | d('Alpine Linux 3.21') }}
 # Vars for the test network
 validation:
   test_vm:
-    # Should we create a test network or reuse existing net? Existin network defined in {{validation.test_vm.vnet.name}} var
+    # Should we create a test network or reuse existing net? Existing network defined in {{validation.test_vm.vnet_name}} var
     create_vnet: true
+    # Name of the virtual network to use (either existing or to be created)
+    vnet_name: 'VLAN_580'
     vm:
       check_connection: true
       market_name: 'Alpine Linux 3.21'
