@@ -1,0 +1,17 @@
+---
+- name: Initialize LLM results accumulator
+  ansible.builtin.set_fact:
+    _llm: {}
+
+- name: Ensure benchmark artifacts directory exists on the frontend
+  ansible.builtin.file:
+    path: /tmp/gpu_benchmark
+    state: directory
+    mode: "0755"
+
+- name: Benchmark each GPU host
+  ansible.builtin.include_tasks: llm_benchmark_host.yml
+  loop: "{{ _gpu_inventory.hosts }}"
+  loop_control:
+    loop_var: _llm_host
+    label: "host {{ _llm_host.host_id }}"

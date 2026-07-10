@@ -9,6 +9,10 @@
       when: validation.run_test_vm | d(true)
     - role: storage-benchmark
       when: validation.run_storage_benchmark | d(true)
+    - role: gpu-benchmark
+      when: validation.run_gpu_benchmark | d(false)
+      tags:
+        - gpu_benchmark
     - role: ldap_auth
       when: validation.run_ldap_auth | d(false)
       tags:
@@ -78,6 +82,10 @@
   gather_facts: false
   become: false
   vars:
+    report_name: "{{ hostvars[groups[frontend_group | d('frontend')][0]].inventory_dir | default('report', true) | basename }}"
+    report_html: "/tmp/cloud_verification_report_{{ report_name }}.html"
+    report_pdf: "/tmp/cloud_verification_report_{{ report_name }}.pdf"
+    report_css: "/tmp/print_fix_{{ report_name }}.css"
     report_frontend_host: "{{ groups[frontend_group | d('frontend')][0] }}"
     report_verification_result: "{{ hostvars[report_frontend_host].verification_result | default({'No verification results were found': 'N/A'}) }}"
     report_verification_comments: "{{ hostvars[report_frontend_host].verification_comments | default({}) }}"
@@ -126,6 +134,13 @@
       # Merge storage_benchmark maps built by the role
       ansible.builtin.set_fact:
         storage_benchmark: "{{ storage_benchmark | default({}) | combine(hostvars[item].storage_benchmark | default({}), recursive=True) }}"
+      loop: "{{ groups[frontend_group | d('frontend')] }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Collect GPU benchmark results from frontend hosts
+      ansible.builtin.set_fact:
+        gpu_benchmark_results: "{{ gpu_benchmark_results | default({}) | combine(hostvars[item].gpu_benchmark_results | default({}), recursive=True) }}"
       loop: "{{ groups[frontend_group | d('frontend')] }}"
       loop_control:
         label: "{{ item }}"
@@ -558,7 +573,7 @@
     - name: Render report
       template:
         src: "appendix-cloud-report.j2"
-        dest: /tmp/cloud_verification_report.html
+        dest: "{{ report_html }}"
       vars:
         repo_version: "{{ repo_version_cmd.stdout }}"
         date: "{{ lookup('pipe', 'date +%Y-%m-%d\\ %H:%M:%S') }}"
@@ -577,16 +592,16 @@
     - name: Render PDF print stylesheet
       ansible.builtin.template:
         src: "print_fix.css"
-        dest: /tmp/print_fix.css
+        dest: "{{ report_css }}"
 
     - name: Generate PDF report
       ansible.builtin.command:
         argv:
           - weasyprint
           - -s
-          - /tmp/print_fix.css
-          - /tmp/cloud_verification_report.html
-          - /tmp/cloud_verification_report.pdf
+          - "{{ report_css }}"
+          - "{{ report_html }}"
+          - "{{ report_pdf }}"
       register: report_pdf_cmd
       changed_when: report_pdf_cmd.rc == 0
 
@@ -594,6 +609,6 @@
       ansible.builtin.debug:
         msg: |
           ******************************************************
-          Verification report rendered to /tmp/cloud_verification_report.html
-          PDF report rendered to /tmp/cloud_verification_report.pdf
+          Verification report rendered to {{ report_html }}
+          PDF report rendered to {{ report_pdf }}
           ******************************************************

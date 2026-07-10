@@ -1,0 +1,28 @@
+---
+- name: Reset GPU discovery accumulators
+  ansible.builtin.set_fact:
+    _gpu_hosts: []
+
+- name: Query host PCI devices
+  become: true
+  become_user: oneadmin
+  ansible.builtin.shell: "onehost show -j {{ _host_id }}"
+  register: _onehost
+  changed_when: false
+  loop: "{{ current_cluster.host_ids }}"
+  loop_control:
+    loop_var: _host_id
+
+- name: Build per-host GPU inventory
+  ansible.builtin.include_tasks: discover_host.yml
+  loop: "{{ current_cluster.host_ids | zip(_onehost.results) | list }}"
+  loop_control:
+    loop_var: _host_pair
+    label: "host {{ _host_pair.0 }}"
+
+- name: Assemble cluster GPU inventory
+  ansible.builtin.set_fact:
+    _gpu_inventory:
+      gpu_count: "{{ _gpu_hosts | map(attribute='gpu_count') | map('int') | sum }}"
+      devices: "{{ _gpu_hosts | map(attribute='devices') | flatten }}"
+      hosts: "{{ _gpu_hosts }}"

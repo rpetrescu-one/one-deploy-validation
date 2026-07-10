@@ -83,6 +83,19 @@ validation:
   storage_benchmark:
     vnet_name: public
 
+  # TEST CASE NAME: GPU / LLM Benchmark
+  # DESCRIPTION: Discovers NVIDIA GPUs on each cluster's hosts, runs a GPU-health
+  # check (nvidia-smi incl. PCIe link width + cuBLAS per GPU) and a vLLM/GuideLLM
+  # inference benchmark (one 'vLLM Inference Engine' appliance VM per model). Collects metrics,
+  # flags anomalies against GuideLLM SLO thresholds. Requires GPU passthrough
+  # already prepared by one-deploy and (by default) egress to download
+  # models/toolkit. Config lives in the top-level `gpu_benchmark:` block below.
+  # OUTPUT: HTML document at /tmp/cloud_verification_report.html + raw GuideLLM
+  # JSONs and a summary.json (full results dump, usable as a baseline) under
+  # /tmp/gpu_benchmark/ on the frontend; the per-cluster status also appears in
+  # the report's summary checks table.
+  run_gpu_benchmark: false
+
   # TEST CASE NAME: Network Benchmark
   # DESCRIPTION: Runs an iperf bandwidth and ping benchmark between all hypervisor hosts
   # that are listed in the inventory.
@@ -246,3 +259,75 @@ validation:
     #       - "10.126.208.6"
     #       - "10.127.208.6"
     hypervisors: {}
+
+# gpu-benchmark role config. This PARTIAL dict is merged recursively over the role
+# defaults by the role itself — you only need to list the keys you change.
+# Only consulted when validation.run_gpu_benchmark is true.
+# The default appliance is the ONEAI Project's 'vLLM Inference Engine'
+# (one-apps appliances/Vllm): the ONEAI marketplace (MARKET_MAD=one) must be
+# registered in OpenNebula so `onemarketapp export` can find the app by name.
+# Gated HuggingFace models (Llama) need hf_token (appliance var ONEAPP_VLLM_MODEL_TOKEN).
+# NOTE: the appliance is x86-64 only. On aarch64 hosts (e.g. GB200) set
+# appliance_market_name to an aarch64 vLLM appliance/image.
+gpu_benchmark:
+  appliance_market_name: 'vLLM Inference Engine'
+  vnet_name: public
+  models:
+    - "Qwen/Qwen2.5-3B-Instruct"
+    # Full certification set (needs larger GPUs; Llama is gated -> set hf_token):
+    # - "Qwen/Qwen2.5-14B-Instruct"
+    # - "meta-llama/Llama-3.2-3B-Instruct"
+    # - "meta-llama/Llama-3.2-7B-Instruct"
+  hf_token: ""
+  thresholds:
+    profile: chat
+    ttft_p95_ms: 200
+    itl_p95_ms: 50
+    min_throughput_req_s: null
+  # Hardware-calibrated reference SLOs (avoid false positives from the
+  # GB200-class chat SLOs above on smaller GPUs). Keyed by nvidia-smi GPU name
+  # -> HF model id -> PARTIAL thresholds merged over `thresholds` for that
+  # combo; anything not listed inherits the global value. There is NO public
+  # canonical per-GPU SLO table for this fixed load profile (numbers depend on
+  # GPU x model x engine version) — these are OUR values, measured on healthy
+  # hardware, with margin. Extend this table as new GPU/model combos get
+  # benchmarked on known-good hardware. Full calibration procedure (how many
+  # runs, where to read the measured values, what margins to apply):
+  # roles/gpu-benchmark/README.md.
+  reference:
+    # L40S (vLLM 0.10.2, guidellm 0.7.1) — VALIDATED on the lab (PASS):
+    # TTFT p95 sync 37.5 ms warm (first-request exclusion active) -> gate 200
+    # has ~5x headroom while still catching real degradation; throughput
+    # 5.9 req/s stable over 6 runs -> floor 4.5 (~25% margin); ITL
+    # 10.6-10.8 ms -> the inherited chat SLO of 50 ms has ample headroom.
+    # Full calibration procedure and the first-request-exclusion caveat:
+    # roles/gpu-benchmark/README.md.
+    'NVIDIA L40S':
+      'Qwen/Qwen2.5-3B-Instruct':
+        ttft_p95_ms: 200
+        min_throughput_req_s: 4.5
+    # GB200-class hardware meets the reference doc's chat SLOs directly — no
+    # entry needed (global thresholds apply). Add measured entries per model
+    # once certified runs exist, e.g.:
+    # 'NVIDIA GB200':
+    #   'meta-llama/Llama-3.2-7B-Instruct':
+    #     ttft_p95_ms: 150
+    #     min_throughput_req_s: 40
+  cublas:
+    enabled: true
+    variance_pct: 25
+    allow_toolkit_install: true
+  # NVIDIA DCGM diagnostics (vendor acceptance tool; level 2 ~2-3 min, 3 ~30 min),
+  # PCIe H2D/D2H bandwidth (passthrough data-path check), functional API
+  # conformance suite and under-load power sampling (tokens/W) are all ON by
+  # default — disable or tune per site:
+  # dcgm: {enabled: true, level: 2, allow_install: true}
+  # pcie_bw: {enabled: true, min_gbs: 8}
+  # functional: {enabled: true}
+  # power_sampling: {enabled: true, interval_s: 5}
+  # On a multi-GPU host the LLM benchmark runs once PER GPU and the results are
+  # compared against each other; a GPU deviating from the best by more than
+  # llm_variance_pct (throughput down / latency up) is flagged. A single-GPU
+  # host runs once with no comparison.
+  llm_variance_pct: 20
+  fail_on_flag: false

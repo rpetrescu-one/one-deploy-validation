@@ -57,7 +57,7 @@
 
     - name: OneFlow | Store template ID
       set_fact:
-        flow_template_id: "{{ flow_template_id_cmd.stdout | trim | default('', true) }}"
+        flow_template_id: "{{ flow_template_id_cmd.stdout | default('', true) | trim }}"
 
     - name: OneFlow | Instantiate the service
       ansible.builtin.shell: oneflow-template instantiate {{ flow_template_id }}
@@ -84,7 +84,7 @@
 
     - name: OneFlow | Store service ID
       set_fact:
-        flow_service_id: "{{ flow_service_id_cmd.stdout | trim | default('', true) }}"
+        flow_service_id: "{{ flow_service_id_cmd.stdout | default('', true) | trim }}"
 
     - name: OneFlow | Wait for service state RUNNING (non-fatal, robust)
       ansible.builtin.shell: |

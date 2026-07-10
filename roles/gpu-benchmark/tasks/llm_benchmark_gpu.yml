@@ -1,0 +1,227 @@
+---
+- name: Benchmark model {{ _model }} on GPU {{ _gpu }}
+  block:
+    - name: Reset per-GPU facts
+      ansible.builtin.set_fact:
+        _power: {}
+
+    - name: Stop any previous vLLM server (frees the port for GPU {{ _gpu }})
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }}
+        "kill \$(cat /root/power_sampler.pid 2>/dev/null) 2>/dev/null;
+        pkill -f '[v]llm serve' 2>/dev/null; sleep 5; pkill -9 -f '[v]llm serve' 2>/dev/null; sleep 1; true"
+      changed_when: true
+      failed_when: false
+
+    - name: Serve {{ _model }} on GPU {{ _gpu }} (CUDA_VISIBLE_DEVICES pin, TP=1)
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }}
+        "rm -f /root/vllm_serve.log;
+        nohup bash -c 'source /root/vllm_gpu_env/bin/activate && export CUDA_VISIBLE_DEVICES={{ _gpu }} &&
+        {% if gpu_benchmark.hf_token %}export HF_TOKEN={{ gpu_benchmark.hf_token }} &&{% endif %}
+        exec vllm serve {{ _model }} --host 0.0.0.0 --port {{ gpu_benchmark.vllm_context.api_port }}
+        --gpu-memory-utilization {{ gpu_benchmark.vllm_context.gpu_mem_util }}
+        --max-model-len {{ gpu_benchmark.vllm_context.model_max_length }}
+        --tensor-parallel-size 1' >> /root/vllm_serve.log 2>&1
+        < /dev/null & sleep 2; echo serve-launched"
+      register: _serve_start
+      changed_when: true
+      no_log: "{{ (gpu_benchmark.hf_token | length > 0) | bool }}"
+
+    - name: Wait until vLLM is serving (fail fast if it dies) on GPU {{ _gpu }}
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        for i in $(seq 1 {{ (gpu_benchmark.serve_timeout_s | int) // 10 }}); do
+        if curl -sf -m 5 http://{{ _vm_ip }}:{{ gpu_benchmark.vllm_context.api_port }}/v1/models >/dev/null 2>&1; then echo serving; exit 0; fi;
+        if ! ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no -oConnectTimeout=10 root@{{ _vm_ip }} "pgrep -f '[v]llm serve' >/dev/null 2>&1"; then
+        echo "vLLM server process died during startup on GPU {{ _gpu }} — vllm_serve.log tail:";
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no -oConnectTimeout=10 root@{{ _vm_ip }} "tail -n 15 /root/vllm_serve.log 2>/dev/null";
+        exit 2; fi;
+        sleep 10; done;
+        echo "vLLM did not start serving within {{ gpu_benchmark.serve_timeout_s }} s"; exit 1
+      register: _serve
+      changed_when: false
+
+    - name: Record provisioning time (first GPU only)
+      ansible.builtin.set_fact:
+        _provision_s: "{{ (lookup('pipe', 'date +%s') | int) - (_prov_start | int) }}"
+      when:
+        - (_gpu | int) == 0
+        - (_provision_s | default('') | string | length) == 0
+
+    - name: Warm up on GPU {{ _gpu }} (representative prefill)
+      ansible.builtin.uri:
+        url: "http://{{ _vm_ip }}:{{ gpu_benchmark.vllm_context.api_port }}/v1/completions"
+        method: POST
+        body_format: json
+        body:
+          model: "{{ _model }}"
+          prompt: "{{ 'benchmark warm up token ' * 100 }}"
+          max_tokens: 8
+        status_code: [200]
+        timeout: 120
+      register: _warmup
+      until: _warmup.status | default(0) == 200
+      retries: 5
+      delay: 10
+      loop: [1, 2]
+      loop_control:
+        label: "warm-up {{ item }}"
+
+    - name: Ensure guidellm 0.7.1 is available in the GPU venv
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }}
+        "source /root/vllm_gpu_env/bin/activate && pip install --quiet guidellm==0.7.1"
+      changed_when: true
+
+    - name: Start power sampler for GPU {{ _gpu }}
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }}
+        "rm -f /root/power_g{{ _gpu }}.csv /root/power_sampler.pid;
+        nohup bash -c 'while true; do nvidia-smi -i {{ _gpu }}
+        --query-gpu=power.draw,clocks.sm,temperature.gpu --format=csv,noheader,nounits
+        >> /root/power_g{{ _gpu }}.csv; sleep {{ gpu_benchmark.power_sampling.interval_s | int }}; done'
+        > /dev/null 2>&1 < /dev/null & echo \$! > /root/power_sampler.pid"
+      changed_when: true
+      failed_when: false
+      when: gpu_benchmark.power_sampling.enabled | bool
+
+    - name: Run GuideLLM benchmark on GPU {{ _gpu }}
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }}
+        "source /root/vllm_gpu_env/bin/activate && mkdir -p /root/benchmark_results &&
+        guidellm run
+        --backend 'kind=openai_http,target=http://localhost:{{ gpu_benchmark.vllm_context.api_port }},model={{ _model }}'
+        --profile 'kind=sweep,warmup.value=1,warmup.mode=requests'
+        --constraint kind=max_duration,seconds={{ gpu_benchmark.guidellm_max_duration_s | default(20) | int }}
+        --constraint kind=max_requests,count=100000
+        --data 'kind=synthetic_text,prompt_tokens=512,output_tokens=256'
+        --tokenizer 'kind=huggingface_auto,model={{ _model }}'
+        --output 'kind=json,path=/root/benchmark_results/result_g{{ _gpu }}.json'
+        --disable-console-interactive > /root/guidellm_g{{ _gpu }}.log 2>&1 < /dev/null;
+        rc=\$?; tail -c 8000 /root/guidellm_g{{ _gpu }}.log; exit \$rc"
+      register: _bench
+      changed_when: true
+
+    - name: Stop power sampler and read samples for GPU {{ _gpu }}
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }}
+        "kill \$(cat /root/power_sampler.pid 2>/dev/null) 2>/dev/null;
+        cat /root/power_g{{ _gpu }}.csv 2>/dev/null; true"
+      register: _power_csv_out
+      changed_when: true
+      failed_when: false
+      when: gpu_benchmark.power_sampling.enabled | bool
+
+    - name: Parse power samples for GPU {{ _gpu }}
+      ansible.builtin.include_tasks: lib/parse_power.yml
+      vars:
+        _power_csv: "{{ _power_csv_out.stdout | default('') }}"
+      when: gpu_benchmark.power_sampling.enabled | bool
+
+    - name: Read the GuideLLM JSON report for GPU {{ _gpu }}
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }}
+        "cat /root/benchmark_results/result_g{{ _gpu }}.json"
+      register: _gl_json
+      changed_when: false
+
+    - name: Parse GuideLLM metrics for GPU {{ _gpu }}
+      ansible.builtin.include_tasks: lib/parse_guidellm.yml
+      vars:
+        _guidellm_report: "{{ _gl_json.stdout | from_json }}"
+
+    - name: Persist raw GuideLLM report for GPU {{ _gpu }} on the frontend
+      ansible.builtin.copy:
+        content: "{{ _gl_json.stdout }}"
+        dest: "/tmp/gpu_benchmark/{{ current_cluster.name | regex_replace('[^A-Za-z0-9._-]', '_') }}_{{ _model | regex_replace('[^A-Za-z0-9._-]', '_') }}_h{{ _llm_host.host_id }}_g{{ _gpu }}_guidellm.json"
+        mode: "0644"
+
+    - name: Resolve SLO thresholds for GPU {{ _gpu }}
+      ansible.builtin.include_tasks: lib/resolve_thresholds.yml
+      vars:
+        _gpu_name: "{{ _names[_gpu | int] | default(_names[0] | default('')) }}"
+        _names: >-
+          {{ (((_gpu_health | default({})).hosts | default([])
+              | selectattr('host_id', 'eq', _llm_host.host_id) | first | default({})).nvidia_smi | default([]))
+             | map(attribute='name') | list }}
+
+    - name: Evaluate metrics for GPU {{ _gpu }} against SLO thresholds
+      ansible.builtin.include_tasks: lib/evaluate_llm.yml
+      vars:
+        _eval_thresholds: "{{ _resolved_thresholds }}"
+        _eval_thresholds_source: "{{ _resolved_thresholds_source }}"
+
+    - name: Record GPU {{ _gpu }} result
+      ansible.builtin.set_fact:
+        _model_gpu_results: >-
+          {{ _model_gpu_results + [{
+            'gpu': _gpu | int,
+            'metrics': _llm_metrics | combine({
+              'power': _power | default({}),
+              'tokens_per_watt': _tpw
+            }),
+            'evaluation': _llm_eval
+          }] }}
+      vars:
+        _otps: "{{ _llm_metrics.output_tok_s_saturated | default('') }}"
+        _pavg: "{{ (_power | default({})).power_avg_w | default('') }}"
+        _tpw: >-
+          {{ (((_otps | float) / (_pavg | float)) | round(2))
+             if ((_otps | string | length > 0) and (_pavg | string | length > 0)
+                 and ((_pavg | float) > 0))
+             else '' }}
+
+  rescue:
+    - name: Collect failure diagnostics for GPU {{ _gpu }} (best effort)
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no -oConnectTimeout=10 root@{{ _vm_ip }}
+        'echo "=== nvidia-smi -L ==="; nvidia-smi -L 2>&1 | head -8; echo;
+        echo "=== procese vllm ==="; pgrep -af "[v]llm serve" 2>/dev/null || echo "(niciun proces vllm)"; echo;
+        echo "=== vllm_serve.log (tail 120) ==="; tail -n 120 /root/vllm_serve.log 2>/dev/null || echo "(lipsa)"'
+      register: _gpu_diag
+      changed_when: false
+      failed_when: false
+      when: _vm_ip is defined and (_vm_ip | default('') | string | length > 0)
+
+    - name: Persist GPU {{ _gpu }} failure diagnostics
+      ansible.builtin.copy:
+        content: |
+          {{ _gpu_diag.stdout | default('no VM diagnostics collected') }}
+
+          === guidellm log (tail — stdout+stderr merged on the VM) ===
+          {{ (_bench | default({})).stdout | default('(guidellm produced no output / did not run)', true) }}
+          {{ (_bench | default({})).stderr | default('', true) }}
+
+          === failed task ===
+          {{ ansible_failed_result.msg | default('') }}
+        dest: "/tmp/gpu_benchmark/{{ current_cluster.name | regex_replace('[^A-Za-z0-9._-]', '_') }}_{{ _model | regex_replace('[^A-Za-z0-9._-]', '_') }}_h{{ _llm_host.host_id }}_g{{ _gpu }}_failure.log"
+        mode: "0644"
+      failed_when: false
+
+    - name: Record GPU {{ _gpu }} failure
+      ansible.builtin.set_fact:
+        _model_gpu_results: >-
+          {{ _model_gpu_results + [{
+            'gpu': _gpu | int,
+            'status': 'failed',
+            'error': (ansible_failed_result.msg | default('error'))
+          }] }}
+      no_log: true

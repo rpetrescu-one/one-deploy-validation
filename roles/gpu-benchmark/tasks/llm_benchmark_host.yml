@@ -1,0 +1,7 @@
+---
+- name: Benchmark each model on host {{ _llm_host.host_id }}
+  ansible.builtin.include_tasks: llm_benchmark_one.yml
+  loop: "{{ gpu_benchmark.models }}"
+  loop_control:
+    loop_var: _model
+    label: "{{ _model }} @ host {{ _llm_host.host_id }}"

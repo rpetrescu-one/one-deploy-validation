@@ -1,0 +1,130 @@
+---
+# Defaults for the gpu-benchmark role. Mirror storage-benchmark conventions.
+# Role defaults. User config is a TOP-LEVEL `gpu_benchmark` dict (see
+# inventory/reference/group_vars/all.yml); tasks/main.yml merges it recursively
+# over these defaults, so partial user config is safe.
+_gpu_benchmark_defaults:
+  # Marketplace appliance serving vLLM. Default = the ONEAI Project appliance
+  # ('vLLM Inference Engine', one-apps appliances/Vllm); the ONEAI marketplace
+  # (MARKET_MAD=one) must be registered in OpenNebula for the export to find it.
+  appliance_market_name: 'vLLM Inference Engine'
+  # Network attached to benchmark VMs. Needs egress for model/toolkit download by default.
+  vnet_name: public
+  # One appliance VM is created per model (model is fixed at instantiation via
+  # ONEAPP_VLLM_MODEL_ID). Default keeps a single ungated model that fits a
+  # >=14 GB GPU. NOTE: the appliance DEFAULTS to Qwen2.5-1.5B when no model id
+  # is passed — the health VM therefore auto-serves it and gpu_health_host.yml
+  # kills that vLLM before running cuBLAS.
+  models:
+    - "Qwen/Qwen2.5-3B-Instruct"
+  # Health VM exercises every discovered GPU; 'all' => use discovered count.
+  # This same count drives the per-GPU LLM comparison: the LLM VM attaches all
+  # of a host's GPUs and benchmarks EACH one separately (CUDA_VISIBLE_DEVICES),
+  # so a multi-GPU box yields one LLM result per GPU that we compare against each
+  # other. A single-GPU box yields one result and NO comparison.
+  gpu_count: all
+  # Benchmark VM sizing. The appliance template ships CPU=1 / MEMORY=8192 and an
+  # 8 GB disk — too small for benchmarking (1 vCPU bottlenecks the API server and
+  # skews TTFT/ITL; the model download + CUDA toolkit do not fit in 8 GB).
+  # CPU/VCPU/MEMORY are overridden via the context template; the disk is resized
+  # at instantiation (--disk <image>:size=<disk_mb>).
+  vm:
+    vcpu: 8
+    memory_mb: 16384
+    disk_mb: 40960
+  vllm_context:
+    api_port: 8000
+    gpu_mem_util: 0.9
+    model_max_length: 1024   # ONEAPP_VLLM_MODEL_MAX_LENGTH (prompt+output context)
+  # HuggingFace token for gated models (e.g. Llama). Empty => omitted from
+  # context. Maps to the appliance's ONEAPP_VLLM_MODEL_TOKEN (exported as HF_TOKEN).
+  hf_token: ""
+  # The GuideLLM load profile (sweep, 512/256 tokens, 20 s) is FIXED in
+  # llm_benchmark_one.yml, mirroring the appliance's own benchmark.sh and the
+  # reference doc — that fixedness is what makes baseline and customer runs
+  # comparable. (We invoke guidellm directly instead of benchmark.sh because the
+  # bundled script only emits an HTML report; we need the JSON.)
+  # Which status bucket to read metrics from in the GuideLLM JSON report.
+  # Latency SLO metrics (TTFT/ITL/TPOT) come from the min-RPS (synchronous) run;
+  # throughput comes from the max-RPS (saturated) run — both selected by RPS mean,
+  # which is version-proof (no dependence on a strategy-label field).
+  guidellm_status: successful
+  # Seconds per sweep rate. Must be long enough that the synchronous phase
+  # completes MORE than one request after the warmup exclusion, or guidellm's
+  # sweep aborts ("Invalid rates ... any successful requests?"). 20 s fits a
+  # ~3B model (~2-3 s/request); a slow model (14B ~8 s/request) needs ~40 s —
+  # raise it per inventory when benchmarking large models. Longer = the whole
+  # LLM phase scales linearly (10 rates x this).
+  guidellm_max_duration_s: 20
+  # SLO gates applied to the synchronous-run metrics; null disables a gate.
+  # Defaults follow the reference doc's chat SLOs, written for GB200-class
+  # hardware — on smaller GPUs either tune per inventory or, better, add a
+  # hardware-calibrated entry to `reference:` below.
+  thresholds:
+    profile: chat
+    ttft_p95_ms: 200
+    itl_p95_ms: 50
+    min_throughput_req_s: null
+  # Hardware-calibrated reference SLOs: <nvidia-smi GPU name> -> <model id> ->
+  # PARTIAL thresholds dict merged over `thresholds` for that GPU/model combo
+  # (lib/resolve_thresholds.yml). There is no public canonical per-GPU SLO
+  # table for this fixed load profile — curate these from YOUR healthy-hardware
+  # runs, with margin. See inventory/reference/group_vars/all.yml for measured
+  # starter values. No matching entry => global thresholds apply.
+  reference: {}
+  # GPU-to-GPU comparison tolerance for the LLM metrics: on a multi-GPU host,
+  # a GPU whose throughput drops below best*(1-v/100), or whose latency rises
+  # above best*(1+v/100), relative to the BEST GPU is flagged as an outlier.
+  # (cuBLAS uses its own cublas.variance_pct.) Only ever applied when a host has
+  # more than one GPU — a single-GPU host has nothing to compare against.
+  llm_variance_pct: 20
+  # Guards that stop the GPU-to-GPU comparison from FLAGGING on measurement
+  # NOISE (observed on 2x Tesla T4: a 0.07-vs-0.09 req/s gap tripped the 20%
+  # gate, but each figure came from only 3-4 successful requests and the
+  # throughput probe completed 0/512 — a rounding-scale artifact, not a real
+  # hardware difference). compare_min_samples: a GPU must have at least this many
+  # successful requests for its metrics to be comparable, else the whole delta is
+  # marked low-confidence and nothing is flagged. compare_min_throughput_req_s:
+  # below this absolute sustained rate a relative spread% is meaningless (tiny
+  # denominator), so throughput is not flagged.
+  compare_min_samples: 30
+  compare_min_throughput_req_s: 1.0
+  cublas:
+    enabled: true
+    n: 16384            # matrix dimension (matches reference doc)
+    iters: 10
+    variance_pct: 25    # flag a GPU slower than the fastest by >variance_pct (cross-GPU)
+    allow_toolkit_install: true   # set false for airgap
+  # NVIDIA DCGM diagnostics (dcgmi diag) — the vendor-standard GPU acceptance
+  # tool (memory, PCIe, thermal, NVLink). level: 1 (~seconds), 2 (~2-3 min),
+  # 3 (~30 min burn-in). Failed tests flag the host (nvidia_issues). Needs the
+  # NVIDIA apt repo in the appliance (same one the CUDA toolkit comes from).
+  dcgm:
+    enabled: true
+    level: 2
+    allow_install: true   # set false for airgap (skips when dcgmi is absent)
+    timeout_s: 900        # hard cap on the diag (level 2 ~2-3 min); RAISE for level 3 (~30 min)
+  # Host<->GPU PCIe transfer bandwidth (pinned-memory cudaMemcpy H2D/D2H).
+  # Validates the passthrough DATA PATH — a link can negotiate x16 yet still
+  # transfer poorly (ASPM, NUMA misplacement). min_gbs is deliberately
+  # conservative (gen3 x16 does ~12 GB/s practical, gen4 ~24): it catches
+  # catastrophic passthrough faults without false positives on older links.
+  pcie_bw:
+    enabled: true
+    size_mb: 256
+    iters: 20
+    min_gbs: 8
+  # Functional API conformance suite, run once per (host, model) VM against the
+  # served OpenAI-compatible endpoint: chat completions, streaming, max_tokens
+  # honored, clean 4xx on invalid model / context overflow (server must survive),
+  # concurrent-request isolation. Any failed test flags the model.
+  functional:
+    enabled: true
+  # Sample power draw / SM clock / temperature on the GPU while GuideLLM runs;
+  # yields avg/max power, max temp, min clock and tokens-per-watt (efficiency).
+  power_sampling:
+    enabled: true
+    interval_s: 5
+  # Seconds to wait for the appliance to start serving the model.
+  serve_timeout_s: 1200
+  fail_on_flag: false

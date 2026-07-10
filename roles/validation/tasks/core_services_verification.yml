@@ -218,15 +218,26 @@
     verification_result: "{{ verification_result | combine({'Status of the registered KVM hosts': hosts_list if hosts_list | length > 0 else 'no hosts registered' }) }}"
 
 - name: Set host offline and then set online
+  become: true
+  become_user: oneadmin
   ansible.builtin.shell: |
+    set -e
     onehost disable "{{ item.id }}"
-    sleep 1
+    sleep 5
     onehost enable "{{ item.id }}"
-    sleep 1
-    onehost show "{{ item.id }}" -j
+    onehost forceupdate "{{ item.id }}"
+    for i in $(seq 1 30); do
+      st=$(onehost list -f ID={{ item.id }} -l STAT --no-header | tr -d ' ')
+      [ "$st" = "on" ] && { onehost show "{{ item.id }}" -j; exit 0; }
+      sleep 10
+    done
+    echo "host {{ item.id }} did not return to 'on' within 300s" >&2
+    exit 1
   register: host_monitoring
   loop: "{{ hosts_list }}"
-  when: hosts_list | length > 0
+  when:
+    - hosts_list | length > 0
+    - hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host
 
 - name: Get host status
   debug:

@@ -1,0 +1,19 @@
+---
+- name: Derive functional verdict
+  ansible.builtin.set_fact:
+    _functional:
+      tests: "{{ _ft }}"
+      status: >-
+        {{ 'flag' if ((_ft | selectattr('status', 'eq', 'fail') | list | length) > 0
+                      or (_ft | length) == 0)
+           else 'ok' }}
+  vars:
+    _parsed: >-
+      {{ _functional_stdout if (_functional_stdout is mapping)
+         else ((_functional_stdout | trim | from_json)
+               if ((_functional_stdout | trim).startswith('{')) else {}) }}
+    _ft: >-
+      {{ (_parsed.tests | default([]))
+         if (_parsed | length > 0)
+         else [{'name': 'functional_suite', 'status': 'fail',
+                'detail': _functional_fallback | default('no output')}] }}

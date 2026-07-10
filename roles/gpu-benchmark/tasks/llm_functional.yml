@@ -1,0 +1,129 @@
+---
+- name: Run functional API suite for {{ _model }}
+  become: true
+  become_user: oneadmin
+  ansible.builtin.shell: |
+    ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }} python3 - <<'REMOTE_EOF'
+    import json
+    import threading
+    import urllib.error
+    import urllib.request
+
+    PORT = {{ gpu_benchmark.vllm_context.api_port | int }}
+    MODEL = "{{ _model }}"
+    OVERFLOW_WORDS = {{ (gpu_benchmark.vllm_context.model_max_length | int) * 4 }}
+    BASE = "http://localhost:%d" % PORT
+    results = []
+
+    def post(path, payload, timeout=120):
+        req = urllib.request.Request(BASE + path, data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+
+    def record(name, ok, detail):
+        results.append({"name": name, "status": "pass" if ok else "fail",
+                        "detail": "" if ok else detail})
+
+    try:
+        st, body = post("/v1/chat/completions", {"model": MODEL, "max_tokens": 8,
+                        "messages": [{"role": "user", "content": "Say OK"}]})
+        if 400 <= st < 500 and "chat template" in body.lower():
+            # base model without a chat template: a legitimate deployment, the
+            # chat endpoint simply does not apply — skip, never fail
+            results.append({"name": "chat_completions", "status": "skip",
+                            "detail": "model ships no chat template"})
+        else:
+            d = json.loads(body)
+            content = d.get("choices", [{}])[0].get("message", {}).get("content", "")
+            fr = d.get("choices", [{}])[0].get("finish_reason")
+            record("chat_completions", st == 200 and len(content) > 0 and fr is not None,
+                   "status=%s content_len=%d finish=%s" % (st, len(content), fr))
+    except Exception as e:
+        record("chat_completions", False, str(e)[:160])
+
+    try:
+        st, body = post("/v1/completions", {"model": MODEL,
+                        "prompt": "Count to one hundred:", "max_tokens": 5})
+        d = json.loads(body)
+        used = d.get("usage", {}).get("completion_tokens", 999)
+        fr = d.get("choices", [{}])[0].get("finish_reason")
+        record("max_tokens_honored", st == 200 and used <= 5 and fr == "length",
+               "status=%s completion_tokens=%s finish=%s" % (st, used, fr))
+    except Exception as e:
+        record("max_tokens_honored", False, str(e)[:160])
+
+    try:
+        req = urllib.request.Request(BASE + "/v1/completions",
+              data=json.dumps({"model": MODEL, "prompt": "Hi", "max_tokens": 8,
+                               "stream": True}).encode(),
+              headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            raw = r.read().decode()
+        record("streaming_sse", "data:" in raw and "[DONE]" in raw, "len=%d" % len(raw))
+    except Exception as e:
+        record("streaming_sse", False, str(e)[:160])
+
+    try:
+        st, body = post("/v1/completions", {"model": "no-such-model",
+                        "prompt": "x", "max_tokens": 4})
+        record("invalid_model_4xx", 400 <= st < 500 and "error" in body.lower(),
+               "status=%s" % st)
+    except Exception as e:
+        record("invalid_model_4xx", False, str(e)[:160])
+
+    try:
+        st, body = post("/v1/completions", {"model": MODEL,
+                        "prompt": "word " * OVERFLOW_WORDS, "max_tokens": 4})
+        st2, body2 = post("/v1/completions", {"model": MODEL,
+                          "prompt": "ping", "max_tokens": 4})
+        record("context_overflow_4xx", 400 <= st < 500 and st2 == 200,
+               "overflow_status=%s followup_status=%s" % (st, st2))
+    except Exception as e:
+        record("context_overflow_4xx", False, str(e)[:160])
+
+    sizes = [10, 80, 200, 400]
+    out = [None] * len(sizes)
+
+    def worker(i, n):
+        st, body = post("/v1/completions", {"model": MODEL,
+                        "prompt": "word " * n, "max_tokens": 4})
+        try:
+            out[i] = (st, json.loads(body).get("usage", {}).get("prompt_tokens", -1))
+        except Exception:
+            out[i] = (st, -1)
+
+    try:
+        ts = [threading.Thread(target=worker, args=(i, n)) for i, n in enumerate(sizes)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(180)
+        ok = all(o is not None and o[0] == 200 for o in out)
+        toks = [o[1] for o in out if o is not None]
+        ordered = ok and len(toks) == len(sizes) and all(
+            toks[i] < toks[i + 1] for i in range(len(toks) - 1))
+        record("concurrent_isolation", ok and ordered,
+               "statuses_and_prompt_tokens=%s" % (out,))
+    except Exception as e:
+        record("concurrent_isolation", False, str(e)[:160])
+
+    print(json.dumps({"tests": results}))
+    REMOTE_EOF
+  args:
+    executable: /bin/bash
+  register: _func_out
+  changed_when: false
+  failed_when: false
+
+- name: Derive functional verdict
+  ansible.builtin.include_tasks: lib/parse_functional.yml
+  vars:
+    _functional_stdout: "{{ _func_out.stdout | default('') }}"
+    _functional_fallback: >-
+      {{ (_func_out.stderr | default('') | trim)
+         | default(_func_out.stdout | default('no output'), true)
+         | string | truncate(200, true) }}

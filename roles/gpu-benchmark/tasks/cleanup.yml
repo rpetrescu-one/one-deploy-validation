@@ -1,0 +1,48 @@
+---
+- name: Terminate benchmark VM
+  become: true
+  become_user: oneadmin
+  ansible.builtin.shell: >
+    onevm terminate --hard {{ _vm_id }}
+  register: _term
+  until: _term.rc == 0
+  retries: 3
+  delay: 5
+  changed_when: _term.rc == 0
+  failed_when: false
+  when: _vm_id is defined and (_vm_id | string | length > 0)
+
+- name: Wait for benchmark VM to release its resources
+  become: true
+  become_user: oneadmin
+  ansible.builtin.shell: >
+    onevm list --f ID={{ _vm_id }} -l STAT --no-header
+  register: _term_stat
+  until: (_term_stat.stdout | trim) in ['', 'done']
+  retries: 30
+  delay: 5
+  changed_when: false
+  failed_when: false
+  when: _vm_id is defined and (_vm_id | string | length > 0)
+
+- name: Force-delete the VM if terminate did not release it
+  become: true
+  become_user: oneadmin
+  ansible.builtin.shell: >
+    onevm recover --delete {{ _vm_id }}
+  register: _recover
+  changed_when: _recover.rc == 0
+  failed_when: false
+  when:
+    - _vm_id is defined and (_vm_id | string | length > 0)
+    - (_term_stat.stdout | default('') | trim) not in ['', 'done']
+
+- name: Clear VM id
+  ansible.builtin.set_fact:
+    _vm_id: ""
+
+- name: Remove rendered context file (may contain HF token)
+  ansible.builtin.file:
+    path: "/tmp/gpu_bench_ctx_{{ _appliance_template_id }}.tmpl"
+    state: absent
+  when: _appliance_template_id is defined and (_appliance_template_id | string | length > 0)

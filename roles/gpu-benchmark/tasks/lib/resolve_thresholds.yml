@@ -1,0 +1,9 @@
+---
+- name: Resolve SLO thresholds for {{ _gpu_name | default('unknown GPU') }} / {{ _model }}
+  ansible.builtin.set_fact:
+    _resolved_thresholds: "{{ gpu_benchmark.thresholds | combine(_ref_entry, recursive=True) }}"
+    _resolved_thresholds_source: >-
+      {{ ('reference: ' ~ _gpu_name) if (_ref_entry | length > 0) else 'global' }}
+  vars:
+    _ref_gpu: "{{ (gpu_benchmark.reference | default({}))[_gpu_name | default('')] | default({}) }}"
+    _ref_entry: "{{ _ref_gpu[_model] | default({}) }}"

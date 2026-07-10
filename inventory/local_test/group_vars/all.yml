@@ -15,6 +15,7 @@ validation:
     check_fireedge_ui: false
 
   run_storage_benchmark: false
+  run_gpu_benchmark: false
   run_fe_ha: false
   run_network_benchmark: true
 

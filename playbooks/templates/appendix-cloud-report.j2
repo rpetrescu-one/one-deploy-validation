@@ -48,6 +48,12 @@
   .summary-table th,.summary-table td{padding:10px 12px;border:1px solid var(--border);font-size:13px;vertical-align:top}
   .summary-table th{width:220px;background:var(--surface2);text-align:left;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;font-size:11px}
   .footer{display:flex;align-items:center;justify-content:space-between;padding-top:24px;border-top:1px solid var(--border);font-size:12px;color:var(--muted)}.footer a{color:var(--one-blue);text-decoration:none}.footer a:hover{text-decoration:underline}
+  .chart-card{background:#fff;border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-top:12px}
+  .chart-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin-bottom:6px}
+  .chart-legend{display:flex;flex-wrap:wrap;gap:14px;font-size:11px;color:var(--muted);margin-bottom:6px;font-family:var(--mono)}
+  .chart-legend .sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+  .chart-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:760px){.chart-row{grid-template-columns:1fr}}
   @media(max-width:640px){.cards{grid-template-columns:repeat(2,1fr)}.anodes{grid-template-columns:1fr}.header{flex-direction:column;align-items:flex-start}.header-meta{align-items:flex-start}.footer{flex-direction:column;gap:12px;align-items:flex-start}}
   @media print{
     body{background:#fff}
@@ -72,6 +78,12 @@
     .pgbar{height:6px}
 	    .arch-section,.arch-fe,.anodes,.anode,.anet{break-inside:avoid;page-break-inside:avoid}
     .doc-page,.cover-meta,.summary-table,.toc-list,.toc-list li{break-inside:avoid;page-break-inside:avoid}
+    .gtable th{padding:4px 5px;font-size:8px;letter-spacing:.3px}
+    .gtable td{padding:4px 5px;font-size:9px}
+    .chart-card{break-inside:avoid;page-break-inside:avoid;padding:8px 10px;margin-top:8px}
+    .chart-row{break-inside:avoid;page-break-inside:avoid}
+    .chart-legend{font-size:9px;gap:10px;margin-bottom:4px}
+    .chart-title{font-size:9px;margin-bottom:4px}
 	    .arch-section{padding:8px 10px;margin-bottom:10px}
 	    .arch-section .section-title{margin-bottom:4px;font-size:10px}
 	    .arch-fe{width:180px;margin-bottom:2px;padding:5px 10px;font-size:10px}
@@ -477,6 +489,143 @@
   {% for host in storage_benchmark.keys() | list %}<div class="section-title" style="margin-top:14px">{{ host }}</div><div class="table-scroll"><table class="gtable"><thead><tr><th>Job</th><th class="num">IOPS</th><th class="num">BW (MB/s)</th><th class="num">p99 Lat (ms)</th><th class="num">Score</th></tr></thead><tbody>
   {% for item in ordered_profiles %}{% set p = (storage_benchmark[host].profiles | default([]) | selectattr('name','equalto',item.key) | list | first | default({})) %}{% set rw = p.rw | default('') %}{% if rw in ['read','randread'] %}{% set iops = p.read_iops | default(None) %}{% set bw_kib = p.read_bw_kib | default(None) %}{% set lat_ns = p.read_p99_ns | default(None) %}{% elif rw in ['write','randwrite'] %}{% set iops = p.write_iops | default(None) %}{% set bw_kib = p.write_bw_kib | default(None) %}{% set lat_ns = p.write_p99_ns | default(None) %}{% elif rw in ['rw','randrw'] %}{% set iops = (p.read_iops | default(0)) + (p.write_iops | default(0)) %}{% set bw_kib = (p.read_bw_kib | default(0)) + (p.write_bw_kib | default(0)) %}{% set lat_ns = [p.read_p99_ns | default(0), p.write_p99_ns | default(0)] | max %}{% else %}{% set iops = None %}{% set bw_kib = None %}{% set lat_ns = None %}{% endif %}{% set bw_mbs = (bw_kib / 1024) if bw_kib is not none else None %}{% set lat_ms = (lat_ns / 1000000) if lat_ns is not none else None %}{% if item.key[:3] == 'seq' %}{% set score = '★★★' if bw_mbs is not none and bw_mbs >= 300 else ('★★' if bw_mbs is not none and bw_mbs >= 150 else ('★' if bw_mbs is not none and bw_mbs >= 75 else '⚠')) %}{% else %}{% set score = '★★★' if lat_ms is not none and lat_ms <= 5 else ('★★' if lat_ms is not none and lat_ms <= 10 else ('★' if lat_ms is not none and lat_ms <= 20 else '⚠')) %}{% endif %}<tr><td>{{ item.label }}</td><td class="num">{{ iops | default('N/A') }}</td><td class="num">{% if bw_mbs is not none %}{{ bw_mbs | round(2) }}{% else %}N/A{% endif %}</td><td class="num">{% if lat_ms is not none %}{{ lat_ms | round(2) }}{% else %}N/A{% endif %}</td><td class="score-cell">{{ score }}</td></tr>{% endfor %}
   </tbody></table></div>{% endfor %}</section>
+  {% endif %}
+
+  {% if validation_vars.run_gpu_benchmark | default(false) and gpu_benchmark_results is defined and gpu_benchmark_results | length > 0 %}
+  {# Charts are hand-rolled inline SVG on purpose: the report is also rendered
+     to PDF by weasyprint, which executes NO JavaScript — charting libraries
+     would silently vanish from the PDF. #}
+  {% macro line_chart(title, series, x_label, y_label, hline=0, hline_label='') %}
+  {% set W, H = 560, 230 %}{% set pl, pr, ptop, pb = 56, 16, 14, 38 %}
+  {% set iw, ih = W - pl - pr, H - ptop - pb %}
+  {% set allp = [] %}{% for s in series %}{% for p in s.points %}{% if allp.append(p) %}{% endif %}{% endfor %}{% endfor %}
+  {% set xmax = allp | map(attribute='x') | max | float %}
+  {% set ymax0 = allp | map(attribute='y') | max | float %}
+  {% set ymax0 = ([ymax0, hline | float] | max) if (hline | float) > 0 else ymax0 %}
+  {% set ymax = ymax0 * 1.08 %}
+  {% if xmax > 0 and ymax > 0 %}
+  <div class="chart-card">
+  <div class="chart-title">{{ title }}</div>
+  <div class="chart-legend">{% for s in series %}<span><span class="sw" style="background:{{ s.color }}"></span>{{ s.label }}</span>{% endfor %}{% if (hline | float) > 0 %}<span><span class="sw" style="background:#fff;border:1px dashed #b91c1c"></span>{{ hline_label }}</span>{% endif %}</div>
+  <svg viewBox="0 0 {{ W }} {{ H }}" style="width:100%;height:auto" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="{{ title }}">
+  {% for i in range(5) %}{% set fy = ptop + ih * i / 4 %}{% set vy = ymax * (4 - i) / 4 %}<line x1="{{ pl }}" y1="{{ fy | round(1) }}" x2="{{ W - pr }}" y2="{{ fy | round(1) }}" stroke="#e2e8f0" stroke-width="1"/><text x="{{ pl - 6 }}" y="{{ (fy + 3.5) | round(1) }}" text-anchor="end" font-size="10" fill="#64748b" font-family="IBM Plex Mono,monospace">{{ vy | round(0) | int }}</text>{% endfor %}
+  {% for i in range(5) %}{% set fx = pl + iw * i / 4 %}<text x="{{ fx | round(1) }}" y="{{ H - pb + 16 }}" text-anchor="middle" font-size="10" fill="#64748b" font-family="IBM Plex Mono,monospace">{{ (xmax * i / 4) | round(1) }}</text>{% endfor %}
+  <line x1="{{ pl }}" y1="{{ ptop }}" x2="{{ pl }}" y2="{{ H - pb }}" stroke="#94a3b8" stroke-width="1"/>
+  <line x1="{{ pl }}" y1="{{ H - pb }}" x2="{{ W - pr }}" y2="{{ H - pb }}" stroke="#94a3b8" stroke-width="1"/>
+  <text x="{{ pl + iw // 2 }}" y="{{ H - 4 }}" text-anchor="middle" font-size="10" fill="#64748b">{{ x_label }}</text>
+  <text x="12" y="{{ ptop + ih // 2 }}" text-anchor="middle" font-size="10" fill="#64748b" transform="rotate(-90 12 {{ ptop + ih // 2 }})">{{ y_label }}</text>
+  {% if (hline | float) > 0 and (hline | float) <= ymax %}{% set hy = ptop + ih * (1 - (hline | float) / ymax) %}<line x1="{{ pl }}" y1="{{ hy | round(1) }}" x2="{{ W - pr }}" y2="{{ hy | round(1) }}" stroke="#b91c1c" stroke-width="1" stroke-dasharray="5,4"/>{% endif %}
+  {% for s in series %}{% set ns = namespace(pts='') %}{% for p in s.points %}{% set ns.pts = ns.pts ~ ((pl + iw * (p.x / xmax)) | round(1)) ~ ',' ~ ((ptop + ih * (1 - p.y / ymax)) | round(1)) ~ ' ' %}{% endfor %}<polyline points="{{ ns.pts | trim }}" fill="none" stroke="{{ s.color }}" stroke-width="2"/>{% for p in s.points %}<circle cx="{{ (pl + iw * (p.x / xmax)) | round(1) }}" cy="{{ (ptop + ih * (1 - p.y / ymax)) | round(1) }}" r="3" fill="{{ s.color }}"/>{% endfor %}{% endfor %}
+  </svg>
+  </div>
+  {% endif %}
+  {% endmacro %}
+  {% macro bar_chart(title, bars, unit='') %}
+  {% set W = 560 %}{% set rh = 26 %}{% set pl = 64 %}{% set pr = 100 %}
+  {% set H = bars | length * rh + 10 %}
+  {% set vmax = bars | map(attribute='value') | max | float %}
+  {% if vmax > 0 %}
+  <div class="chart-card">
+  <div class="chart-title">{{ title }}</div>
+  <svg viewBox="0 0 {{ W }} {{ H }}" style="width:100%;height:auto" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="{{ title }}">
+  {% for b in bars %}{% set y = 5 + loop.index0 * rh %}{% set bw = (W - pl - pr) * (b.value / vmax) %}<text x="{{ pl - 8 }}" y="{{ y + 13 }}" text-anchor="end" font-size="11" fill="#0f172a" font-family="IBM Plex Mono,monospace">{{ b.label }}</text><rect x="{{ pl }}" y="{{ y }}" width="{{ bw | round(1) }}" height="{{ rh - 8 }}" rx="3" fill="{{ b.color }}"/><text x="{{ (pl + bw + 6) | round(1) }}" y="{{ y + 13 }}" font-size="11" fill="#64748b" font-family="IBM Plex Mono,monospace">{{ b.value | round(0) | int }}{{ unit }}</text>{% endfor %}
+  </svg>
+  </div>
+  {% endif %}
+  {% endmacro %}
+  {% set gpu_colors = ['#1a7ba4', '#7c3aed', '#15803d', '#b45309', '#b91c1c', '#0e7490', '#9333ea', '#065f46'] %}
+  <section class="data-section"><div class="section-title">GPU / LLM Benchmark Results</div>
+  {% for host, data in gpu_benchmark_results.items() %}
+  <div class="section-title" style="margin-top:14px">{{ host }} — status: {{ data.status | default('n/a') }}{% if data.note | default('') %} ({{ data.note }}){% endif %}</div>
+  {% set _all_smi = (data.gpu_health | default({})).hosts | default([]) | selectattr('nvidia_smi', 'defined') | map(attribute='nvidia_smi') | flatten | list %}
+  {% set _vrams = _all_smi | map(attribute='vram_mib') | map('string') | select('ne', '') | unique | list %}
+  {% if _all_smi | length > 0 %}<div class="mini-pre">Platform: {{ _all_smi | length }}&times; {{ _all_smi | map(attribute='name') | unique | join(' / ') }}{% if _vrams | length == 1 %} ({{ ((_vrams[0] | int) / 1024) | round(0) | int }} GiB VRAM each){% endif %}{% if data.meta.driver_version | default('') %} — driver {{ data.meta.driver_version }}{% endif %}{% if data.meta.cuda_version | default('') %}, CUDA {{ data.meta.cuda_version }}{% endif %}</div>{% endif %}
+  {% if data.meta is defined and data.meta %}<div class="mini-pre">Run: {{ data.meta.timestamp | default('') }} — appliance template ID {{ data.meta.appliance_template_id | default('n/a', true) }} — model(s): {{ data.meta.models | default([]) | join(', ') }}</div>{% endif %}
+  {% set _kpi_tok = [] %}{% set _kpi_ttft = [] %}{% set _kpi_gf = [] %}
+  {% for lk, lm in (data.llm | default({})).items() %}{% for g in lm.per_gpu | default([]) %}{% if g.metrics is defined %}{% if (g.metrics.output_tok_s_saturated | default('') | string | length) > 0 %}{% if _kpi_tok.append(g.metrics.output_tok_s_saturated | float) %}{% endif %}{% endif %}{% if _kpi_ttft.append(g.metrics.ttft_p95_ms | float) %}{% endif %}{% endif %}{% endfor %}{% endfor %}
+  {% for h in (data.gpu_health | default({})).hosts | default([]) %}{% if h.cublas is defined and h.cublas.skipped is not defined %}{% for c in h.cublas %}{% if _kpi_gf.append(c.gflops | float) %}{% endif %}{% endfor %}{% endif %}{% endfor %}
+  {% if (_kpi_gf | length > 0) or (_kpi_tok | length > 0) %}
+  <div class="cards" style="margin-top:14px;margin-bottom:10px">
+    <div class="card {{ 'cp' if (data.status | default('')) == 'ok' else 'cw' }}"><span class="num">{{ _all_smi | length }}</span><span class="lbl">GPUs tested</span></div>
+    {% if _kpi_gf | length > 0 %}<div class="card ct"><span class="num">{{ ((_kpi_gf | max) / 1000) | round(1) }}k</span><span class="lbl">cuBLAS GFLOP/s (best)</span></div>{% endif %}
+    {% if _kpi_tok | length > 0 %}<div class="card ct"><span class="num">{{ _kpi_tok | max | round(0) | int }}</span><span class="lbl">Output tokens/s (peak)</span></div>{% endif %}
+    {% if _kpi_ttft | length > 0 %}<div class="card ct"><span class="num">{{ _kpi_ttft | min | round(0) | int }}</span><span class="lbl">Best TTFT p95 (ms, sync)</span></div>{% endif %}
+  </div>
+  {% endif %}
+  {% for h in (data.gpu_health | default({})).hosts | default([]) %}
+  <div class="section-title" style="margin-top:14px">Host {{ h.host_id }} — GPU inventory &amp; health{% if h.nvidia_issues | default([]) %} — issues: {{ h.nvidia_issues | join('; ') }}{% endif %}</div>
+  <div class="table-scroll"><table class="gtable"><thead><tr><th>GPU</th><th>Name</th><th class="num">VRAM (MiB)</th><th class="num">Compute cap</th><th>VBIOS</th><th class="num">PCIe width</th><th class="num">PCIe GB/s (H2D/D2H)</th><th class="num">Power limit (W)</th><th class="num">Max SM clock (MHz)</th><th class="num">Temp (&deg;C)</th><th class="num">ECC errors</th><th class="num">cuBLAS GFLOP/s</th><th>Status</th></tr></thead><tbody>
+  {% for g in h.nvidia_smi | default([]) %}{% set _pbl = h.pcie_bw | default([]) %}{% set _pb = (_pbl | selectattr('gpu', 'eq', (g.index | int)) | list | first | default({})) if (_pbl is not mapping) else {} %}<tr><td>{{ g.index }}</td><td>{{ g.name }}</td><td class="num">{{ g.vram_mib }}</td><td class="num">{{ g.compute_cap | default('—', true) }}</td><td>{{ g.vbios | default('—', true) }}</td><td class="num">x{{ g.pcie_width_current | default('?', true) }}/x{{ g.pcie_width_max | default('?', true) }}</td><td class="num">{% if _pb.h2d_gbs is defined %}{{ _pb.h2d_gbs | float | round(1) }}/{{ _pb.d2h_gbs | float | round(1) }}{% else %}—{% endif %}</td><td class="num">{% if g.power_limit_w | default('') %}{{ g.power_limit_w | float | round(0) | int }}{% else %}—{% endif %}</td><td class="num">{{ g.sm_clock_max_mhz | default('—', true) }}</td><td class="num">{{ g.temperature_c | default('—', true) }}</td><td class="num">{{ g.ecc_uncorrected | default('—', true) }}</td><td class="num">{% if h.cublas.skipped is defined %}skipped{% else %}{{ h.cublas | selectattr('gpu', 'eq', (g.index | int)) | map(attribute='gflops') | first | default('—') }}{% endif %}</td><td>{{ 'FLAG' if (g.index | int) in (h.flagged_gpus | default([]) | map('int') | list) else 'ok' }}</td></tr>{% endfor %}
+  </tbody></table></div>
+  {% if h.dcgm is defined and h.dcgm %}<div class="mini-pre">NVIDIA DCGM diagnostics: {% if h.dcgm.status == 'pass' %}PASS ({{ h.dcgm.tests_total }} tests{% if h.dcgm.tests_skipped | default(0) | int > 0 %}, {{ h.dcgm.tests_skipped }} skipped{% endif %}){% if h.dcgm.warned | default([]) | length > 0 %}, warnings: {{ h.dcgm.warned | join(', ') }}{% endif %}{% elif h.dcgm.status == 'fail' %}FAIL — {{ h.dcgm.failed | default([]) | join(', ') }}{% else %}{{ h.dcgm.status }}{% if h.dcgm.detail | default('') %} ({{ h.dcgm.detail | e }}){% endif %}{% endif %}</div>{% endif %}
+  {% set _cg = h.cublas | default([]) %}
+  {% if h.cublas.skipped is not defined and (_cg | length) > 1 %}{% set _gf = _cg | map(attribute='gflops') | map('float') | list %}<div class="mini-pre">cuBLAS spread across {{ _gf | length }} GPUs: max {{ _gf | max | round(1) }} / min {{ _gf | min | round(1) }} GFLOP/s ({{ ((_gf | max - _gf | min) / (_gf | max) * 100) | round(1) }}% spread). Per-GPU pass/fail (incl. any cuBLAS/PCIe/DCGM issue) is in the Status column above.</div>
+  {% set _cb_bars = [] %}{% for c in _cg %}{% if _cb_bars.append({'label': 'GPU ' ~ c.gpu, 'value': c.gflops | float, 'color': ('#b91c1c' if (c.gpu | int) in (h.flagged_gpus | default([]) | map('int') | list) else '#1a7ba4')}) %}{% endif %}{% endfor %}
+  {{ bar_chart('cuBLAS SGEMM compute per GPU — host ' ~ h.host_id, _cb_bars, ' GFLOP/s') }}
+  {% endif %}
+  {% endfor %}
+  {% if (data.llm | default({}) | length) > 0 and data.meta is defined %}
+  <div class="mini-pre">Method: {{ data.meta.load_profile | default('GuideLLM sweep') }}. Each GPU is benchmarked individually (CUDA_VISIBLE_DEVICES pinning, tensor-parallel 1).{% set th = data.meta.thresholds | default({}) %}{% if th %} SLO profile '{{ th.profile | default('chat') }}': TTFT p95 {% if th.ttft_p95_ms is not none %}&le; {{ th.ttft_p95_ms }} ms{% else %}not gated{% endif %}, ITL p95 {% if th.itl_p95_ms is not none %}&le; {{ th.itl_p95_ms }} ms{% else %}not gated{% endif %} (synchronous run){% if th.min_throughput_req_s is defined and th.min_throughput_req_s is not none %}, throughput &ge; {{ th.min_throughput_req_s }} req/s (saturated run){% endif %}.{% endif %}{% if data.meta.reference | default({}) | length > 0 %} Hardware-calibrated reference SLOs override the profile where marked '(ref)':{% for rg, rmodels in data.meta.reference.items() %}{% for rm, rth in rmodels.items() %}{% set _has = (rth.ttft_p95_ms is defined and rth.ttft_p95_ms is not none) or (rth.itl_p95_ms is defined and rth.itl_p95_ms is not none) or (rth.min_throughput_req_s is defined and rth.min_throughput_req_s is not none) %} {{ rg }} / {{ rm }}:{% if not _has %} no numeric gate (calibration){% else %}{% if rth.ttft_p95_ms is defined and rth.ttft_p95_ms is not none %} TTFT p95 &le; {{ rth.ttft_p95_ms }} ms{% endif %}{% if rth.itl_p95_ms is defined and rth.itl_p95_ms is not none %}, ITL p95 &le; {{ rth.itl_p95_ms }} ms{% endif %}{% if rth.min_throughput_req_s is defined and rth.min_throughput_req_s is not none %}, throughput &ge; {{ rth.min_throughput_req_s }} req/s{% endif %}{% endif %}.{% endfor %}{% endfor %}{% endif %}</div>
+  {% endif %}
+  {% for lkey, m in (data.llm | default({})).items() %}
+  {% set _okg = m.per_gpu | default([]) | selectattr('metrics', 'defined') | list %}
+  <div class="section-title" style="margin-top:14px">{{ lkey }} — {{ m.status | default('n/a') }}</div>
+  {% if (m.versions | default('')) or (m.provisioning_s | default('') | string | length > 0) %}<div class="mini-pre">{{ m.versions | default('') }}{% if m.provisioning_s | default('') | string | length > 0 %}{% if m.versions | default('') %} — {% endif %}provisioning: VM create &rarr; model serving in {{ m.provisioning_s }} s{% endif %}</div>{% endif %}
+  {% if (m.per_gpu | default([]) | length) > 0 %}
+  <div class="table-scroll"><table class="gtable"><thead><tr><th>GPU</th><th class="num">Output tok/s (sat)</th><th class="num">Sustained req/s (sat)</th><th class="num">Req latency p95 (s, sync)</th><th class="num">TTFT p95 (ms, sync)</th><th class="num">ITL p95 (ms, sync)</th><th class="num">TPOT p95 (ms, sync)</th><th class="num">TTFT p95 (ms, sat)</th><th>SLO</th></tr></thead><tbody>
+  {% for g in m.per_gpu | default([]) %}{% if g.metrics is defined %}<tr><td>{{ g.gpu }}</td><td class="num">{% if g.metrics.output_tok_s_saturated | default('') | string | length > 0 %}{{ g.metrics.output_tok_s_saturated | float | round(0) | int }}{% else %}—{% endif %}</td><td class="num">{{ g.metrics.throughput_req_s_mean | float | round(2) }}</td><td class="num">{{ g.metrics.req_latency_p95_s | float | round(3) }}</td><td class="num">{{ g.metrics.ttft_p95_ms | float | round(1) }}</td><td class="num">{{ g.metrics.itl_p95_ms | float | round(2) }}</td><td class="num">{{ g.metrics.tpot_p95_ms | float | round(2) }}</td><td class="num">{% if (g.metrics.saturated | default({})).ttft_p95_ms is defined %}{{ g.metrics.saturated.ttft_p95_ms | float | round(1) }}{% else %}—{% endif %}</td><td>{% set _ev = g.evaluation | default({}) %}{% if _ev.gated is defined and not (_ev.gated | bool) %}not evaluated{% else %}{{ _ev.status | default('n/a') }}{% if (_ev.source | default('global')) != 'global' %} (ref){% endif %}{% endif %}</td></tr>{% else %}<tr><td>{{ g.gpu }}</td><td colspan="8">Failed: {{ g.error | default('unknown error') | e }}</td></tr>{% endif %}{% endfor %}
+  </tbody></table></div>
+  {% set _unsat = _okg | selectattr('metrics.saturation_achieved', 'defined') | map(attribute='metrics.saturation_achieved') | map('string') | select('equalto', 'False') | list %}
+  {% if _unsat | length > 0 %}<div class="mini-pre"><strong>Saturation not achieved:</strong> the concurrent throughput probe completed 0 requests within each rate window on {{ _unsat | length }} of {{ _okg | length }} GPU(s) — this GPU class is too slow for that load. The figures below are the PEAK single-stream rate reached, not a sustained ceiling the GPU can hold under concurrency.</div>
+  {% else %}<div class="mini-pre">Sustained req/s = saturated token rate &divide; tokens-per-request (the steady-state request rate the GPU holds){% set _pk = (_okg | map(attribute='metrics.throughput_req_s_peak') | select('defined') | map('float') | list) %}{% if _pk | length > 0 %}; guidellm's short-window peak rate was up to {{ _pk | max | round(1) }} req/s (a drain burst, not sustainable){% endif %}. Headline throughput is output tokens/s, which is stable run-to-run.</div>{% endif %}
+  {% endif %}
+  {% set _tok_series = [] %}{% set _ttft_series = [] %}
+  {% for g in m.per_gpu | default([]) %}{% if (g.metrics | default({})).sweep is defined %}
+  {% set _tp = [] %}{% set _lp = [] %}
+  {% for r in g.metrics.sweep %}{% if (r.output_tok_s | string | length) > 0 %}{% if _tp.append({'x': r.rps | float, 'y': r.output_tok_s | float}) %}{% endif %}{% endif %}{% if _lp.append({'x': r.rps | float, 'y': r.ttft_p95_ms | float}) %}{% endif %}{% endfor %}
+  {% set _col = gpu_colors[loop.index0 % 8] %}
+  {% if _tp | length >= 2 %}{% if _tok_series.append({'label': 'GPU ' ~ g.gpu, 'color': _col, 'points': _tp | sort(attribute='x')}) %}{% endif %}{% endif %}
+  {% if _lp | length >= 2 %}{% if _ttft_series.append({'label': 'GPU ' ~ g.gpu, 'color': _col, 'points': _lp | sort(attribute='x')}) %}{% endif %}{% endif %}
+  {% endif %}{% endfor %}
+  {% if (_tok_series | length > 0) or (_ttft_series | length > 0) %}
+  {# SLO line = the gate that was ACTUALLY applied to this model's GPUs (per-GPU
+     reference SLOs when resolved), not the global profile — the two can differ
+     by an order of magnitude. Falls back to the globals for old data. #}
+  {% set _ev0 = ((_okg | first | default({})).evaluation | default({})) %}
+  {% set _slo = _ev0.thresholds | default((data.meta | default({})).thresholds | default({})) %}
+  {% set _slo_ref = (_ev0.source | default('global')) != 'global' %}
+  <div class="chart-row">
+  {% if _tok_series | length > 0 %}{{ line_chart('Generation throughput vs achieved load', _tok_series, 'achieved requests/s', 'output tokens/s') }}{% endif %}
+  {% if _ttft_series | length > 0 %}{{ line_chart('Time to first token (p95) vs achieved load', _ttft_series, 'achieved requests/s', 'TTFT p95 (ms)', (_slo.ttft_p95_ms | default(0, true)) | float, 'SLO ' ~ (_slo.ttft_p95_ms | default('', true)) ~ ' ms (sync gate' ~ (', ref' if _slo_ref else '') ~ ')') }}{% endif %}
+  </div>
+  {% endif %}
+  {% for g in m.per_gpu | default([]) %}{% if (g.metrics | default({})).power is defined and g.metrics.power %}
+  <div class="mini-pre">GPU {{ g.gpu }} under load: avg {{ g.metrics.power.power_avg_w }} W (max {{ g.metrics.power.power_max_w }} W), max temp {{ g.metrics.power.temp_max_c }} &deg;C, min SM clock {{ g.metrics.power.sm_clock_min_mhz }} MHz{% if g.metrics.tokens_per_watt | default('') | string | length > 0 %} — {{ g.metrics.tokens_per_watt }} output tokens/s per watt (run-average power){% endif %}</div>
+  {% endif %}{% endfor %}
+  {% if m.functional is defined and m.functional and (m.functional.tests | default([]) | length > 0) %}
+  <div class="section-title" style="margin-top:10px">API functional conformance — {{ 'ok' if (m.functional.status | default('ok')) == 'ok' else 'FLAG' }} ({{ m.functional.tests | selectattr('status', 'eq', 'pass') | list | length }}/{{ m.functional.tests | length }} passed)</div>
+  <div class="table-scroll"><table class="gtable"><thead><tr><th>Test</th><th>Status</th><th>Detail</th></tr></thead><tbody>
+  {% for t in m.functional.tests %}<tr><td>{{ t.name }}</td><td>{{ 'ok' if t.status == 'pass' else 'FAIL' }}</td><td>{{ (t.detail | default('') | e) if t.status != 'pass' else '—' }}</td></tr>{% endfor %}
+  </tbody></table></div>
+  {% endif %}
+  {% for g in m.per_gpu | default([]) %}{% if (g.metrics | default({})).sweep is defined and (g.metrics.sweep | length) > 0 %}
+  <div class="section-title" style="margin-top:10px">GPU {{ g.gpu }} — load sweep ({{ g.metrics.sweep | length }} steps{% if g.metrics.requests_errored | default(0) | int > 0 %}, {{ g.metrics.requests_errored }} errored requests{% endif %})</div>
+  <div class="table-scroll"><table class="gtable"><thead><tr><th>Strategy</th><th class="num">Target req/s</th><th class="num">Achieved req/s</th><th class="num">Output tok/s</th><th class="num">Avg concurrency</th><th class="num">TTFT p95 (ms)</th><th class="num">ITL p95 (ms)</th><th class="num">Requests (ok/incomplete/err)</th></tr></thead><tbody>
+  {% for r in g.metrics.sweep %}<tr><td>{{ r.strategy }}</td><td class="num">{% if r.target_rate | string | length > 0 %}{{ r.target_rate | float | round(1) }}{% else %}—{% endif %}</td><td class="num">{{ r.rps }}</td><td class="num">{% if r.output_tok_s | string | length > 0 %}{{ r.output_tok_s | float | round(0) | int }}{% else %}—{% endif %}</td><td class="num">{% if r.concurrency | string | length > 0 %}{{ r.concurrency | float | round(1) }}{% else %}—{% endif %}</td><td class="num">{{ r.ttft_p95_ms }}</td><td class="num">{{ r.itl_p95_ms }}</td><td class="num">{% if r.requests_ok | string | length > 0 %}{{ r.requests_ok }}{% else %}—{% endif %}/{% if r.requests_incomplete | default('') | string | length > 0 %}{{ r.requests_incomplete }}{% else %}—{% endif %}/{% if r.requests_err | string | length > 0 %}{{ r.requests_err }}{% else %}—{% endif %}</td></tr>{% endfor %}
+  </tbody></table></div>
+  <div class="mini-pre">Incomplete = requests still in flight when the {{ (data.meta | default({})).rate_window_s | default(20) }} s rate window closed (expected under saturation); errored = failed requests.</div>
+  {% endif %}{% endfor %}
+  {% if m.delta is defined and m.delta and (m.delta.metrics | default([]) | length > 0) %}
+  {% set _dlabels = {'throughput_req_s_mean': 'Throughput (req/s, sustained)', 'req_latency_p95_s': 'Req latency p95 (s)', 'ttft_p95_ms': 'TTFT p95 (ms)', 'itl_p95_ms': 'ITL p95 (ms)', 'tpot_p95_ms': 'TPOT p95 (ms)'} %}
+  <div class="section-title" style="margin-top:10px">GPU-to-GPU comparison — {{ 'FLAG' if (m.delta.status | default('ok')) == 'flag' else 'ok' }} (tolerance &plusmn;{{ m.delta.variance_pct | float | round(0) | int }}%)</div>
+  {% if (m.delta.confidence | default('ok')) == 'low' %}<div class="mini-pre">Low confidence: the weakest GPU completed only {{ m.delta.min_samples | default('?') }} successful requests — too few to distinguish a real hardware difference from single-run variance, so no GPU is flagged as an outlier here.</div>{% endif %}
+  <div class="table-scroll"><table class="gtable"><thead><tr><th>Metric</th><th class="num">Best</th><th class="num">Worst</th><th class="num">Spread %</th><th>Flagged / note</th><th>Status</th></tr></thead><tbody>
+  {% for r in m.delta.metrics %}<tr><td>{{ _dlabels[r.metric] | default(r.metric) }}</td><td class="num">{{ r.best }}</td><td class="num">{{ r.worst }}</td><td class="num">{{ r.spread_pct }}</td><td>{% if (r.flagged_gpus | default([]) | length > 0) %}{{ r.flagged_gpus | map('regex_replace', '^', 'GPU ') | join(', ') }}{% elif r.note | default('') %}{{ r.note }}{% else %}—{% endif %}</td><td>{{ 'ok' if r.ok else 'FLAG' }}</td></tr>{% endfor %}
+  </tbody></table></div>
+  {% endif %}
+  {% if (m.status | default('')) == 'failed' and (_okg | length == 0) and (m.error is defined) %}<div class="mini-pre">Failed: {{ m.error | default('unknown error') | e }}</div>{% endif %}
+  {% endfor %}
+  {% endfor %}</section>
   {% endif %}
 
   {% if validation_vars.run_network_benchmark | default(false) and network_benchmark is defined and network_benchmark | length > 0 %}

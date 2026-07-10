@@ -48,10 +48,7 @@
       - "conn-mtx-vm-on-host-{{ host_id }}"
       - --raw
       - >-
-        {{
-          (extra_template_content_raw.content | b64decode) +
-          (validation.test_vm.vm.template_extra if validation.test_vm.vm.template_extra is defined else "")
-        }}
+        {{ extra_template_content_raw.content | b64decode }}
   register: vm_id
   failed_when: "vm_id.rc != 0" 
   when: existing_vm.stdout == ""

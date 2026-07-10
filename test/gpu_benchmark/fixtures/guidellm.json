@@ -1,0 +1,47 @@
+{
+  "benchmarks": [
+    {
+      "id_": "synchronous",
+      "config": {"strategy": {"type_": "synchronous", "rate": null}},
+      "metrics": {
+        "requests_per_second": {"successful": {"mean": 1.3, "percentiles": {"p95": 1.3}}},
+        "request_latency": {"successful": {"mean": 0.7, "percentiles": {"p95": 0.7}}},
+        "time_to_first_token_ms": {"successful": {"mean": 45.1, "percentiles": {"p95": 47.2}}},
+        "inter_token_latency_ms": {"successful": {"mean": 2.7, "percentiles": {"p95": 2.7}}},
+        "time_per_output_token_ms": {"successful": {"mean": 2.9, "percentiles": {"p95": 2.9}}},
+        "output_tokens_per_second": {"successful": {"mean": 92.9}},
+        "request_concurrency": {"successful": {"mean": 1.0}},
+        "request_totals": {"successful": 7, "errored": 0, "incomplete": 0, "total": 7}
+      }
+    },
+    {
+      "id_": "throughput",
+      "config": {"strategy": {"type_": "throughput", "rate": null}},
+      "metrics": {
+        "requests_per_second": {"successful": {"mean": 56.9, "percentiles": {"p95": 60.0}}},
+        "request_latency": {"successful": {"mean": 7.6, "percentiles": {"p95": 7.7}}},
+        "time_to_first_token_ms": {"successful": {"mean": 720.6, "percentiles": {"p95": 1149.2}}},
+        "inter_token_latency_ms": {"successful": {"mean": 26.9, "percentiles": {"p95": 27.9}}},
+        "time_per_output_token_ms": {"successful": {"mean": 29.7, "percentiles": {"p95": 30.0}}},
+        "output_tokens_per_second": {"successful": {"mean": 14563.2}},
+        "output_token_count": {"successful": {"mean": 512.0}},
+        "request_concurrency": {"successful": {"mean": 110.4}},
+        "request_totals": {"successful": 122, "errored": 0, "incomplete": 508, "total": 630}
+      }
+    },
+    {
+      "id_": "constant",
+      "config": {"strategy": {"type_": "constant", "rate": 8.0}},
+      "metrics": {
+        "requests_per_second": {"successful": {"mean": 8.3, "percentiles": {"p95": 8.3}}},
+        "request_latency": {"successful": {"mean": 1.1, "percentiles": {"p95": 1.1}}},
+        "time_to_first_token_ms": {"successful": {"mean": 49.5, "percentiles": {"p95": 52.3}}},
+        "inter_token_latency_ms": {"successful": {"mean": 4.1, "percentiles": {"p95": 4.2}}},
+        "time_per_output_token_ms": {"successful": {"mean": 4.3, "percentiles": {"p95": 4.4}}},
+        "output_tokens_per_second": {"successful": {"mean": 2118.7}},
+        "request_concurrency": {"successful": {"mean": 9.1}},
+        "request_totals": {"successful": 100, "errored": 1, "incomplete": 4, "total": 105}
+      }
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "DCGM Diagnostic": {
+    "version": "3.3.5",
+    "driver_version_detected": "570.195.03",
+    "test_categories": [
+      {
+        "category": "Deployment",
+        "tests": [
+          {"name": "Denylist", "results": [{"status": "Pass"}]},
+          {"name": "CUDA Main Library", "results": [{"status": "Pass"}]},
+          {"name": "Permissions and OS-related Blocks", "results": [{"status": "Pass"}]}
+        ]
+      },
+      {
+        "category": "Hardware",
+        "tests": [
+          {"name": "GPU Memory", "results": [{"status": "Fail", "gpu_id": "0", "warnings": [{"warning": "memory error detected"}]}]},
+          {"name": "Diagnostic", "results": [{"status": "Warn", "gpu_id": "0"}]}
+        ]
+      },
+      {
+        "category": "Integration",
+        "tests": [
+          {"name": "PCIe", "results": [{"status": "Pass", "gpu_id": "0"}]}
+        ]
+      }
+    ]
+  }
+}

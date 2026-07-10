@@ -1,0 +1,24 @@
+---
+- name: Reset cublas accumulator
+  ansible.builtin.set_fact:
+    _cublas: []
+
+- name: Extract GFLOP/s per GPU
+  ansible.builtin.set_fact:
+    _cublas: "{{ _cublas + [{'gpu': item.gpu | int, 'gflops': _g | float}] }}"
+  loop: "{{ _cublas_results }}"
+  loop_control:
+    label: "gpu {{ item.gpu }}"
+  vars:
+    _g: "{{ (item.stdout | regex_search('GFLOP/s=([0-9.]+)', '\\1') | default(['0'], true) | first) }}"
+
+- name: Compute relative-variance flags
+  ansible.builtin.set_fact:
+    _cublas_flagged: >-
+      {{
+        _cublas
+        | selectattr('gflops', 'lt', (_max | float) * (1.0 - (gpu_benchmark.cublas.variance_pct | float) / 100.0))
+        | map(attribute='gpu') | list
+      }}
+  vars:
+    _max: "{{ (_cublas | map(attribute='gflops') | list or [0]) | max }}"

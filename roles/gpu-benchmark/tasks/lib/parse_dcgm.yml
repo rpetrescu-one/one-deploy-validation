@@ -1,0 +1,45 @@
+---
+- name: Reset DCGM accumulators
+  ansible.builtin.set_fact:
+    _dcgm_failed: []
+    _dcgm_warned: []
+    _dcgm_skipped: []
+    _dcgm_detail: "{{ _root.runtime_error | default('') }}"
+    _dcgm_tests: >-
+      {{ _root.test_categories | default([])
+         | map(attribute='tests') | flatten | list }}
+  vars:
+    _d: "{{ _dcgm_json if (_dcgm_json is mapping) else (_dcgm_json | from_json) }}"
+    _root: >-
+      {{ _d.values() | list
+         | selectattr('test_categories', 'defined') | list | first
+         | default(_d.values() | list | first | default({}), true) }}
+
+- name: Classify DCGM tests
+  ansible.builtin.set_fact:
+    _dcgm_failed: "{{ _dcgm_failed + ([item.name | default('?')] if ('Fail' in _st) else []) }}"
+    _dcgm_warned: "{{ _dcgm_warned + ([item.name | default('?')] if ('Warn' in _st and 'Fail' not in _st) else []) }}"
+    _dcgm_skipped: >-
+      {{ _dcgm_skipped + ([item.name | default('?')]
+         if ((_st | length == 0) or (_st | reject('eq', 'Skip') | list | length == 0)) else []) }}
+  loop: "{{ _dcgm_tests }}"
+  loop_control:
+    label: "{{ item.name | default('?') }}"
+  vars:
+    _st: "{{ item.results | default([]) | map(attribute='status') | list }}"
+
+- name: Assemble DCGM verdict
+  ansible.builtin.set_fact:
+    _dcgm:
+      status: >-
+        {{ 'fail' if (_dcgm_failed | length > 0)
+           else ('pass' if ((_dcgm_tests | length) - (_dcgm_skipped | length)) > 0
+                 else 'error') }}
+      tests_total: "{{ _dcgm_tests | length }}"
+      tests_skipped: "{{ _dcgm_skipped | length }}"
+      failed: "{{ _dcgm_failed }}"
+      warned: "{{ _dcgm_warned }}"
+      detail: >-
+        {{ _dcgm_detail if (_dcgm_detail | length > 0)
+           else ('all tests skipped by the tool' if ((_dcgm_tests | length) > 0
+                 and (_dcgm_tests | length) == (_dcgm_skipped | length)) else '') }}

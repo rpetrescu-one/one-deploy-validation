@@ -1,0 +1,16 @@
+---
+- name: Derive model status from per-GPU results
+  ansible.builtin.set_fact:
+    _model_status: >-
+      {{ 'failed' if (_ok_gpus | length | int == 0)
+         else ('flag' if ((_any_slo_flag | bool) or (_delta_flag | bool)
+                          or (_any_gpu_failed | bool) or (_functional_flag | bool))
+               else 'ok') }}
+  vars:
+    _ok_gpus: "{{ _model_gpu_results | selectattr('metrics', 'defined') | list }}"
+    _any_slo_flag: "{{ (_ok_gpus | selectattr('evaluation.status', 'eq', 'flag') | list | length | int) > 0 }}"
+    _delta_flag: "{{ ((_gpu_delta | default({})).status | default('ok')) == 'flag' }}"
+    _functional_flag: "{{ ((_functional | default({})).status | default('ok')) == 'flag' }}"
+    _any_gpu_failed: >-
+      {{ (_model_gpu_results | selectattr('status', 'defined')
+          | selectattr('status', 'eq', 'failed') | list | length | int) > 0 }}

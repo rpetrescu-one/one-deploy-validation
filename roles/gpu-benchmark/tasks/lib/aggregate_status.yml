@@ -1,0 +1,22 @@
+---
+- name: Aggregate cluster status
+  ansible.builtin.set_fact:
+    _cluster_status: >-
+      {{ 'failed' if (_llm_all_failed | bool)
+         else ('flag' if ((_h_flagged | bool) or (_nv_flagged | bool) or (_llm_flagged | bool) or (_llm_failed | bool))
+               else 'ok') }}
+  vars:
+    _hosts: "{{ (_gpu_health | default({})).hosts | default([]) }}"
+    _h_flagged: "{{ (_hosts | map(attribute='flagged_gpus') | map('length') | select('gt', 0) | list | length) > 0 }}"
+    _nv_flagged: "{{ not (((_gpu_health | default({})).nvidia_ok | default(true)) | bool) }}"
+    _llm_entries: "{{ _llm | default({}) | dict2items | map(attribute='value') | list }}"
+    _llm_flagged: >-
+      {{ (_llm_entries | selectattr('status', 'defined') | selectattr('status', 'eq', 'flag')
+          | list | length) > 0 }}
+    _llm_failed: >-
+      {{ (_llm_entries | selectattr('status', 'defined') | selectattr('status', 'eq', 'failed')
+          | list | length) > 0 }}
+    _llm_all_failed: >-
+      {{ (_llm_entries | length > 0)
+         and ((_llm_entries | selectattr('status', 'defined') | selectattr('status', 'eq', 'failed')
+               | list | length) == (_llm_entries | length)) }}

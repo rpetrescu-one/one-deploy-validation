@@ -1,0 +1,45 @@
+---
+- name: Merge gpu_benchmark config over role defaults
+  ansible.builtin.set_fact:
+    gpu_benchmark: "{{ _gpu_benchmark_defaults | combine(gpu_benchmark | default({}), recursive=True) }}"
+  when: hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host
+
+- name: Run GPU/LLM benchmark per cluster
+  ansible.builtin.include_tasks:
+    file: per_cluster.yml
+  loop: "{{ _one_clusters }}"
+  loop_control:
+    loop_var: current_cluster
+    label: "{{ current_cluster.name }}"
+  when: hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host
+
+- name: Ensure benchmark artifacts directory exists on the frontend
+  ansible.builtin.file:
+    path: /tmp/gpu_benchmark
+    state: directory
+    mode: "0755"
+  when:
+    - hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host
+    - gpu_benchmark_results | default({}) | length > 0
+
+- name: Persist benchmark summary on the frontend
+  ansible.builtin.copy:
+    content: "{{ gpu_benchmark_results | default({}) | to_nice_json }}"
+    dest: /tmp/gpu_benchmark/summary.json
+    mode: "0644"
+  when:
+    - hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host
+    - gpu_benchmark_results | default({}) | length > 0
+
+- name: Fail when anomalies were flagged and fail_on_flag is set
+  ansible.builtin.assert:
+    that:
+      - >-
+        gpu_benchmark_results | default({}) | dict2items
+        | map(attribute='value') | selectattr('status', 'defined')
+        | map(attribute='status') | select('in', ['flag', 'failed'])
+        | list | length == 0
+    fail_msg: "GPU benchmark flagged anomalies or failed clusters and gpu_benchmark.fail_on_flag is set"
+  when:
+    - gpu_benchmark.fail_on_flag | d(false)
+    - hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host

@@ -1,0 +1,812 @@
+---
+- name: gpu-benchmark unit tests
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    fixtures: "{{ playbook_dir }}/fixtures"
+    gpu_benchmark: "{{ (lookup('file', playbook_dir ~ '/../../roles/gpu-benchmark/defaults/main.yml') | from_yaml)._gpu_benchmark_defaults }}"
+  tasks:
+    - name: parse_gpu_inventory — filters NVIDIA 3D controllers
+      vars:
+        _pci_devices: "{{ (lookup('file', fixtures ~ '/onehost.json') | from_json).PCI_DEVICES.PCI }}"
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_gpu_inventory.yml
+    - name: assert gpu inventory
+      ansible.builtin.assert:
+        that:
+          - _gpu_inventory.gpu_count | int == 2
+          - _gpu_inventory.devices | map(attribute='short_address') | list == ['0009:01:00.0', '0019:01:00.0']
+          - _gpu_inventory.devices[0].model == 'GB200'
+        fail_msg: "parse_gpu_inventory produced {{ _gpu_inventory }}"
+    - name: parse_nvidia_smi — CSV to list of dicts
+      vars:
+        _nvidia_smi_csv: "{{ lookup('file', fixtures ~ '/nvidia_smi.csv') }}"
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_nvidia_smi.yml
+    - name: assert nvidia-smi parse
+      ansible.builtin.assert:
+        that:
+          - _nvidia_smi | length == 2
+          - _nvidia_smi[0].index | int == 0
+          - _nvidia_smi[0].vram_mib | int == 189471
+          - _nvidia_smi[1].name == 'NVIDIA GB200'
+          - _nvidia_smi[0].throttle == '0x0000000000000000'
+          - _nvidia_smi[0].pcie_width_current | int == 16
+          - _nvidia_smi[1].pcie_width_max | int == 16
+          - _nvidia_smi[0].compute_cap == '10.0'
+          - _nvidia_smi[0].vbios == '97.00.5A.00.01'
+          - _nvidia_smi[0].power_limit_w | float == 1200.0
+          - _nvidia_smi[1].sm_clock_max_mhz | int == 1965
+          - _nvidia_smi[1].temperature_c | int == 35
+        fail_msg: "parse_nvidia_smi produced {{ _nvidia_smi }}"
+
+    - name: parse_nvidia_smi — N/A sentinels in the new display columns normalize to ''
+      vars:
+        _nvidia_smi_csv: "0, NVIDIA vGPU, 46068, 0, 0x0, 16, 16, 8.9, [N/A], [N/A], N/A, [Not Supported]"
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_nvidia_smi.yml
+    - name: assert N/A normalization (report renders em-dash, not '0 W')
+      ansible.builtin.assert:
+        that:
+          - _nvidia_smi[0].compute_cap == '8.9'
+          - _nvidia_smi[0].vbios == ''
+          - _nvidia_smi[0].power_limit_w == ''
+          - _nvidia_smi[0].sm_clock_max_mhz == ''
+          - _nvidia_smi[0].temperature_c == ''
+        fail_msg: "parse_nvidia_smi N/A case produced {{ _nvidia_smi }}"
+
+    - name: parse_nvidia_smi — old 7-column CSV still parses (new fields empty)
+      vars:
+        _nvidia_smi_csv: "0, NVIDIA L40S, 46068, 0, 0x0000000000000001, 16, 16"
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_nvidia_smi.yml
+    - name: assert old CSV backward compatibility
+      ansible.builtin.assert:
+        that:
+          - _nvidia_smi | length == 1
+          - _nvidia_smi[0].pcie_width_max | int == 16
+          - _nvidia_smi[0].compute_cap == ''
+          - _nvidia_smi[0].temperature_c == ''
+        fail_msg: "parse_nvidia_smi 7-col case produced {{ _nvidia_smi }}"
+    - name: parse_cublas — extract GFLOP/s and flag slow GPUs
+      vars:
+        _cublas_results:
+          - {gpu: 0, stdout: "GPU 0\nRESULT: N=16384 iters=10 total=1.226 s avg=0.123 s GFLOP/s=71734.66"}
+          - {gpu: 1, stdout: "GPU 1\nRESULT: N=16384 iters=10 total=4.869 s avg=0.487 s GFLOP/s=18063.70"}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_cublas.yml
+    - name: assert cublas parse + flag
+      ansible.builtin.assert:
+        that:
+          - _cublas | length == 2
+          - (_cublas[0].gflops | float) == 71734.66
+          - (_cublas[1].gflops | float) == 18063.70
+          - _cublas_flagged | map('int') | list == [1]
+        fail_msg: "cublas={{ _cublas }} flagged={{ _cublas_flagged }}"
+    - name: parse_pcie_bw — extract H2D/D2H and flag low-bandwidth GPUs
+      vars:
+        gpu_benchmark: {pcie_bw: {min_gbs: 8}}
+        _pcie_bw_results:
+          - {gpu: 0, stdout: "RESULT: size_mb=256 iters=20 H2D=25.31 GB/s D2H=24.87 GB/s"}
+          - {gpu: 1, stdout: "RESULT: size_mb=256 iters=20 H2D=3.12 GB/s D2H=24.00 GB/s"}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_pcie_bw.yml
+    - name: assert pcie bw parse + flag
+      ansible.builtin.assert:
+        that:
+          - _pcie_bw | length == 2
+          - (_pcie_bw[0].h2d_gbs | float) == 25.31
+          - (_pcie_bw[1].d2h_gbs | float) == 24.0
+          - _pcie_bw_flagged == [1]     # H2D 3.12 < 8 on gpu 1
+        fail_msg: "parse_pcie_bw produced {{ _pcie_bw }} / {{ _pcie_bw_flagged }}"
+
+    - name: parse_dcgm — mixed report yields fail with named tests
+      vars:
+        _dcgm_json: "{{ lookup('file', fixtures ~ '/dcgm.json') }}"
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_dcgm.yml
+    - name: assert dcgm mixed verdict
+      ansible.builtin.assert:
+        that:
+          - _dcgm.status == 'fail'
+          - _dcgm.tests_total | int == 6
+          - _dcgm.failed == ['GPU Memory']
+          - _dcgm.warned == ['Diagnostic']
+        fail_msg: "parse_dcgm produced {{ _dcgm }}"
+
+    - name: parse_dcgm — all-pass report yields pass
+      vars:
+        _dcgm_json: '{"DCGM GPU Diagnostic": {"test_categories": [{"category": "Deployment", "tests": [{"name": "Denylist", "results": [{"status": "Pass"}]}]}]}}'
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_dcgm.yml
+    - name: assert dcgm pass verdict (alternate top-level key)
+      ansible.builtin.assert:
+        that:
+          - _dcgm.status == 'pass'
+          - _dcgm.tests_total | int == 1
+        fail_msg: "parse_dcgm produced {{ _dcgm }}"
+
+    - name: parse_dcgm — report without tests yields error WITH the runtime_error detail
+      vars:
+        _dcgm_json: '{"DCGM Diagnostic": {"runtime_error": "unable to start diagnostics"}}'
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_dcgm.yml
+    - name: assert dcgm error verdict carries the detail
+      ansible.builtin.assert:
+        that:
+          - _dcgm.status == 'error'
+          - _dcgm.detail == 'unable to start diagnostics'
+        fail_msg: "parse_dcgm produced {{ _dcgm }}"
+
+    - name: parse_dcgm — all-Skip report is error, never an overstated PASS
+      vars:
+        _dcgm_json: '{"DCGM Diagnostic": {"test_categories": [{"category": "Hardware", "tests": [{"name": "GPU Memory", "results": [{"status": "Skip"}]}, {"name": "PCIe", "results": [{"status": "Skip"}]}]}]}}'
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_dcgm.yml
+    - name: assert all-skip verdict
+      ansible.builtin.assert:
+        that:
+          - _dcgm.status == 'error'
+          - _dcgm.tests_skipped | int == 2
+          - "'skipped' in _dcgm.detail"
+        fail_msg: "parse_dcgm produced {{ _dcgm }}"
+
+    - name: parse_dcgm — partial skips still pass when real tests ran
+      vars:
+        _dcgm_json: '{"DCGM Diagnostic": {"test_categories": [{"category": "Hardware", "tests": [{"name": "GPU Memory", "results": [{"status": "Pass"}]}, {"name": "NVLink", "results": [{"status": "Skip"}]}]}]}}'
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_dcgm.yml
+    - name: assert partial-skip verdict
+      ansible.builtin.assert:
+        that:
+          - _dcgm.status == 'pass'
+          - _dcgm.tests_skipped | int == 1
+        fail_msg: "parse_dcgm produced {{ _dcgm }}"
+
+    - name: parse_power — aggregates samples and skips non-numeric rows
+      vars:
+        _power_csv: "45.61, 2520, 36\n[N/A], 2520, 36\n288.98, 2490, 61\n300.10, 2505, 58"
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_power.yml
+    - name: assert power aggregates
+      ansible.builtin.assert:
+        that:
+          - _power.samples | int == 3
+          - (_power.power_avg_w | float) == 211.6
+          - (_power.power_max_w | float) == 300.1
+          - _power.sm_clock_min_mhz | int == 2490
+          - _power.temp_max_c | int == 61
+        fail_msg: "parse_power produced {{ _power }}"
+
+    - name: parse_power — no usable samples yields empty dict
+      vars:
+        _power_csv: ""
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_power.yml
+    - name: assert empty power
+      ansible.builtin.assert:
+        that: _power == {}
+        fail_msg: "parse_power produced {{ _power }}"
+
+    - name: parse_functional — a failed test flags the suite
+      vars:
+        _functional_stdout: '{"tests": [{"name": "chat_completions", "status": "pass", "detail": ""}, {"name": "streaming_sse", "status": "fail", "detail": "no DONE marker"}]}'
+        _functional_fallback: ""
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_functional.yml
+    - name: assert functional flag on failed test
+      ansible.builtin.assert:
+        that:
+          - _functional.status == 'flag'
+          - _functional.tests | length == 2
+        fail_msg: "parse_functional produced {{ _functional }}"
+
+    - name: parse_functional — all pass yields ok
+      vars:
+        _functional_stdout: '{"tests": [{"name": "chat_completions", "status": "pass", "detail": ""}]}'
+        _functional_fallback: ""
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_functional.yml
+    - name: assert functional ok
+      ansible.builtin.assert:
+        that: _functional.status == 'ok'
+        fail_msg: "parse_functional produced {{ _functional }}"
+
+    - name: parse_functional — unrunnable suite is a visible failure, not a silent pass
+      vars:
+        _functional_stdout: "ssh connection refused"
+        _functional_fallback: "ssh connection refused"
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_functional.yml
+    - name: assert functional fallback failure
+      ansible.builtin.assert:
+        that:
+          - _functional.status == 'flag'
+          - _functional.tests[0].name == 'functional_suite'
+        fail_msg: "parse_functional produced {{ _functional }}"
+
+    - name: parse_functional — already-parsed dict input (2.18 auto-conversion) works
+      vars:
+        _functional_stdout: {tests: [{name: chat_completions, status: pass, detail: ''}, {name: streaming_sse, status: skip, detail: 'n/a'}]}
+        _functional_fallback: ""
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_functional.yml
+    - name: assert dict input parses and skip does not flag
+      ansible.builtin.assert:
+        that:
+          - _functional.status == 'ok'
+          - _functional.tests | length == 2
+        fail_msg: "parse_functional produced {{ _functional }}"
+
+    - name: parse_guidellm — pick throughput run (max RPS) and extract metrics
+      vars:
+        _guidellm_report: "{{ lookup('file', fixtures ~ '/guidellm.json') | from_json }}"
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_guidellm.yml
+    - name: assert guidellm metrics
+      ansible.builtin.assert:
+        that:
+          # SUSTAINED = otps 14563.2 / 512 tok-per-req = 28.44 (NOT the peak rps.mean 56.9)
+          - (_llm_metrics.throughput_req_s_mean | float) == 28.44
+          - (_llm_metrics.throughput_req_s_peak | float) == 56.9
+          - (_llm_metrics.req_latency_p95_s | float) == 0.7
+          - (_llm_metrics.ttft_p95_ms | float) == 47.2
+          - (_llm_metrics.itl_p95_ms | float) == 2.7
+          - (_llm_metrics.tpot_p95_ms | float) == 2.9
+          - (_llm_metrics.saturated.ttft_p95_ms | float) == 1149.2
+          - (_llm_metrics.output_tok_s_saturated | float) == 14563.2
+          - _llm_metrics.sweep | length == 3
+          # ascending load: synchronous (1.3 rps) -> constant (8.3) -> throughput (56.9)
+          - _llm_metrics.sweep[0].strategy == 'synchronous'
+          - _llm_metrics.sweep[1].strategy == 'constant'
+          - (_llm_metrics.sweep[1].target_rate | float) == 8.0
+          - _llm_metrics.sweep[2].strategy == 'throughput'
+          - (_llm_metrics.sweep[2].output_tok_s | float) == 14563.2
+          - (_llm_metrics.sweep[2].concurrency | float) == 110.4
+          - _llm_metrics.sweep[0].requests_ok | int == 7
+          - _llm_metrics.sweep[2].requests_incomplete | int == 508   # throughput probe cut-offs are VISIBLE
+          - _llm_metrics.requests_successful | int == 229   # 7 + 122 + 100
+          - _llm_metrics.requests_errored | int == 1
+          - _llm_metrics.requests_incomplete | int == 512   # 0 + 508 + 4
+          - _llm_metrics.saturation_achieved | bool         # throughput probe had successful requests
+        fail_msg: "parse_guidellm produced {{ _llm_metrics }}"
+    - name: parse_guidellm — synchronous phase selected by TYPE, not min-RPS (slow-GPU case)
+      vars:
+        # throughput probe FAILED (0 successful, rps 0) so it sorts BEFORE the
+        # real synchronous run; latency metrics must still come from synchronous.
+        _guidellm_report:
+          benchmarks:
+            - id_: "throughput"
+              config: {strategy: {type_: throughput, rate: null}}
+              metrics:
+                requests_per_second: {successful: {mean: 0.0, percentiles: {p95: 0.0}}}
+                request_latency: {successful: {mean: 0.0, percentiles: {p95: 0.0}}}
+                time_to_first_token_ms: {successful: {mean: 0.0, percentiles: {p95: 0.0}}}
+                inter_token_latency_ms: {successful: {mean: 0.0, percentiles: {p95: 0.0}}}
+                time_per_output_token_ms: {successful: {mean: 0.0, percentiles: {p95: 0.0}}}
+                output_tokens_per_second: {successful: {mean: 0.0}}
+                request_totals: {successful: 0, errored: 0, incomplete: 512, total: 512}
+            - id_: "synchronous"
+              config: {strategy: {type_: synchronous, rate: null}}
+              metrics:
+                requests_per_second: {successful: {mean: 0.07, percentiles: {p95: 0.07}}}
+                request_latency: {successful: {mean: 11.0, percentiles: {p95: 11.5}}}
+                time_to_first_token_ms: {successful: {mean: 233.9, percentiles: {p95: 240.9}}}
+                inter_token_latency_ms: {successful: {mean: 40.0, percentiles: {p95: 42.0}}}
+                time_per_output_token_ms: {successful: {mean: 43.0, percentiles: {p95: 44.0}}}
+                output_tokens_per_second: {successful: {mean: 23.4}}
+                output_token_count: {successful: {mean: 256.0}}
+                request_totals: {successful: 3, errored: 0, incomplete: 0, total: 3}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_guidellm.yml
+    - name: assert synchronous metrics come from the synchronous run, not the failed probe
+      ansible.builtin.assert:
+        that:
+          - (_llm_metrics.ttft_p95_ms | float) == 240.9   # from synchronous, NOT 0.0
+          - (_llm_metrics.itl_p95_ms | float) == 42.0
+          - (_llm_metrics.tpot_p95_ms | float) == 44.0
+          - not (_llm_metrics.saturation_achieved | bool)   # throughput probe completed 0/512
+        fail_msg: "parse_guidellm slow-GPU case produced {{ _llm_metrics }}"
+
+    - name: parse_guidellm — minimal report (no config/otps/concurrency/totals) degrades gracefully
+      vars:
+        _guidellm_report:
+          benchmarks:
+            - id_: "legacy"
+              metrics:
+                requests_per_second: {successful: {mean: 2.0, percentiles: {p95: 2.0}}}
+                request_latency: {successful: {mean: 1.0, percentiles: {p95: 1.0}}}
+                time_to_first_token_ms: {successful: {mean: 50.0, percentiles: {p95: 55.0}}}
+                inter_token_latency_ms: {successful: {mean: 3.0, percentiles: {p95: 3.1}}}
+                time_per_output_token_ms: {successful: {mean: 3.2, percentiles: {p95: 3.3}}}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_guidellm.yml
+    - name: assert minimal report parses with empty optional fields
+      ansible.builtin.assert:
+        that:
+          - _llm_metrics.sweep | length == 1
+          - _llm_metrics.sweep[0].strategy == 'legacy'
+          - _llm_metrics.sweep[0].output_tok_s == ''
+          - _llm_metrics.sweep[0].concurrency == ''
+          - _llm_metrics.sweep[0].requests_ok == ''
+          - _llm_metrics.output_tok_s_saturated == ''
+          - _llm_metrics.requests_successful | int == 0
+          - (_llm_metrics.ttft_p95_ms | float) == 55.0
+          # no token-count data => throughput falls back to guidellm's rps.mean
+          - (_llm_metrics.throughput_req_s_mean | float) == 2.0
+          - (_llm_metrics.throughput_req_s_peak | float) == 2.0
+        fail_msg: "parse_guidellm minimal case produced {{ _llm_metrics }}"
+
+    - name: evaluate_llm — chat SLOs flag high TTFT
+      vars:
+        _llm_metrics:
+          throughput_req_s_mean: 56.9
+          req_latency_p95_s: 7.7
+          ttft_p95_ms: 1149.2
+          itl_p95_ms: 27.9
+          tpot_p95_ms: 30.0
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/evaluate_llm.yml
+    - name: assert evaluation
+      ansible.builtin.assert:
+        that:
+          - not (_llm_eval.ttft_ok | bool)  # 1149.2 > 200
+          - _llm_eval.itl_ok | bool         # 27.9  <= 50
+          - _llm_eval.throughput_ok | bool  # min_throughput_req_s is null => pass
+          - _llm_eval.status == 'flag'
+          - _llm_eval.gated | bool          # ttft/itl gates ARE applied
+        fail_msg: "evaluate_llm produced {{ _llm_eval }}"
+
+    - name: evaluate_llm — null thresholds disable the SLO gates
+      vars:
+        gpu_benchmark:
+          thresholds: {profile: chat, ttft_p95_ms: null, itl_p95_ms: null, min_throughput_req_s: null}
+        _llm_metrics:
+          throughput_req_s_mean: 5.9
+          req_latency_p95_s: 4.2
+          ttft_p95_ms: 1533.9
+          itl_p95_ms: 10.6
+          tpot_p95_ms: 16.6
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/evaluate_llm.yml
+    - name: assert null thresholds pass
+      ansible.builtin.assert:
+        that:
+          - _llm_eval.ttft_ok | bool
+          - _llm_eval.itl_ok | bool
+          - _llm_eval.throughput_ok | bool
+          - _llm_eval.status == 'ok'
+          - not (_llm_eval.gated | bool)    # all gates null => calibration, not a real pass
+        fail_msg: "evaluate_llm null-threshold case produced {{ _llm_eval }}"
+
+    - name: resolve_thresholds — reference entry merges partially over globals
+      vars:
+        gpu_benchmark:
+          thresholds: {profile: chat, ttft_p95_ms: 200, itl_p95_ms: 50, min_throughput_req_s: null}
+          reference:
+            'NVIDIA L40S':
+              'Qwen/Qwen2.5-3B-Instruct': {ttft_p95_ms: 2000, min_throughput_req_s: 4.5}
+        _gpu_name: 'NVIDIA L40S'
+        _model: 'Qwen/Qwen2.5-3B-Instruct'
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/resolve_thresholds.yml
+    - name: assert reference thresholds resolved
+      ansible.builtin.assert:
+        that:
+          - _resolved_thresholds.ttft_p95_ms | int == 2000
+          - _resolved_thresholds.itl_p95_ms | int == 50      # inherited from globals
+          - _resolved_thresholds.min_throughput_req_s | float == 4.5
+          - _resolved_thresholds.profile == 'chat'
+          - "_resolved_thresholds_source == 'reference: NVIDIA L40S'"
+        fail_msg: "resolve produced {{ _resolved_thresholds }} / {{ _resolved_thresholds_source }}"
+
+    - name: resolve_thresholds — GPU listed but model missing falls back to globals
+      vars:
+        gpu_benchmark:
+          thresholds: {profile: chat, ttft_p95_ms: 200, itl_p95_ms: 50, min_throughput_req_s: null}
+          reference:
+            'NVIDIA L40S':
+              'some/other-model': {ttft_p95_ms: 2000}
+        _gpu_name: 'NVIDIA L40S'
+        _model: 'Qwen/Qwen2.5-3B-Instruct'
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/resolve_thresholds.yml
+    - name: assert model-miss falls back to global thresholds
+      ansible.builtin.assert:
+        that:
+          - _resolved_thresholds.ttft_p95_ms | int == 200
+          - _resolved_thresholds_source == 'global'
+        fail_msg: "resolve produced {{ _resolved_thresholds }} / {{ _resolved_thresholds_source }}"
+
+    - name: resolve_thresholds — no reference table and unknown GPU name stays global
+      vars:
+        gpu_benchmark:
+          thresholds: {profile: chat, ttft_p95_ms: 200, itl_p95_ms: 50, min_throughput_req_s: null}
+        _gpu_name: ''
+        _model: 'Qwen/Qwen2.5-3B-Instruct'
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/resolve_thresholds.yml
+    - name: assert absent table stays global
+      ansible.builtin.assert:
+        that:
+          - _resolved_thresholds.ttft_p95_ms | int == 200
+          - _resolved_thresholds_source == 'global'
+        fail_msg: "resolve produced {{ _resolved_thresholds }} / {{ _resolved_thresholds_source }}"
+
+    - name: evaluate_llm — reference thresholds passed via _eval_thresholds clear the TTFT flag
+      vars:
+        _eval_thresholds: {profile: chat, ttft_p95_ms: 2000, itl_p95_ms: 50, min_throughput_req_s: 4.5}
+        _eval_thresholds_source: 'reference: NVIDIA L40S'
+        _llm_metrics:
+          throughput_req_s_mean: 5.9
+          req_latency_p95_s: 4.2
+          ttft_p95_ms: 1533.9    # > 200 global, but <= 2000 reference => ok
+          itl_p95_ms: 10.6
+          tpot_p95_ms: 16.6
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/evaluate_llm.yml
+    - name: assert reference SLOs evaluate clean and record their source
+      ansible.builtin.assert:
+        that:
+          - _llm_eval.status == 'ok'
+          - _llm_eval.ttft_ok | bool
+          - _llm_eval.throughput_ok | bool   # 5.9 >= 4.5
+          - "_llm_eval.source == 'reference: NVIDIA L40S'"
+        fail_msg: "evaluate_llm reference case produced {{ _llm_eval }}"
+
+    - name: compare_gpus — identical GPUs produce zero spread and no flags
+      vars:
+        gpu_benchmark: {llm_variance_pct: 20}
+        _model_gpu_results:
+          - {gpu: 0, metrics: {throughput_req_s_mean: "5.9", req_latency_p95_s: "4.2", ttft_p95_ms: "1500", itl_p95_ms: "10", tpot_p95_ms: "16", requests_successful: "120"}}
+          - {gpu: 1, metrics: {throughput_req_s_mean: "5.9", req_latency_p95_s: "4.2", ttft_p95_ms: "1500", itl_p95_ms: "10", tpot_p95_ms: "16", requests_successful: "120"}}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_gpus.yml
+    - name: assert identical GPUs compare ok
+      ansible.builtin.assert:
+        that:
+          - _gpu_delta.status == 'ok'
+          - _gpu_delta.metrics | length == 5
+          - _gpu_delta.metrics | rejectattr('ok') | list | length == 0
+          - _gpu_delta.metrics | map(attribute='spread_pct') | map('float') | select('ne', 0.0) | list | length == 0
+          - _gpu_delta.metrics | map(attribute='flagged_gpus') | map('length') | sum == 0
+        fail_msg: "compare_gpus identical case produced {{ _gpu_delta }}"
+
+    - name: compare_gpus — a slow GPU is flagged directionally (throughput down, latency up)
+      vars:
+        gpu_benchmark: {llm_variance_pct: 20}
+        _model_gpu_results:
+          # gpu 1 is the outlier: lower throughput AND higher latencies than gpu 0.
+          - {gpu: 0, metrics: {throughput_req_s_mean: "6.0", req_latency_p95_s: "4.0", ttft_p95_ms: "1000", itl_p95_ms: "10", tpot_p95_ms: "16", requests_successful: "120"}}
+          - {gpu: 1, metrics: {throughput_req_s_mean: "4.0", req_latency_p95_s: "6.0", ttft_p95_ms: "1500", itl_p95_ms: "10", tpot_p95_ms: "16", requests_successful: "120"}}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_gpus.yml
+    - name: assert the slow GPU is flagged on the right metrics
+      ansible.builtin.assert:
+        that:
+          - _gpu_delta.status == 'flag'
+          # throughput (higher-better): 4.0 < 6.0*0.8 => gpu 1 flagged
+          - (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).flagged_gpus == [1]
+          - not (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).ok
+          # req_latency (lower-better): 6.0 > 4.0*1.2 => gpu 1 flagged
+          - (_gpu_delta.metrics | selectattr('metric', 'eq', 'req_latency_p95_s') | first).flagged_gpus == [1]
+          # ttft (lower-better): 1500 > 1000*1.2 => gpu 1 flagged
+          - (_gpu_delta.metrics | selectattr('metric', 'eq', 'ttft_p95_ms') | first).flagged_gpus == [1]
+          # equal metrics stay ok with no flags
+          - (_gpu_delta.metrics | selectattr('metric', 'eq', 'itl_p95_ms') | first).ok
+          - (_gpu_delta.metrics | selectattr('metric', 'eq', 'itl_p95_ms') | first).flagged_gpus | length == 0
+          - _gpu_delta.metrics | rejectattr('ok') | list | length == 3
+        fail_msg: "compare_gpus slow-GPU case produced {{ _gpu_delta }}"
+
+    - name: compare_gpus — 3 GPUs, only the outlier flagged; best is never flagged
+      vars:
+        gpu_benchmark: {llm_variance_pct: 20}
+        _model_gpu_results:
+          - {gpu: 0, metrics: {throughput_req_s_mean: "6.0", req_latency_p95_s: "4.0", ttft_p95_ms: "1000", itl_p95_ms: "10", tpot_p95_ms: "16", requests_successful: "120"}}
+          - {gpu: 1, metrics: {throughput_req_s_mean: "5.8", req_latency_p95_s: "4.1", ttft_p95_ms: "1050", itl_p95_ms: "10", tpot_p95_ms: "16", requests_successful: "120"}}
+          - {gpu: 2, metrics: {throughput_req_s_mean: "3.0", req_latency_p95_s: "8.0", ttft_p95_ms: "2000", itl_p95_ms: "10", tpot_p95_ms: "16", requests_successful: "120"}}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_gpus.yml
+    - name: assert only the outlier GPU is flagged
+      ansible.builtin.assert:
+        that:
+          - _gpu_delta.status == 'flag'
+          # 5.8 within 20% of 6.0 (>4.8) => gpu 1 ok; 3.0 < 4.8 => gpu 2 flagged
+          - (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).flagged_gpus == [2]
+          - (_gpu_delta.metrics | selectattr('metric', 'eq', 'ttft_p95_ms') | first).flagged_gpus == [2]
+        fail_msg: "compare_gpus 3-GPU case produced {{ _gpu_delta }}"
+
+    - name: compare_gpus — all-zero metric does not crash (spread 0, no divide-by-zero)
+      vars:
+        gpu_benchmark: {llm_variance_pct: 20}
+        _model_gpu_results:
+          # throughput 0 on both GPUs (e.g. saturated run had 0 successful requests)
+          - {gpu: 0, metrics: {throughput_req_s_mean: "0.0", req_latency_p95_s: "4.0", ttft_p95_ms: "1000", itl_p95_ms: "10", tpot_p95_ms: "16", requests_successful: "120"}}
+          - {gpu: 1, metrics: {throughput_req_s_mean: "0.0", req_latency_p95_s: "4.0", ttft_p95_ms: "1000", itl_p95_ms: "10", tpot_p95_ms: "16", requests_successful: "120"}}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_gpus.yml
+    - name: assert zero-valued best metric is handled
+      ansible.builtin.assert:
+        that:
+          - _gpu_delta.status == 'ok'
+          - (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).spread_pct | float == 0.0
+        fail_msg: "compare_gpus zero-metric case produced {{ _gpu_delta }}"
+
+    # Regression for the 2x T4 false-outlier: a large RELATIVE gap that is
+    # actually single-run noise (tiny sample) must NOT flag any GPU.
+    - name: compare_gpus — tiny sample suppresses flags (T4 3-vs-4 request case)
+      vars:
+        gpu_benchmark: {llm_variance_pct: 20}
+        _model_gpu_results:
+          - {gpu: 0, metrics: {throughput_req_s_mean: "0.07", req_latency_p95_s: "11.36", ttft_p95_ms: "286", itl_p95_ms: "43", tpot_p95_ms: "44", requests_successful: "3"}}
+          - {gpu: 1, metrics: {throughput_req_s_mean: "0.09", req_latency_p95_s: "11.32", ttft_p95_ms: "254", itl_p95_ms: "43", tpot_p95_ms: "44", requests_successful: "4"}}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_gpus.yml
+    - name: assert tiny-sample comparison flags nothing and reports low confidence
+      ansible.builtin.assert:
+        that:
+          - _gpu_delta.status == 'ok'
+          - _gpu_delta.confidence == 'low'
+          - _gpu_delta.min_samples | int == 3
+          - _gpu_delta.metrics | map(attribute='flagged_gpus') | map('length') | sum == 0
+          - "'insufficient sample' in (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).note"
+        fail_msg: "compare_gpus tiny-sample case produced {{ _gpu_delta }}"
+
+    # Absolute floor: even WITH enough samples, a relative throughput spread at
+    # sub-1-req/s is a tiny-denominator artifact and must not flag.
+    - name: compare_gpus — throughput below the absolute floor is not flagged
+      vars:
+        gpu_benchmark: {llm_variance_pct: 20}
+        _model_gpu_results:
+          - {gpu: 0, metrics: {throughput_req_s_mean: "0.07", req_latency_p95_s: "4.0", ttft_p95_ms: "1000", itl_p95_ms: "10", tpot_p95_ms: "16", requests_successful: "120"}}
+          - {gpu: 1, metrics: {throughput_req_s_mean: "0.09", req_latency_p95_s: "4.0", ttft_p95_ms: "1000", itl_p95_ms: "10", tpot_p95_ms: "16", requests_successful: "120"}}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_gpus.yml
+    - name: assert below-floor throughput is not flagged but is noted
+      ansible.builtin.assert:
+        that:
+          - _gpu_delta.confidence == 'ok'   # samples are sufficient
+          - (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).ok
+          - (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).flagged_gpus | length == 0
+          - "'below measurement floor' in (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).note"
+        fail_msg: "compare_gpus below-floor case produced {{ _gpu_delta }}"
+
+    - name: model_status — all GPUs ok yields ok
+      vars:
+        _model_gpu_results:
+          - {gpu: 0, metrics: {}, evaluation: {status: "ok"}}
+          - {gpu: 1, metrics: {}, evaluation: {status: "ok"}}
+        _gpu_delta: {status: "ok", metrics: []}
+        _functional: {}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/model_status.yml
+    - name: assert all-ok model status
+      ansible.builtin.assert:
+        that: _model_status == 'ok'
+        fail_msg: "model_status all-ok case produced {{ _model_status }}"
+
+    - name: model_status — a dead GPU among healthy peers flags (never masked as ok)
+      vars:
+        _model_gpu_results:
+          - {gpu: 0, metrics: {}, evaluation: {status: "ok"}}
+          - {gpu: 1, status: "failed", error: "vLLM never served"}
+        _gpu_delta: {}   # only 1 GPU produced metrics => no delta computed
+        _functional: {}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/model_status.yml
+    - name: assert partial GPU failure flags the model
+      ansible.builtin.assert:
+        that: _model_status == 'flag'
+        fail_msg: "model_status partial-failure case produced {{ _model_status }}"
+
+    - name: model_status — all GPUs failed yields failed
+      vars:
+        _model_gpu_results:
+          - {gpu: 0, status: "failed", error: "boom"}
+          - {gpu: 1, status: "failed", error: "boom"}
+        _gpu_delta: {}
+        _functional: {}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/model_status.yml
+    - name: assert all-failed model status
+      ansible.builtin.assert:
+        that: _model_status == 'failed'
+        fail_msg: "model_status all-failed case produced {{ _model_status }}"
+
+    - name: model_status — GPU-to-GPU delta flag propagates
+      vars:
+        _model_gpu_results:
+          - {gpu: 0, metrics: {}, evaluation: {status: "ok"}}
+          - {gpu: 1, metrics: {}, evaluation: {status: "ok"}}
+        _gpu_delta: {status: "flag", metrics: []}
+        _functional: {}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/model_status.yml
+    - name: assert delta flag propagates to model status
+      ansible.builtin.assert:
+        that: _model_status == 'flag'
+        fail_msg: "model_status delta-flag case produced {{ _model_status }}"
+
+    - name: model_status — a failed functional API test flags the model
+      vars:
+        _model_gpu_results:
+          - {gpu: 0, metrics: {}, evaluation: {status: "ok"}}
+        _gpu_delta: {}
+        _functional: {status: "flag", tests: [{name: "streaming_sse", status: "fail", detail: "x"}]}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/model_status.yml
+    - name: assert functional flag propagates to model status
+      ansible.builtin.assert:
+        that: _model_status == 'flag'
+        fail_msg: "model_status functional-flag case produced {{ _model_status }}"
+
+    - name: evaluate_nvidia — healthy (zero/idle bitmask throttle, zero ECC, count matches)
+      vars:
+        _nvidia_smi:
+          # 0x1 = GPU-idle bit: benign, the normal state of an unloaded GPU (L40S lab regression)
+          - {index: "0", name: "NVIDIA GB200", vram_mib: "189471", ecc_uncorrected: "0", throttle: "0x0000000000000001", pcie_width_current: "16", pcie_width_max: "16"}
+          - {index: "1", name: "NVIDIA GB200", vram_mib: "189471", ecc_uncorrected: "N/A", throttle: "Not Active", pcie_width_current: "N/A", pcie_width_max: "N/A"}
+        _expected_gpu_count: 2
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/evaluate_nvidia.yml
+    - name: assert nvidia healthy
+      ansible.builtin.assert:
+        that:
+          - _nvidia_issues | length == 0
+          - _nvidia_ok | bool
+        fail_msg: "evaluate_nvidia healthy case produced {{ _nvidia_issues }}"
+
+    - name: evaluate_nvidia — count mismatch + ECC + real throttle bit (HW slowdown)
+      vars:
+        _nvidia_smi:
+          # 0x8 = HW slowdown: a REAL throttle problem (unlike the benign idle bit)
+          - {index: "0", name: "NVIDIA GB200", vram_mib: "189471", ecc_uncorrected: "5", throttle: "0x0000000000000008"}
+        _expected_gpu_count: 2
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/evaluate_nvidia.yml
+    - name: assert nvidia unhealthy
+      ansible.builtin.assert:
+        that:
+          - not (_nvidia_ok | bool)
+          - _nvidia_issues | length == 3
+          - _nvidia_issues | select('search', 'only 1/2') | list | length == 1
+          - _nvidia_issues | select('search', 'ECC') | list | length == 1
+          - _nvidia_issues | select('search', 'throttled') | list | length == 1
+        fail_msg: "evaluate_nvidia unhealthy case produced {{ _nvidia_issues }}"
+
+    - name: evaluate_nvidia — degraded PCIe link width flags the GPU
+      vars:
+        _nvidia_smi:
+          - {index: "0", name: "NVIDIA GB200", vram_mib: "189471", ecc_uncorrected: "0", throttle: "0x0000000000000000", pcie_width_current: "4", pcie_width_max: "16"}
+        _expected_gpu_count: 1
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/evaluate_nvidia.yml
+    - name: assert pcie degradation flagged
+      ansible.builtin.assert:
+        that:
+          - not (_nvidia_ok | bool)
+          - _nvidia_issues | length == 1
+          - _nvidia_issues | select('search', 'PCIe link below max width') | list | length == 1
+          - _nvidia_issues | select('search', 'x4 of x16') | list | length == 1
+        fail_msg: "evaluate_nvidia pcie case produced {{ _nvidia_issues }}"
+
+    - name: aggregate_status — all ok
+      vars:
+        _gpu_health:
+          hosts:
+            - {host_id: 0, flagged_gpus: [], nvidia_ok: true}
+          nvidia_ok: true
+        _llm:
+          "m1": {status: "ok"}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/aggregate_status.yml
+    - name: assert status ok
+      ansible.builtin.assert:
+        that: _cluster_status == 'ok'
+        fail_msg: "aggregate_status produced {{ _cluster_status }}"
+
+    - name: aggregate_status — ALL models failed is a hard cluster failure (FAIL, not WARN)
+      vars:
+        _gpu_health:
+          hosts:
+            - {host_id: 0, flagged_gpus: [], nvidia_ok: true}
+          nvidia_ok: true
+        _llm:
+          "m1": {status: "failed", error: "boom"}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/aggregate_status.yml
+    - name: assert status failed when every model failed
+      ansible.builtin.assert:
+        that: _cluster_status == 'failed'
+        fail_msg: "aggregate_status produced {{ _cluster_status }}"
+
+    - name: aggregate_status — a failed model among successful ones stays a flag
+      vars:
+        _gpu_health:
+          hosts:
+            - {host_id: 0, flagged_gpus: [], nvidia_ok: true}
+          nvidia_ok: true
+        _llm:
+          "m1": {status: "failed", error: "boom"}
+          "m2": {status: "ok"}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/aggregate_status.yml
+    - name: assert status flag on partial model failure
+      ansible.builtin.assert:
+        that: _cluster_status == 'flag'
+        fail_msg: "aggregate_status produced {{ _cluster_status }}"
+
+    - name: aggregate_status — a GPU-delta-flagged model flags the cluster
+      vars:
+        _gpu_health:
+          hosts:
+            - {host_id: 0, flagged_gpus: [], nvidia_ok: true}
+          nvidia_ok: true
+        _llm:
+          "m1": {status: "flag"}   # per-GPU SLO or GPU-to-GPU delta flagged
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/aggregate_status.yml
+    - name: assert status flag on delta-flagged model
+      ansible.builtin.assert:
+        that: _cluster_status == 'flag'
+        fail_msg: "aggregate_status produced {{ _cluster_status }}"
+
+    - name: aggregate_status — cublas-flagged GPU flags the cluster
+      vars:
+        _gpu_health:
+          hosts:
+            - {host_id: 0, flagged_gpus: [1], nvidia_ok: true}
+          nvidia_ok: true
+        _llm: {}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/aggregate_status.yml
+    - name: assert status flag on flagged gpu
+      ansible.builtin.assert:
+        that: _cluster_status == 'flag'
+        fail_msg: "aggregate_status produced {{ _cluster_status }}"

@@ -1,0 +1,40 @@
+---
+- name: Reset nvidia-smi accumulator
+  ansible.builtin.set_fact:
+    _nvidia_smi: []
+
+- name: Split nvidia-smi rows
+  ansible.builtin.set_fact:
+    _nvsmi_rows: >-
+      {{ _nvidia_smi_csv.splitlines()
+         | map('regex_replace', ' *, *', ',') | map('trim')
+         | select('match', '^[0-9]') | list }}
+
+- name: Build nvidia-smi dicts
+  ansible.builtin.set_fact:
+    _nvidia_smi: "{{ _nvidia_smi + [_row] }}"
+  loop: "{{ _nvsmi_rows }}"
+  loop_control:
+    loop_var: _line
+    label: "{{ _line }}"
+  vars:
+    _f: "{{ _line.split(',') }}"
+    _na: ['N/A', '[N/A]', 'Not Supported', '[Not Supported]']
+    _c7: "{{ (_f[7] | trim) if (_f | length) > 7 else '' }}"
+    _c8: "{{ (_f[8] | trim) if (_f | length) > 8 else '' }}"
+    _c9: "{{ (_f[9] | trim) if (_f | length) > 9 else '' }}"
+    _c10: "{{ (_f[10] | trim) if (_f | length) > 10 else '' }}"
+    _c11: "{{ (_f[11] | trim) if (_f | length) > 11 else '' }}"
+    _row:
+      index: "{{ _f[0] | int }}"
+      name: "{{ _f[1] }}"
+      vram_mib: "{{ _f[2] | int }}"
+      ecc_uncorrected: "{{ _f[3] }}"
+      throttle: "{{ _f[4] }}"
+      pcie_width_current: "{{ (_f[5] | trim) if (_f | length) > 5 else '' }}"
+      pcie_width_max: "{{ (_f[6] | trim) if (_f | length) > 6 else '' }}"
+      compute_cap: "{{ '' if _c7 in _na else _c7 }}"
+      vbios: "{{ '' if _c8 in _na else _c8 }}"
+      power_limit_w: "{{ '' if _c9 in _na else _c9 }}"
+      sm_clock_max_mhz: "{{ '' if _c10 in _na else _c10 }}"
+      temperature_c: "{{ '' if _c11 in _na else _c11 }}"

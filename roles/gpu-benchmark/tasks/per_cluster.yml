@@ -1,0 +1,163 @@
+---
+- name: GPU/LLM benchmark for cluster {{ current_cluster.name }}
+  block:
+    - name: Reset per-cluster note
+      ansible.builtin.set_fact:
+        _cluster_note: ""
+        _appliance_template_id: ""
+        _appliance_image_id: ""
+        _gpu_health: {}
+        _llm: {}
+
+    - name: Discover GPUs
+      ansible.builtin.include_tasks: discover.yml
+
+    - name: Skip cluster when no GPUs are present
+      ansible.builtin.set_fact:
+        _gpu_health: {}
+        _llm: {}
+        _cluster_note: "no NVIDIA GPUs discovered"
+      when: _gpu_inventory.gpu_count | int == 0
+
+    - name: Export vLLM appliance from the marketplace (once per cluster)
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: export_marketapp.yml
+      vars:
+        _export_app_name: "{{ gpu_benchmark.appliance_market_name }}"
+        _export_name: "{{ gpu_benchmark.appliance_market_name | regex_replace('[^A-Za-z0-9_-]', '_') }}{{ current_cluster.name_suffix }}"
+        _export_ds_id: "{{ current_cluster.image_ds_id }}"
+      when: _gpu_inventory.gpu_count | int > 0
+
+    - name: Record appliance template id
+      ansible.builtin.set_fact:
+        _appliance_template_id: "{{ _export_template_id }}"
+        _appliance_image_id: "{{ _export_image_id }}"
+      when: _gpu_inventory.gpu_count | int > 0
+
+    - name: Strip USER_INPUTS from the exported template (CLI prompting unusable without TTY)
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: |
+        set -e
+        BODY="$(onetemplate show {{ _appliance_template_id }} | sed -n '/^TEMPLATE CONTENTS/,$p' | tail -n +2)"
+        if ! grep -q '^USER_INPUTS=\[' <<< "$BODY"; then
+          echo "no USER_INPUTS; nothing to strip"
+          exit 0
+        fi
+        TMP="$(mktemp)"
+        sed '/^USER_INPUTS=\[/,/\]$/d; /^INPUTS_ORDER=/d' <<< "$BODY" > "$TMP"
+        onetemplate update {{ _appliance_template_id }} "$TMP"
+        rm -f "$TMP"
+        echo "stripped"
+      args:
+        executable: /bin/bash
+      register: _strip_inputs
+      changed_when: "'stripped' in _strip_inputs.stdout"
+      when: _gpu_inventory.gpu_count | int > 0
+
+    - name: Assert the exported appliance image id is usable
+      ansible.builtin.assert:
+        that:
+          - _export_image_id | default('') | string is match('^[0-9]+$')
+        fail_msg: >-
+          export_marketapp did not yield a usable image id
+          (got '{{ _export_image_id | default('') }}') for '{{ gpu_benchmark.appliance_market_name }}'
+      when: _gpu_inventory.gpu_count | int > 0
+
+    - name: Wait for the exported appliance image to be ready
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        oneimage list --f ID={{ _export_image_id }} -l STAT --no-header
+      register: _img_stat
+      until: (_img_stat.stdout | trim) in ['rdy', 'used', 'err']
+      retries: 90
+      delay: 20
+      changed_when: false
+      when: _gpu_inventory.gpu_count | int > 0
+
+    - name: Fail fast when the appliance image is in error state
+      ansible.builtin.fail:
+        msg: "Appliance image {{ _export_image_id }} is in state '{{ _img_stat.stdout | trim }}'"
+      when:
+        - _gpu_inventory.gpu_count | int > 0
+        - (_img_stat.stdout | trim) not in ['rdy', 'used']
+
+    - name: Resolve benchmark vnet for this cluster
+      ansible.builtin.set_fact:
+        _gpu_vnet_name: >-
+          {{ gpu_benchmark.vnet_name
+             if (gpu_benchmark.vnet_name in (current_cluster.vnet_names_eligible | d(current_cluster.vnet_names | d([]))))
+             else current_cluster.vnet_name }}
+      when: _gpu_inventory.gpu_count | int > 0
+
+    - name: Run GPU-health phase
+      ansible.builtin.include_tasks: gpu_health.yml
+      when: _gpu_inventory.gpu_count | int > 0
+
+    - name: Run LLM benchmark phase
+      ansible.builtin.include_tasks: llm_benchmark.yml
+      when: _gpu_inventory.gpu_count | int > 0
+
+    - name: Aggregate cluster status
+      ansible.builtin.include_tasks: lib/aggregate_status.yml
+
+    - name: Assemble cluster result
+      ansible.builtin.set_fact:
+        gpu_benchmark_results: >-
+          {{ gpu_benchmark_results | default({}) | combine({
+            (inventory_hostname ~ current_cluster.report_suffix): {
+              'discovery': _gpu_inventory,
+              'gpu_health': _gpu_health | default({}),
+              'llm': _llm | default({}),
+              'note': _cluster_note | default(''),
+              'status': _cluster_status,
+              'meta': {
+                'timestamp': ('%Y-%m-%dT%H:%M:%S' | strftime),
+                'appliance_template_id': _appliance_template_id | default(''),
+                'driver_version': (_gpu_health | default({})).driver_version | default(''),
+                'cuda_version': (_gpu_health | default({})).cuda_version | default(''),
+                'models': gpu_benchmark.models,
+                'thresholds': gpu_benchmark.thresholds,
+                'reference': gpu_benchmark.reference | default({}),
+                'llm_variance_pct': gpu_benchmark.llm_variance_pct,
+                'rate_window_s': (gpu_benchmark.guidellm_max_duration_s | default(20) | int),
+                'load_profile': ('GuideLLM sweep, synthetic chat load (512 prompt / 256 output tokens, '
+                  ~ (gpu_benchmark.guidellm_max_duration_s | default(20) | int)
+                  ~ ' s per rate; first request per rate excluded as warmup)')
+              }
+            }
+          }) }}
+
+    - name: Record cluster verification status
+      ansible.builtin.set_fact:
+        verification_result: >-
+          {{ verification_result | default({}) | combine({
+            ('GPU benchmark' ~ current_cluster.report_suffix):
+              ('skipped - no NVIDIA GPUs discovered' if (_gpu_inventory.gpu_count | int == 0)
+               else ('failed - LLM benchmark produced no results' if _cluster_status == 'failed'
+                     else ('warning - anomalies flagged' if _cluster_status == 'flag' else 'ok')))
+          }) }}
+
+  rescue:
+    - name: Best-effort cleanup of leaked VM
+      ansible.builtin.include_tasks: cleanup.yml
+
+    - name: Record cluster failure
+      vars:
+        _rk: "{{ inventory_hostname ~ current_cluster.report_suffix }}"
+      ansible.builtin.set_fact:
+        gpu_benchmark_results: >-
+          {{ gpu_benchmark_results | default({}) | combine({
+            _rk: (((gpu_benchmark_results | default({}))[_rk] | default({})) | combine({
+              'status': 'failed',
+              'error': (ansible_failed_result.msg | default('unknown error') | string | truncate(300, true)),
+              'gpu_health': _gpu_health | default({}),
+              'llm': _llm | default({})
+            }))
+          }) }}
+        verification_result: >-
+          {{ verification_result | default({}) | combine({
+            ('GPU benchmark' ~ current_cluster.report_suffix): 'failed'
+          }) }}

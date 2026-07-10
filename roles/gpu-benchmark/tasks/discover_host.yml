@@ -1,0 +1,16 @@
+---
+- name: Parse host PCI devices
+  ansible.builtin.include_tasks: lib/parse_gpu_inventory.yml
+  vars:
+    _pci_devices: >-
+      {{ ((_host_pair.1.stdout | from_json).HOST.HOST_SHARE['PCI_DEVICES'] | default({})).PCI | default([]) }}
+
+- name: Record host GPU inventory
+  ansible.builtin.set_fact:
+    _gpu_hosts: >-
+      {{ _gpu_hosts + [{
+        'host_id': _host_pair.0,
+        'gpu_count': _gpu_inventory.gpu_count | int,
+        'devices': _gpu_inventory.devices
+      }] }}
+  when: _gpu_inventory.gpu_count | int > 0

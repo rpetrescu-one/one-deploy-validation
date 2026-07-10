@@ -1,7 +1,9 @@
 ---
 - name: OneFlow | validate per cluster
   ansible.builtin.include_tasks: per_cluster.yml
-  when: validation.run_one_flow | default(false) | bool
+  when:
+    - validation.run_one_flow | default(false) | bool
+    - hostvars[_primary_frontend]['ansible_host'] == ansible_host
   loop: "{{ _one_clusters }}"
   loop_control:
     loop_var: current_cluster

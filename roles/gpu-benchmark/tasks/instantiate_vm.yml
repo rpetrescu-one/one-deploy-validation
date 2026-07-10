@@ -1,0 +1,56 @@
+---
+- name: Render instantiation context
+  ansible.builtin.template:
+    src: vllm_context.j2
+    dest: "/tmp/gpu_bench_ctx_{{ _template_id }}.tmpl"
+    owner: oneadmin
+    group: oneadmin
+    mode: "0600"
+  no_log: true
+
+- name: Instantiate VM
+  become: true
+  become_user: oneadmin
+  ansible.builtin.shell: >
+    onetemplate instantiate {{ _template_id }}
+    {% if _ctx.vm_name is defined %}--name '{{ _ctx.vm_name }}'{% endif %}
+    /tmp/gpu_bench_ctx_{{ _template_id }}.tmpl
+  register: _inst
+  changed_when: true
+
+- name: Remove rendered context file (may contain HF token)
+  ansible.builtin.file:
+    path: "/tmp/gpu_bench_ctx_{{ _template_id }}.tmpl"
+    state: absent
+
+- name: Set VM id
+  ansible.builtin.set_fact:
+    _vm_id: "{{ _inst.stdout | regex_search('VM ID:\\s*(\\d+)', '\\1') | first }}"
+
+- name: Wait for VM to be running
+  become: true
+  become_user: oneadmin
+  ansible.builtin.shell: >
+    onevm list --f ID={{ _vm_id }} -l STAT --no-header
+  register: _vm_stat
+  changed_when: false
+  retries: 30
+  delay: 20
+  until: (_vm_stat.stdout | trim) in ['runn', 'fail']
+
+- name: Fail fast when the VM entered a failed state
+  ansible.builtin.fail:
+    msg: "VM {{ _vm_id }} entered state '{{ _vm_stat.stdout | trim }}' instead of running"
+  when: (_vm_stat.stdout | trim) != 'runn'
+
+- name: Get VM IP
+  become: true
+  become_user: oneadmin
+  ansible.builtin.shell: >
+    onevm list --f ID={{ _vm_id }} -l IP --no-header
+  register: _vm_ip_cmd
+  changed_when: false
+
+- name: Set VM IP fact
+  ansible.builtin.set_fact:
+    _vm_ip: "{{ _vm_ip_cmd.stdout.split(',')[0] | trim }}"

@@ -1,24 +1,32 @@
 ---
 # Storage benchmarking. Execute the block below only when validation.storage_benchmark is enabled.
+- name: Resolve benchmark cluster and template
+  ansible.builtin.set_fact:
+    current_cluster: "{{ _sb_pair.0 }}"
+    _sb_template: "{{ _sb_pair.1 }}"
+
 - name: Run Storage benchmark test
   block:
   - name: Get VM template as JSON
     ansible.builtin.shell: >
-      onetemplate show "{{ validation.test_vm.vm.market_name }}{{ current_cluster.name_suffix }}" -j
+      onetemplate show "{{ _sb_template }}{{ current_cluster.name_suffix }}" -j
     register: image_output
     failed_when: "image_output.rc != 0 and image_output.stdout == ''"
-    when: current_cluster.name not in _test_vm_template_image_ids_map
+    when: >-
+      (_sb_template != validation.test_vm.vm.market_name)
+      or (current_cluster.name not in _test_vm_template_image_ids_map)
 
   - name: Set benchmark image ID for this cluster
     ansible.builtin.set_fact:
       _sb_image_id: >-
         {{ _test_vm_template_image_ids_map[current_cluster.name]
-           if current_cluster.name in _test_vm_template_image_ids_map
+           if (_sb_template == validation.test_vm.vm.market_name
+               and current_cluster.name in _test_vm_template_image_ids_map)
            else (image_output.stdout | from_json | json_query('VMTEMPLATE.TEMPLATE.DISK.IMAGE_ID')) }}
 
   - name: Instantiate benchmark VM
     ansible.builtin.shell: >
-      onetemplate instantiate "{{ validation.test_vm.vm.market_name }}{{ current_cluster.name_suffix }}" --nic '{{ current_cluster.storage_vnet_name }}' --disk {{ _sb_image_id }}:size=8000 --mem 1g
+      onetemplate instantiate "{{ _sb_template }}{{ current_cluster.name_suffix }}" --nic '{{ current_cluster.storage_vnet_name }}' --disk {{ _sb_image_id }}:size=8000 --mem 1g
     register: benchmarkvm_id
     failed_when: "benchmarkvm_id.rc != 0"
     retries: 3
@@ -209,7 +217,7 @@
       storage_benchmark: >-
         {{
           storage_benchmark | default({}) | combine({
-            (inventory_hostname ~ current_cluster.report_suffix): {
+            (inventory_hostname ~ ' (' ~ _sb_template ~ ')' ~ current_cluster.report_suffix): {
               'fio_raw': (fio_suite.stdout | from_json),
               'profiles': (fio_suite.stdout | from_json | json_query('jobs[].{name: jobname, rw: "job options".rw, bs: "job options".bs, iodepth: "job options".iodepth, read_iops: read.iops, read_bw_kib: read.bw, read_p99_ns: read.clat_ns.percentile."99.000000", write_iops: write.iops, write_bw_kib: write.bw, write_p99_ns: write.clat_ns.percentile."99.000000" }') )
             }
@@ -237,7 +245,7 @@
       ansible.builtin.set_fact:
         verification_result: >-
           {{ (verification_result | d({}))
-             | combine({'Storage benchmark' ~ current_cluster.report_suffix: 'failed'}) }}
+             | combine({'Storage benchmark (' ~ _sb_template ~ ')' ~ current_cluster.report_suffix: 'failed'}) }}
 
     - name: "Show failure"
       ansible.builtin.debug:

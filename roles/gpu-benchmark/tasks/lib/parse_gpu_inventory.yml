@@ -1,0 +1,18 @@
+---
+- name: Normalize PCI devices to a list
+  ansible.builtin.set_fact:
+    _pci_list: "{{ [_pci_devices] if _pci_devices is mapping else (_pci_devices | default([])) }}"
+
+- name: Build GPU device list
+  ansible.builtin.set_fact:
+    _gpu_inventory:
+      gpu_count: "{{ _gpus | length }}"
+      devices: "{{ _gpus }}"
+  vars:
+    _gpus: >-
+      {{
+        _pci_list
+        | selectattr('VENDOR', 'defined') | selectattr('VENDOR', 'eq', '10de')
+        | selectattr('CLASS', 'defined') | selectattr('CLASS', 'eq', '0302')
+        | json_query('[].{short_address: SHORT_ADDRESS, vendor: VENDOR, device: DEVICE, model: DEVICE_NAME}')
+      }}

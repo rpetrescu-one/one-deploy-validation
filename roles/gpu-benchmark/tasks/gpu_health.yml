@@ -1,0 +1,21 @@
+---
+# Runs one health VM per GPU-bearing host in the cluster. Out: _gpu_health.
+- name: Reset GPU-health accumulators
+  ansible.builtin.set_fact:
+    _gpu_health_hosts: []
+
+- name: Run GPU health per host
+  ansible.builtin.include_tasks: gpu_health_host.yml
+  loop: "{{ _gpu_inventory.hosts }}"
+  loop_control:
+    loop_var: _gpu_host
+    label: "host {{ _gpu_host.host_id }}"
+
+- name: Assemble GPU-health fact
+  ansible.builtin.set_fact:
+    _gpu_health:
+      hosts: "{{ _gpu_health_hosts }}"
+      driver_version: "{{ (_gpu_health_hosts | selectattr('driver_version', 'defined') | map(attribute='driver_version') | select('ne', '') | first) | default('') }}"
+      cuda_version: "{{ (_gpu_health_hosts | selectattr('cuda_version', 'defined') | map(attribute='cuda_version') | select('ne', '') | first) | default('') }}"
+      any_cublas_flagged: "{{ (_gpu_health_hosts | map(attribute='flagged_gpus') | map('length') | select('gt', 0) | list | length) > 0 }}"
+      nvidia_ok: "{{ (_gpu_health_hosts | map(attribute='nvidia_ok') | map('bool') | select('eq', false) | list | length) == 0 }}"

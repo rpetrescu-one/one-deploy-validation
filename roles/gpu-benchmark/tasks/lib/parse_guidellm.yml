@@ -1,0 +1,70 @@
+---
+- name: Select saturated and synchronous benchmarks (by RPS mean)
+  ansible.builtin.set_fact:
+    _gl_sorted: >-
+      {{ _guidellm_report.benchmarks
+         | sort(attribute='metrics.requests_per_second.' ~ gpu_benchmark.guidellm_status ~ '.mean') }}
+    _llm_sweep: []
+
+- name: Extract load-sweep rows
+  ansible.builtin.set_fact:
+    _llm_sweep: >-
+      {{ _llm_sweep + [{
+        'strategy': _strat.type_ | default(item.id_ | default('?'), true),
+        'target_rate': _strat.rate | default('', true),
+        'rps': _m.requests_per_second[_s].mean | float | round(2),
+        'output_tok_s': _otps if (_otps | string | length > 0) else '',
+        'concurrency': _conc if (_conc | string | length > 0) else '',
+        'ttft_p95_ms': _m.time_to_first_token_ms[_s].percentiles.p95 | float | round(1),
+        'itl_p95_ms': _m.inter_token_latency_ms[_s].percentiles.p95 | float | round(2),
+        'requests_ok': (_m.request_totals | default({})).successful | default(''),
+        'requests_err': (_m.request_totals | default({})).errored | default(''),
+        'requests_incomplete': (_m.request_totals | default({})).incomplete | default('')
+      }] }}
+  loop: "{{ _gl_sorted }}"
+  loop_control:
+    label: "{{ (item.config | default({})).strategy.type_ | default(item.id_ | default('?')) }}"
+  vars:
+    _m: "{{ item.metrics }}"
+    _s: "{{ gpu_benchmark.guidellm_status }}"
+    _strat: "{{ (item.config | default({})).strategy | default({}) }}"
+    _otps: "{{ ((_m.output_tokens_per_second | default({}))[_s] | default({})).mean | default('') }}"
+    _conc: "{{ ((_m.request_concurrency | default({}))[_s] | default({})).mean | default('') }}"
+
+- name: Extract headline LLM metrics
+  ansible.builtin.set_fact:
+    _llm_metrics:
+      throughput_req_s_mean: >-
+        {{ ((_sat_otps | float) / (_sat_outtok | float)) | round(2)
+           if ((_sat_otps | string | length > 0) and ((_sat_outtok | default('0') | float) > 0))
+           else (_sat.requests_per_second[_s].mean | float | round(2)) }}
+      throughput_req_s_peak: "{{ _sat.requests_per_second[_s].mean | float | round(2) }}"
+      output_tok_s_saturated: "{{ _sat_otps }}"
+      req_latency_p95_s: "{{ _syn.request_latency[_s].percentiles.p95 | float }}"
+      ttft_p95_ms: "{{ _syn.time_to_first_token_ms[_s].percentiles.p95 | float }}"
+      itl_p95_ms: "{{ _syn.inter_token_latency_ms[_s].percentiles.p95 | float }}"
+      tpot_p95_ms: "{{ _syn.time_per_output_token_ms[_s].percentiles.p95 | float }}"
+      saturated:
+        req_latency_p95_s: "{{ _sat.request_latency[_s].percentiles.p95 | float }}"
+        ttft_p95_ms: "{{ _sat.time_to_first_token_ms[_s].percentiles.p95 | float }}"
+        itl_p95_ms: "{{ _sat.inter_token_latency_ms[_s].percentiles.p95 | float }}"
+        tpot_p95_ms: "{{ _sat.time_per_output_token_ms[_s].percentiles.p95 | float }}"
+      requests_successful: "{{ _llm_sweep | map(attribute='requests_ok') | map('string') | select('ne', '') | map('int') | sum }}"
+      requests_errored: "{{ _llm_sweep | map(attribute='requests_err') | map('string') | select('ne', '') | map('int') | sum }}"
+      requests_incomplete: "{{ _llm_sweep | map(attribute='requests_incomplete') | map('string') | select('ne', '') | map('int') | sum }}"
+      saturation_achieved: >-
+        {{ (_tp_by_type | length == 0)
+           or ((((_tp_by_type | first).metrics.request_totals | default({})).successful | default(0) | int) > 0) }}
+      sweep: "{{ _llm_sweep }}"
+  vars:
+    _tp_by_type: >-
+      {{ _gl_sorted | selectattr('config.strategy.type_', 'defined')
+         | selectattr('config.strategy.type_', 'eq', 'throughput') | list }}
+    _syn_by_type: >-
+      {{ _gl_sorted | selectattr('config.strategy.type_', 'defined')
+         | selectattr('config.strategy.type_', 'eq', 'synchronous') | list }}
+    _syn: "{{ (_syn_by_type | first | default(_gl_sorted | first)).metrics }}"
+    _sat: "{{ (_gl_sorted | last).metrics }}"
+    _s: "{{ gpu_benchmark.guidellm_status }}"
+    _sat_otps: "{{ ((_sat.output_tokens_per_second | default({}))[_s] | default({})).mean | default('') }}"
+    _sat_outtok: "{{ ((_sat.output_token_count | default({}))[_s] | default({})).mean | default('') }}"

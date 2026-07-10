@@ -1,0 +1,31 @@
+---
+- name: Evaluate LLM metrics against thresholds
+  ansible.builtin.set_fact:
+    _llm_eval:
+      profile: "{{ _t.profile }}"
+      source: "{{ _eval_thresholds_source | default('global') }}"
+      thresholds:
+        ttft_p95_ms: "{{ _t.ttft_p95_ms }}"
+        itl_p95_ms: "{{ _t.itl_p95_ms }}"
+        min_throughput_req_s: "{{ _t.min_throughput_req_s }}"
+      gated: >-
+        {{ (_t.ttft_p95_ms is not none) or (_t.itl_p95_ms is not none)
+           or (_t.min_throughput_req_s is not none) }}
+      ttft_ok: >-
+        {{ _t.ttft_p95_ms is none
+           or (_llm_metrics.ttft_p95_ms | float) <= (_t.ttft_p95_ms | float) }}
+      itl_ok: >-
+        {{ _t.itl_p95_ms is none
+           or (_llm_metrics.itl_p95_ms | float) <= (_t.itl_p95_ms | float) }}
+      throughput_ok: >-
+        {{ _t.min_throughput_req_s is none
+           or (_llm_metrics.throughput_req_s_mean | float) >= (_t.min_throughput_req_s | float) }}
+  vars:
+    _t: "{{ _eval_thresholds | default(gpu_benchmark.thresholds) }}"
+
+- name: Derive overall status
+  ansible.builtin.set_fact:
+    _llm_eval: >-
+      {{ _llm_eval | combine({
+        'status': ('ok' if ((_llm_eval.ttft_ok | bool) and (_llm_eval.itl_ok | bool) and (_llm_eval.throughput_ok | bool)) else 'flag')
+      }) }}

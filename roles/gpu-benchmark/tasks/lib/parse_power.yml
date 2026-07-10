@@ -1,0 +1,17 @@
+---
+- name: Parse power samples
+  ansible.builtin.set_fact:
+    _power: >-
+      {{ {'samples': _rows | length,
+          'power_avg_w': ((_p | sum) / (_p | length)) | round(1),
+          'power_max_w': (_p | max) | round(1),
+          'sm_clock_min_mhz': (_c | min) | int,
+          'temp_max_c': (_t | max) | int}
+         if (_rows | length > 0) else {} }}
+  vars:
+    _rows: >-
+      {{ _power_csv.splitlines() | map('regex_replace', ' *, *', ',') | map('trim')
+         | select('match', '^[0-9.]+,[0-9]+,[0-9]+$') | list }}
+    _p: "{{ _rows | map('split', ',') | map(attribute=0) | map('float') | list }}"
+    _c: "{{ _rows | map('split', ',') | map(attribute=1) | map('int') | list }}"
+    _t: "{{ _rows | map('split', ',') | map(attribute=2) | map('int') | list }}"

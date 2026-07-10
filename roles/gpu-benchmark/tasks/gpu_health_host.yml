@@ -1,0 +1,326 @@
+---
+- name: Reset per-host health facts
+  ansible.builtin.set_fact:
+    _cublas: []
+    _cublas_flagged: []
+    _pcie_bw: []
+    _pcie_bw_flagged: []
+    _dcgm: {}
+    _nvidia_smi: []
+    _nvidia_issues: []
+    _health_pci_count: >-
+      {{ (_gpu_host.gpu_count | int)
+         if (gpu_benchmark.gpu_count == 'all')
+         else ([gpu_benchmark.gpu_count | int, _gpu_host.gpu_count | int] | min) }}
+
+- name: GPU health for host {{ _gpu_host.host_id }}
+  block:
+    - name: Instantiate GPU-health VM
+      ansible.builtin.include_tasks: instantiate_vm.yml
+      vars:
+        _template_id: "{{ _appliance_template_id }}"
+        _ctx:
+          vnet: "{{ _gpu_vnet_name | default(gpu_benchmark.vnet_name) }}"
+          pci_count: "{{ _health_pci_count }}"
+          host_id: "{{ _gpu_host.host_id }}"
+          vm_name: "gpu-bench-health-h{{ _gpu_host.host_id }}{{ current_cluster.name_suffix }}"
+          image_id: "{{ _appliance_image_id | default('') }}"
+          disk_size_mb: "{{ gpu_benchmark.vm.disk_mb }}"
+
+    - name: Wait for SSH on the health VM
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no -oConnectTimeout=10
+        root@{{ _vm_ip }} true
+      register: _ssh_ready
+      until: _ssh_ready.rc == 0
+      retries: 20
+      delay: 15
+      changed_when: false
+
+    - name: Query driver and CUDA versions
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }}
+        "nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n1;
+        nvidia-smi -q | grep -m1 'CUDA Version' | grep -oE '[0-9]+[.][0-9]+'"
+      register: _drv
+      changed_when: false
+      failed_when: false
+
+    - name: Run nvidia-smi query
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }}
+        "nvidia-smi --query-gpu=index,name,memory.total,ecc.errors.uncorrected.aggregate.total,clocks_throttle_reasons.active,pcie.link.width.current,pcie.link.width.max,compute_cap,vbios_version,power.limit,clocks.max.sm,temperature.gpu --format=csv,noheader,nounits"
+      register: _nvsmi
+      changed_when: false
+      failed_when: false
+
+    - name: Parse nvidia-smi
+      ansible.builtin.include_tasks: lib/parse_nvidia_smi.yml
+      vars:
+        _nvidia_smi_csv: "{{ _nvsmi.stdout | default('') }}"
+
+    - name: Evaluate NVIDIA health
+      ansible.builtin.include_tasks: lib/evaluate_nvidia.yml
+      vars:
+        _expected_gpu_count: "{{ _health_pci_count }}"
+
+    - name: Stop the appliance's auto-served vLLM (frees the GPUs for the diagnostics)
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }}
+        "systemctl stop one-appliance 2>/dev/null; pkill -f '[v]llm serve' 2>/dev/null; sleep 3;
+        nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits"
+      register: _vllm_kill
+      changed_when: true
+      failed_when: false
+      when: (gpu_benchmark.cublas.enabled | bool)
+            or (gpu_benchmark.pcie_bw.enabled | bool)
+            or (gpu_benchmark.dcgm.enabled | bool)
+
+    - name: Stage cuBLAS source on the frontend
+      ansible.builtin.copy:
+        src: cublas_sgemm.cu
+        dest: /tmp/gpu_bench_cublas_sgemm.cu
+        mode: "0644"
+      when: gpu_benchmark.cublas.enabled | bool
+
+    - name: Copy cuBLAS source to VM
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        scp -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no
+        /tmp/gpu_bench_cublas_sgemm.cu root@{{ _vm_ip }}:/tmp/cublas_sgemm.cu
+      changed_when: true
+      when: gpu_benchmark.cublas.enabled | bool
+
+    - name: Stage PCIe bandwidth source on the frontend
+      ansible.builtin.copy:
+        src: pcie_bandwidth.cu
+        dest: /tmp/gpu_bench_pcie_bandwidth.cu
+        mode: "0644"
+      when: gpu_benchmark.pcie_bw.enabled | bool
+
+    - name: Copy PCIe bandwidth source to VM
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        scp -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no
+        /tmp/gpu_bench_pcie_bandwidth.cu root@{{ _vm_ip }}:/tmp/pcie_bandwidth.cu
+      changed_when: true
+      when: gpu_benchmark.pcie_bw.enabled | bool
+
+    - name: Detect or install CUDA toolkit, then compile (on the VM via ssh)
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: |
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }} bash -s <<'REMOTE_EOF'
+        set -e
+        if ! command -v nvcc >/dev/null 2>&1; then
+          if [ "{{ gpu_benchmark.cublas.allow_toolkit_install | bool | lower }}" = "true" ]; then
+            apt-get update >/dev/null
+            apt-get install -y cuda-toolkit >/dev/null 2>&1 || apt-get install -y nvidia-cuda-toolkit >/dev/null
+          else
+            echo "NVCC_MISSING"; exit 42
+          fi
+        fi
+        if [ -f /tmp/cublas_sgemm.cu ]; then nvcc -O3 -lcublas -o /tmp/cublas_sgemm /tmp/cublas_sgemm.cu; fi
+        if [ -f /tmp/pcie_bandwidth.cu ]; then nvcc -O3 -o /tmp/pcie_bw /tmp/pcie_bandwidth.cu; fi
+        REMOTE_EOF
+      args:
+        executable: /bin/bash
+      register: _nvcc
+      changed_when: true
+      failed_when: false
+      when: (gpu_benchmark.cublas.enabled | bool) or (gpu_benchmark.pcie_bw.enabled | bool)
+
+    - name: Run cuBLAS per visible GPU
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }}
+        "CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES={{ _gpu }} /tmp/cublas_sgemm {{ gpu_benchmark.cublas.n }} {{ gpu_benchmark.cublas.iters }}"
+      register: _cublas_runs
+      changed_when: false
+      loop: "{{ range(_nvidia_smi | length) | list }}"
+      loop_control:
+        loop_var: _gpu
+      when:
+        - gpu_benchmark.cublas.enabled | bool
+        - _nvcc.rc | default(1) == 0
+
+    - name: Parse cuBLAS results
+      ansible.builtin.include_tasks: lib/parse_cublas.yml
+      vars:
+        _cublas_results: "{{ _cublas_runs.results | json_query('[].{gpu: _gpu, stdout: stdout}') }}"
+      when:
+        - gpu_benchmark.cublas.enabled | bool
+        - _nvcc.rc | default(1) == 0
+
+    - name: Run PCIe bandwidth per visible GPU
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }}
+        "CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES={{ _gpu }} /tmp/pcie_bw {{ gpu_benchmark.pcie_bw.size_mb }} {{ gpu_benchmark.pcie_bw.iters }}"
+      register: _pcie_runs
+      changed_when: false
+      loop: "{{ range(_nvidia_smi | length) | list }}"
+      loop_control:
+        loop_var: _gpu
+      when:
+        - gpu_benchmark.pcie_bw.enabled | bool
+        - _nvcc.rc | default(1) == 0
+
+    - name: Parse PCIe bandwidth results
+      ansible.builtin.include_tasks: lib/parse_pcie_bw.yml
+      vars:
+        _pcie_bw_results: "{{ _pcie_runs.results | json_query('[].{gpu: _gpu, stdout: stdout}') }}"
+      when:
+        - gpu_benchmark.pcie_bw.enabled | bool
+        - _nvcc.rc | default(1) == 0
+
+    - name: Run NVIDIA DCGM diagnostics (level {{ gpu_benchmark.dcgm.level }})
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: |
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no -oServerAliveInterval=15 -oServerAliveCountMax=4 root@{{ _vm_ip }} bash -s <<'REMOTE_EOF'
+        set -e
+        try_install() {
+          apt-get install -y datacenter-gpu-manager >/dev/null 2>&1 && return 0
+          apt-get install -y datacenter-gpu-manager-4-cuda12 >/dev/null 2>&1 && return 0
+          apt-get install -y datacenter-gpu-manager-4-core >/dev/null 2>&1 && return 0
+          return 1
+        }
+        if ! command -v dcgmi >/dev/null 2>&1; then
+          if [ "{{ gpu_benchmark.dcgm.allow_install | bool | lower }}" = "true" ]; then
+            apt-get update >/dev/null 2>&1 || true
+            if ! try_install; then
+              # DCGM not in the configured repos (the appliance may use Ubuntu
+              # nvidia-cuda-toolkit, not the NVIDIA CUDA repo). Add the official
+              # CUDA repo for this distro via cuda-keyring, then retry.
+              . /etc/os-release
+              DISTRO="${ID}${VERSION_ID//./}"
+              ARCH="$(uname -m)"; if [ "$ARCH" = "aarch64" ]; then ARCH=sbsa; else ARCH=x86_64; fi
+              BASE="https://developer.download.nvidia.com/compute/cuda/repos/${DISTRO}/${ARCH}"
+              TMP="$(mktemp -d)"
+              if curl -fsSL "${BASE}/cuda-keyring_1.1-1_all.deb" -o "${TMP}/k.deb" 2>/dev/null || wget -qO "${TMP}/k.deb" "${BASE}/cuda-keyring_1.1-1_all.deb" 2>/dev/null; then
+                dpkg -i "${TMP}/k.deb" >/dev/null 2>&1 || true
+                apt-get update >/dev/null 2>&1 || true
+                try_install || { echo "DCGM install failed after adding NVIDIA repo (${DISTRO}/${ARCH})"; exit 42; }
+              else
+                echo "DCGM repo unreachable for ${DISTRO}/${ARCH} (airgap? set dcgm.enabled=false)"; exit 42
+              fi
+              rm -rf "$TMP"
+            fi
+          else
+            echo "dcgmi not installed and dcgm.allow_install is false"; exit 42
+          fi
+        fi
+        systemctl start nvidia-dcgm >/dev/null 2>&1 </dev/null || (setsid nv-hostengine >/dev/null 2>&1 </dev/null &) || true
+        sleep 3
+        # dcgmi output goes to a FILE, never to this ssh channel. A DCGM diag
+        # plugin/subprocess that lingers after dcgmi exits and inherited the
+        # channel would keep ssh (and this Ansible task) blocked forever — a
+        # full level-3 diag hung the task ~1.5h on the lab even though the diag
+        # itself passed. Writing to a file (then cat) removes dcgmi and its
+        # children from the channel. --kill-after force-KILLs a diag that
+        # ignores SIGTERM at the timeout. Hard timeout so a hung plugin or a
+        # network blip becomes a captured skip, not a stalled playbook.
+        timeout --kill-after=30 {{ gpu_benchmark.dcgm.timeout_s | int }} dcgmi diag -r {{ gpu_benchmark.dcgm.level | int }} -j >/root/dcgm_result.json 2>/root/dcgm_result.err </dev/null
+        rc=$?
+        if [ -s /root/dcgm_result.json ] && head -c1 /root/dcgm_result.json | grep -q '{'; then
+          cat /root/dcgm_result.json
+          exit 0
+        fi
+        if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+          echo "DCGM diag exceeded {{ gpu_benchmark.dcgm.timeout_s | int }}s timeout (raise dcgm.timeout_s or lower dcgm.level)"
+        else
+          echo "DCGM diag failed (rc=$rc): $(tail -n1 /root/dcgm_result.err 2>/dev/null)"
+        fi
+        exit "$rc"
+        REMOTE_EOF
+      args:
+        executable: /bin/bash
+      register: _dcgm_out
+      changed_when: true
+      failed_when: false
+      when: gpu_benchmark.dcgm.enabled | bool
+
+    - name: Parse DCGM diagnostics
+      ansible.builtin.include_tasks: lib/parse_dcgm.yml
+      vars:
+        _dcgm_json: "{{ _dcgm_out.stdout }}"
+      when:
+        - gpu_benchmark.dcgm.enabled | bool
+        - (_dcgm_out.stdout | default('') | trim).startswith('{')
+
+    - name: Record DCGM as unavailable when it produced no report
+      ansible.builtin.set_fact:
+        _dcgm:
+          status: skipped
+          detail: >-
+            {{ ((_dcgm_out.stderr | default('')) | trim).splitlines() | last
+               | default((_dcgm_out.stdout | default('DCGM disabled')) | trim | truncate(200, true), true) }}
+      when:
+        - gpu_benchmark.dcgm.enabled | bool
+        - not ((_dcgm_out.stdout | default('') | trim).startswith('{'))
+
+    - name: Record host GPU-health result
+      ansible.builtin.set_fact:
+        _gpu_health_hosts: >-
+          {{ _gpu_health_hosts + [{
+            'host_id': _gpu_host.host_id,
+            'driver_version': ((_drv.stdout_lines | default([]))[0] | default('')) | trim,
+            'cuda_version': ((_drv.stdout_lines | default([]))[1] | default('')) | trim,
+            'nvidia_smi': _nvidia_smi,
+            'cublas': (_cublas if (gpu_benchmark.cublas.enabled | bool and (_nvcc.rc | default(1) == 0))
+                       else {'skipped': (((_nvcc.stderr | default('')) | trim).splitlines() | last
+                                         | default((_nvcc.stdout | default('cuBLAS disabled')) | trim
+                                                   | truncate(200, true), true)) }),
+            'pcie_bw': (_pcie_bw if (gpu_benchmark.pcie_bw.enabled | bool and (_nvcc.rc | default(1) == 0))
+                        else ({'skipped': (((_nvcc.stderr | default('')) | trim).splitlines() | last
+                                           | default('nvcc unavailable', true) | truncate(200, true))}
+                              if (gpu_benchmark.pcie_bw.enabled | bool) else [])),
+            'dcgm': _dcgm | default({}),
+            'flagged_gpus': ((_cublas_flagged | default([])) + (_pcie_bw_flagged | default([]))) | unique,
+            'nvidia_issues': (_nvidia_issues | default([])) + _pcie_issues + _dcgm_issues,
+            'nvidia_ok': (_nvidia_ok | default(true) | bool)
+                         and (((_dcgm | default({})).status | default('pass')) != 'fail')
+          }] }}
+      vars:
+        _pcie_issues: >-
+          {{ _pcie_bw | default([]) | selectattr('gpu', 'in', _pcie_bw_flagged | default([]))
+             | map(attribute='gpu') | map('string')
+             | map('regex_replace', '^(.*)$', 'GPU \1 PCIe bandwidth below ' ~ (gpu_benchmark.pcie_bw.min_gbs) ~ ' GB/s')
+             | list }}
+        _dcgm_issues: >-
+          {{ ['DCGM diag failed: ' ~ ((_dcgm.failed | default([])) | join(', '))]
+             if (((_dcgm | default({})).status | default('pass')) == 'fail') else [] }}
+
+  rescue:
+    - name: Record host GPU-health failure
+      ansible.builtin.set_fact:
+        _gpu_health_hosts: >-
+          {{ _gpu_health_hosts + [{
+            'host_id': _gpu_host.host_id,
+            'driver_version': '',
+            'cuda_version': '',
+            'nvidia_smi': _nvidia_smi | default([]),
+            'cublas': {'skipped': 'health benchmark failed'},
+            'flagged_gpus': [],
+            'nvidia_issues': ['health benchmark failed: '
+                              ~ (ansible_failed_result.msg | default('error') | string | truncate(200, true))],
+            'nvidia_ok': false
+          }] }}
+      no_log: true
+
+  always:
+    - name: Terminate GPU-health VM
+      ansible.builtin.include_tasks: cleanup.yml

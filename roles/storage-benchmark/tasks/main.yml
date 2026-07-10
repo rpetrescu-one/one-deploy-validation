@@ -11,11 +11,14 @@
         }, recursive=True)
       }}
 
-- name: Run storage benchmark test per cluster
+- name: Run storage benchmark test per cluster and template
   ansible.builtin.include_tasks:
     file: "{{ role_path }}/tasks/storage_benchmark.yml"
-  loop: "{{ _one_clusters }}"
+  when: hostvars[_primary_frontend]['ansible_host'] == ansible_host
+  loop: "{{ _one_clusters | product(_sb_templates) | list }}"
   loop_control:
-    loop_var: current_cluster
-    label: "{{ current_cluster.name }}"
+    loop_var: _sb_pair
+    label: "{{ _sb_pair.0.name }} / {{ _sb_pair.1 }}"
+  vars:
+    _sb_templates: "{{ validation.storage_benchmark.templates | d([validation.test_vm.vm.market_name]) }}"
 

@@ -1,0 +1,23 @@
+---
+- name: Reset PCIe bandwidth accumulator
+  ansible.builtin.set_fact:
+    _pcie_bw: []
+
+- name: Extract H2D/D2H GB/s per GPU
+  ansible.builtin.set_fact:
+    _pcie_bw: "{{ _pcie_bw + [{'gpu': item.gpu | int, 'h2d_gbs': _h | float, 'd2h_gbs': _d | float}] }}"
+  loop: "{{ _pcie_bw_results }}"
+  loop_control:
+    label: "gpu {{ item.gpu }}"
+  vars:
+    _h: "{{ (item.stdout | regex_search('H2D=([0-9.]+)', '\\1') | default(['0'], true) | first) }}"
+    _d: "{{ (item.stdout | regex_search('D2H=([0-9.]+)', '\\1') | default(['0'], true) | first) }}"
+
+- name: Flag GPUs below the minimum PCIe bandwidth
+  ansible.builtin.set_fact:
+    _pcie_bw_flagged: >-
+      {{ (_pcie_bw | selectattr('h2d_gbs', 'lt', _min | float) | map(attribute='gpu') | list
+          + _pcie_bw | selectattr('d2h_gbs', 'lt', _min | float) | map(attribute='gpu') | list)
+         | unique | list }}
+  vars:
+    _min: "{{ gpu_benchmark.pcie_bw.min_gbs }}"

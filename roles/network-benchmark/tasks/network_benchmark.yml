@@ -37,7 +37,7 @@
 
 - name: Start iperf3 server in all hosts
   ansible.builtin.command: nohup iperf3 -s -p {{ _iperf_port }} > /dev/null 2>&1 &
-  async: 30
+  async: 600
   poll: 0
   when: iperf3_check.rc != 0
   changed_when: true

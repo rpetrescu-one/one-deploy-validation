@@ -1,0 +1,145 @@
+---
+- name: Reset per-model accumulators
+  ansible.builtin.set_fact:
+    _model_gpu_results: []
+    _gpu_delta: {}
+    _functional: {}
+    _provision_s: ""
+    _prov_start: "{{ lookup('pipe', 'date +%s') }}"
+    _llm_pci_count: >-
+      {{ (_llm_host.gpu_count | int)
+         if (gpu_benchmark.gpu_count == 'all')
+         else ([gpu_benchmark.gpu_count | int, _llm_host.gpu_count | int] | min) }}
+    _llm_key: "{{ _model }}{{ '' if (_gpu_inventory.hosts | length | int == 1) else ' · host ' ~ _llm_host.host_id }}"
+
+- name: Benchmark model {{ _model }} on host {{ _llm_host.host_id }}
+  block:
+    - name: Instantiate appliance VM (all GPUs of host {{ _llm_host.host_id }})
+      ansible.builtin.include_tasks: instantiate_vm.yml
+      vars:
+        _template_id: "{{ _appliance_template_id }}"
+        _ctx:
+          vnet: "{{ _gpu_vnet_name | default(gpu_benchmark.vnet_name) }}"
+          pci_count: "{{ _llm_pci_count }}"
+          host_id: "{{ _llm_host.host_id }}"
+          model_id: "{{ _model }}"
+          vm_name: "gpu-bench-{{ _model | regex_replace('[^A-Za-z0-9._-]', '_') }}-h{{ _llm_host.host_id }}{{ current_cluster.name_suffix }}"
+          image_id: "{{ _appliance_image_id | default('') }}"
+          disk_size_mb: "{{ gpu_benchmark.vm.disk_mb }}"
+
+    - name: Wait for SSH on the model VM
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no -oConnectTimeout=10
+        root@{{ _vm_ip }} true
+      register: _ssh_ready
+      until: _ssh_ready.rc == 0
+      retries: 20
+      delay: 15
+      changed_when: false
+
+    - name: Stop the appliance auto-serve (we serve per GPU ourselves)
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }}
+        "systemctl stop one-appliance 2>/dev/null; pkill -f '[v]llm serve' 2>/dev/null; sleep 2; true"
+      changed_when: true
+      failed_when: false
+
+    - name: Probe GPUs visible in the model VM
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }}
+        "nvidia-smi -L 2>/dev/null | grep -c '^GPU'; dmesg 2>/dev/null | grep -iE 'RmInitAdapter|fell off the bus' | tail -2; true"
+      register: _vm_gpu_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Resolve GPU visibility for the benchmark loop
+      ansible.builtin.set_fact:
+        _llm_gpu_visible: >-
+          {{ ([_probe_first | int, _llm_pci_count | int] | min)
+             if (_probe_first is match('^[0-9]+$')) else (_llm_pci_count | int) }}
+        _llm_gpu_probe_hint: "{{ _vm_gpu_probe.stdout_lines | default([]) | reject('match', '^[0-9]+$') | join('; ') | truncate(220) }}"
+      vars:
+        _probe_first: "{{ (_vm_gpu_probe.stdout_lines | default([]) | first | default('')) | trim }}"
+
+    - name: Record GPUs that failed to initialize in the VM
+      ansible.builtin.set_fact:
+        _model_gpu_results: >-
+          {{ _model_gpu_results + [{
+            'gpu': item | int,
+            'status': 'failed',
+            'error': ('GPU not visible in the VM — driver initialized only '
+              ~ _llm_gpu_visible ~ ' of ' ~ _llm_pci_count ~ ' attached GPUs'
+              ~ (' (' ~ _llm_gpu_probe_hint ~ ')' if _llm_gpu_probe_hint else ''))
+          }] }}
+      loop: "{{ range(_llm_gpu_visible | int, _llm_pci_count | int) | list }}"
+      loop_control:
+        label: "gpu {{ item }}"
+      when: (_llm_gpu_visible | int) < (_llm_pci_count | int)
+
+    - name: Benchmark each GPU of the host
+      ansible.builtin.include_tasks: llm_benchmark_gpu.yml
+      loop: "{{ range(_llm_gpu_visible | int) | list }}"
+      loop_control:
+        loop_var: _gpu
+        label: "gpu {{ _gpu }}"
+
+    - name: Run functional API suite
+      ansible.builtin.include_tasks: llm_functional.yml
+      when:
+        - gpu_benchmark.functional.enabled | bool
+        - (_model_gpu_results | last | default({})).metrics is defined
+
+    - name: Capture tool versions (guidellm / vllm) for the record
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }}
+        'source /root/vllm_gpu_env/bin/activate 2>/dev/null;
+        pip show guidellm vllm 2>/dev/null | grep -E "^(Name|Version):" | paste -sd" " -'
+      register: _tool_versions
+      changed_when: false
+      failed_when: false
+
+    - name: Compute GPU-to-GPU delta for {{ _model }}
+      ansible.builtin.include_tasks: lib/compare_gpus.yml
+      when: (_model_gpu_results | selectattr('metrics', 'defined') | list | length | int) > 1
+
+    - name: Derive model status
+      ansible.builtin.include_tasks: lib/model_status.yml
+
+    - name: Record model result
+      ansible.builtin.set_fact:
+        _llm: >-
+          {{ _llm | combine({_llm_key: {
+            'host_id': _llm_host.host_id,
+            'model': _model,
+            'per_gpu': _model_gpu_results | sort(attribute='gpu'),
+            'delta': _gpu_delta | default({}),
+            'functional': _functional | default({}),
+            'provisioning_s': _provision_s | default(''),
+            'versions': (_tool_versions.stdout | default('') | trim),
+            'status': _model_status
+          }}) }}
+
+  rescue:
+    - name: Record model failure (VM-level)
+      ansible.builtin.set_fact:
+        _llm: >-
+          {{ _llm | combine({_llm_key: {
+            'host_id': _llm_host.host_id,
+            'model': _model,
+            'per_gpu': _model_gpu_results | default([]),
+            'status': 'failed',
+            'error': (ansible_failed_result.msg | default('error'))
+          }}) }}
+      no_log: true
+
+  always:
+    - name: Terminate model VM
+      ansible.builtin.include_tasks: cleanup.yml

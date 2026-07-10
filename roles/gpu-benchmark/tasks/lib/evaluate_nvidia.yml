@@ -1,0 +1,48 @@
+---
+- name: Reset NVIDIA health issues
+  ansible.builtin.set_fact:
+    _nvidia_issues: []
+
+- name: Flag GPU count mismatch
+  ansible.builtin.set_fact:
+    _nvidia_issues: >-
+      {{ _nvidia_issues + ['only ' ~ (_nvidia_smi | length) ~ '/' ~ (_expected_gpu_count | int)
+         ~ ' GPUs visible in VM'] }}
+  when: (_nvidia_smi | length) != (_expected_gpu_count | int)
+
+- name: Flag per-GPU ECC / throttle / PCIe issues
+  ansible.builtin.set_fact:
+    _nvidia_issues: "{{ _nvidia_issues + _gpu_issues }}"
+  loop: "{{ _nvidia_smi }}"
+  loop_control:
+    loop_var: _g
+    label: "gpu {{ _g.index }}"
+  vars:
+    _ecc_val: "{{ _g.ecc_uncorrected | trim }}"
+    _ecc_bad: "{{ (_ecc_val is match('^[0-9]+$')) and ((_ecc_val | int) > 0) }}"
+    _thr_val: "{{ _g.throttle | trim }}"
+    _thr_is_hex: "{{ _thr_val is match('^0x[0-9a-fA-F]+$') }}"
+    _thr_int: "{{ (_thr_val | int(0, 16)) if (_thr_is_hex | bool) else 0 }}"
+    _thr_bad_bits: >-
+      {{ (_thr_int | int)
+         - ((_thr_int | int) % 2)
+         - (((_thr_int | int) // 2) % 2) * 2
+         - (((_thr_int | int) // 16) % 2) * 16 }}
+    _thr_ok: >-
+      {{ _thr_val == 'Not Active'
+         or (_thr_val in ['N/A', '[N/A]', 'Not Supported', '[Not Supported]'])
+         or ((_thr_is_hex | bool) and (_thr_bad_bits | int == 0)) }}
+    _pw_cur: "{{ _g.pcie_width_current | default('') | trim }}"
+    _pw_max: "{{ _g.pcie_width_max | default('') | trim }}"
+    _pcie_bad: >-
+      {{ (_pw_cur is match('^[0-9]+$')) and (_pw_max is match('^[0-9]+$'))
+         and ((_pw_cur | int) < (_pw_max | int)) }}
+    _gpu_issues: >-
+      {{ (['GPU ' ~ _g.index ~ ' uncorrected ECC errors: ' ~ _ecc_val] if (_ecc_bad | bool) else [])
+         + (['GPU ' ~ _g.index ~ ' throttled: ' ~ _thr_val] if (not (_thr_ok | bool)) else [])
+         + (['GPU ' ~ _g.index ~ ' PCIe link below max width: x' ~ _pw_cur ~ ' of x' ~ _pw_max
+             ~ ' (may be native to the platform, e.g. AWS g4dn wires T4 at x8)'] if (_pcie_bad | bool) else []) }}
+
+- name: Compute NVIDIA health verdict
+  ansible.builtin.set_fact:
+    _nvidia_ok: "{{ (_nvidia_issues | length) == 0 }}"

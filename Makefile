@@ -35,3 +35,9 @@ endif
 validation: $(ENV_ONE_DEPLOY_VALIDATION)
 	cd $(SELF)/ && \
 	$(call ENV_RUN,validation-default) ansible-playbook $(_VERBOSE) -i $(INVENTORY) $(_TAGS) $(_SKIP_TAGS) $(ANSIBLE_ARGS) $(SELF)/playbooks/validation.yml
+
+.PHONY: test
+test: $(ENV_ONE_DEPLOY_VALIDATION)
+	cd $(SELF)/ && \
+	$(call ENV_RUN,validation-default) python3 $(SELF)/test/gpu_benchmark/lint_shell.py && \
+	$(call ENV_RUN,validation-default) ansible-playbook -i localhost, $(SELF)/test/gpu_benchmark/test_logic.yml
