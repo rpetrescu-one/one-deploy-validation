@@ -1,0 +1,127 @@
+---
+# Bare-metal cleanup — the CLEAN-OS guarantee. Runs in the always block (on
+# failure too) and removes exactly what this run added, manifest-driven:
+#   - all processes we started (vLLM, power sampler, nv-hostengine if ours),
+#   - the whole workdir (venv, HF model cache, logs, results, compiled tests),
+#   - only the apt packages recorded in _bm_installed_pkgs (driver/toolkit/
+#     DCGM/python3-venv installed by US — pre-existing ones are never touched),
+#   - the cuda-keyring repo, only if WE added it.
+# Driver kernel modules are unloaded best-effort: if the unload is refused the
+# packages are still purged and a note is recorded (a reboot finishes the job).
+- name: Stop benchmark processes
+  ansible.builtin.shell: |
+    kill $(cat {{ _bm_wd }}/power_sampler.pid 2>/dev/null) 2>/dev/null || true
+    pkill -f '[v]llm serve' 2>/dev/null || true
+    sleep 3
+    pkill -9 -f '[v]llm serve' 2>/dev/null || true
+    true
+  changed_when: true
+  failed_when: false
+
+# Stop the engine whenever it was NOT running before this run — WE started it
+# then, even when the DCGM package itself pre-existed.
+- name: Stop DCGM host engine (only if this run started it)
+  ansible.builtin.shell: |
+    systemctl stop nvidia-dcgm >/dev/null 2>&1 || true
+    pkill -f '[n]v-hostengine' 2>/dev/null || true
+    true
+  changed_when: true
+  failed_when: false
+  when:
+    - gpu_benchmark.dcgm.enabled | bool
+    - not (_bm_had_dcgm_running | default(true) | bool)
+
+# BEFORE the package purge, on purpose: purging deletes the
+# nvidia-persistenced unit/binary, after which systemctl cannot stop the
+# still-running daemon and the modules stay busy (seen on E2E run 4 — modules
+# were left resident). nvidia-persistenced holds nvidia_uvm.
+# MODULES_NOT_LOADED (nothing to do — e.g. the driver install itself failed)
+# is distinct from MODULES_BUSY so the reboot note below fires only on a REAL
+# refused unload.
+- name: Unload NVIDIA kernel modules (only if we installed the driver)
+  ansible.builtin.shell: |
+    systemctl stop nvidia-persistenced 2>/dev/null || true
+    sleep 1
+    if ! lsmod | grep -q '^nvidia'; then
+      echo "MODULES_NOT_LOADED"
+    elif modprobe -r nvidia_uvm nvidia_drm nvidia_modeset nvidia 2>/dev/null; then
+      echo "MODULES_UNLOADED"
+    else
+      echo "MODULES_BUSY"
+    fi
+  register: _bm_unload
+  changed_when: true
+  failed_when: false
+  when: "'cuda-drivers' in (_bm_installed_pkgs | default([]))"
+
+# Sentinel-guarded: only delete a directory this role created/adopted (the
+# preflight guard refuses foreign non-empty dirs, but never delete blindly).
+- name: Remove the working directory (venv, model cache, logs, results)
+  ansible.builtin.shell: |
+    if [ -f "{{ _bm_wd }}/.gpu-bench-workdir" ] || [ ! -d "{{ _bm_wd }}" ]; then
+      rm -rf "{{ _bm_wd }}"
+    else
+      echo "WORKDIR_KEPT (no sentinel — not ours)"
+    fi
+    true
+  changed_when: true
+  failed_when: false
+
+# autoremove ONLY when preflight saw ZERO autoremovable packages — then every
+# candidate is a dependency of something THIS run installed. On a host with
+# pre-existing autoremovables, skip it rather than purge unrelated packages.
+- name: Purge packages installed by this run
+  ansible.builtin.shell: |
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get -y purge {{ _bm_installed_pkgs | map('quote') | join(' ') }} >/dev/null 2>&1 || true
+    if [ "{{ _bm_autoremove_clean | default(false) | bool | lower }}" = "true" ]; then
+      apt-get -y autoremove --purge >/dev/null 2>&1 || true
+    fi
+    true
+  changed_when: true
+  failed_when: false
+  when: _bm_installed_pkgs | default([]) | length > 0
+
+# Restore the exact pre-run kernel state: drop OUR temporary nouveau
+# blacklist, then put nouveau back (a reboot would reload it anyway; this
+# just does not wait for one).
+- name: Remove the temporary nouveau blacklist (only if we added it)
+  ansible.builtin.shell: |
+    rm -f /etc/modprobe.d/gpu-bench-blacklist-nouveau.conf
+  changed_when: true
+  failed_when: false
+  when: _bm_blacklist_added | default(false) | bool
+
+# Remove+insert forces a fresh probe so nouveau re-BINDS the now-free
+# devices (a plain `modprobe nouveau` is a no-op when the module stayed
+# loaded after the PCI-level unbind).
+- name: Rebind nouveau to the GPUs (only if this run unbound it)
+  ansible.builtin.shell: |
+    modprobe -r nouveau 2>/dev/null || true
+    modprobe nouveau 2>/dev/null || true
+  changed_when: true
+  failed_when: false
+  when: _bm_nouveau_unloaded | default(false) | bool
+
+# Purging cuda-keyring removes its OWN sources.list.d file (dpkg-owned); no
+# glob rm here — a pre-existing, manually-configured cuda*.list must survive.
+- name: Remove the cuda-keyring repo (only if we added it)
+  ansible.builtin.shell: |
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get -y purge cuda-keyring >/dev/null 2>&1 || true
+    apt-get update >/dev/null 2>&1 || true
+    true
+  changed_when: true
+  failed_when: false
+  when: _bm_keyring_added | default(false) | bool
+
+- name: Note when a reboot is needed to finish the driver removal
+  ansible.builtin.set_fact:
+    verification_comments: >-
+      {{ verification_comments | default({}) | combine({
+        'GPU baseline (bare-metal, pre-deploy)':
+          'NVIDIA kernel modules were still in use at cleanup — packages are purged; a reboot completes the removal.'
+      }) }}
+  when:
+    - "'cuda-drivers' in (_bm_installed_pkgs | default([]))"
+    - "'MODULES_BUSY' in (_bm_unload.stdout | default(''))"

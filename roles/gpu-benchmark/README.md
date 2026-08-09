@@ -41,6 +41,70 @@ gpu_benchmark:            # partial dict, merged recursively over role defaults
 See `defaults/main.yml` for every knob and
 `inventory/reference/group_vars/all.yml` for a documented example.
 
+Bare-metal baseline (pre-deploy phase)
+--------------------------------------
+
+Before the OpenNebula deploy, the same benchmark can run **directly on a node
+host's OS** — no OpenNebula, no VM — to record the hardware's raw capability
+as the reference the virtualized deployment is later judged against:
+
+```bash
+# BEFORE the deploy (clean host):
+make validation I=inventory/<env>/hosts.yaml ANSIBLE_ARGS='-e gpu_benchmark_phase=pre'
+# ... deploy OpenNebula ...
+# AFTER the deploy (normal run — loads the baseline automatically):
+make validation I=inventory/<env>/hosts.yaml
+```
+
+`phase=pre` skips every other validation play (they need OpenNebula), runs the
+hardware tests + the LLM benchmark (venv with vLLM pinned to the appliance's
+version + the **same** GuideLLM profile) on the selected node host(s) —
+default: the first host of the `node` group; `gpu_benchmark.baremetal.hosts`
+takes a list or `'all'`; `gpu_count` limits GPUs as usual — and saves
+`<inventory_dir>/gpu_baseline.json`. The post-deploy run then adds a
+**"Virtualization overhead vs bare-metal baseline"** section to the report
+(per metric: bare-metal vs virtualized vs overhead %, flagged beyond
+`baremetal.baseline_tolerance_pct`, default 10%, with the same noise guards
+as the GPU-to-GPU comparison).
+
+**Clean-OS guarantee**: everything the pre phase adds is tracked and removed
+in an `always` block — the venv/model/caches live under
+`baremetal.workdir` (deleted; sentinel-guarded so a foreign directory is
+never adopted or removed), and apt packages (driver, CUDA toolkit, DCGM,
+python3-venv) are purged **only if this run installed them**; anything
+pre-existing is used but never touched (including a DCGM engine that was
+already running). `apt-get autoremove` runs only when the host had zero
+autoremovable packages beforehand. A missing NVIDIA driver is installed
+only when `baremetal.allow_driver_install: true` (default), and purged again
+at cleanup. Needs egress (NVIDIA repo + pip + HF).
+
+**Known limitation**: if the controller loses the connection mid-run
+(UNREACHABLE), ansible cannot run the cleanup — re-run the pre phase to
+redo the benchmark; note a driver installed by the interrupted run is then
+detected as pre-existing and left in place (remove manually or reset the
+host if a pristine OS is required).
+
+NUMA-correct benchmarking (multi-socket hosts)
+----------------------------------------------
+
+On a dual-socket host an unpinned run measures scheduler LUCK, not the
+hardware: the same L40S swung 1660 → 2685 tok/s purely on process placement
+relative to its socket. Two knobs make both phases NUMA-deterministic:
+
+- **Pre phase** — `baremetal.numa_pin: true` (default): each `vllm serve` +
+  its load generator is `numactl`-bound to the NUMA node of the GPU under
+  test (numactl is installed/purged via the manifest if missing).
+- **Post phase** — `vm_per_gpu: true`: one benchmark VM per GPU, attached by
+  exact PCI `SHORT_ADDRESS` and pinned with
+  `TOPOLOGY = [ NODE_AFFINITY = <the GPU's node> ]` (the node comes from the
+  host's own PCI monitoring). OpenNebula REJECTS combining `NODE_AFFINITY`
+  with `PIN_POLICY` ("NUMA node affinity cannot be set for pinned VMs"), so
+  when the node is known affinity wins and `vm.pin_policy` is ignored;
+  `vm.pin_policy: CORE|THREAD|SHARED` is emitted INSTEAD only when no NUMA
+  node is reported. Cost: one appliance boot + model download per GPU.
+  Default (`vm_per_gpu: false`) keeps the original all-GPUs-in-one-VM flow —
+  note that flow cannot be NUMA-local to GPUs on different sockets.
+
 How results are judged
 ----------------------
 
@@ -53,13 +117,19 @@ Three independent signals; any of them turns the cluster status to `flag`
    the best card is flagged (default 20 %). cuBLAS has its own
    `cublas.variance_pct` (default 25 %). This is hardware-independent — the
    cards are their own reference. A single-GPU host has nothing to compare and
-   shows no comparison. **Two noise guards** stop a false outlier when the data
-   can't support the call: if the weakest GPU completed fewer than
+   shows no comparison. **Three noise guards** stop a false outlier when the
+   data can't support the call: if the weakest GPU completed fewer than
    `compare_min_samples` successful requests (default 30) the whole comparison
-   is marked low-confidence and nothing is flagged; and a throughput spread
+   is marked low-confidence and nothing is flagged; a throughput spread
    below `compare_min_throughput_req_s` req/s (default 1.0) is treated as a
    tiny-denominator artifact, not a real difference (both observed on a slow
-   2× T4 where 3-vs-4 requests produced a spurious 22 % "outlier").
+   2× T4 where 3-vs-4 requests produced a spurious 22 % "outlier"); and a
+   GPU whose load sweep was **truncated** (guidellm derives its rate ladder
+   from a short throughput probe, and the probe is chaotic in the overload
+   region — seen live as 1467 vs 2807 tok/s on identical L40S cards, flipping
+   between runs) suppresses the throughput comparison: its figures are a
+   lower bound, not a measurement, and the report labels them as such. Sync
+   latency metrics are unaffected and stay compared.
 2. **Absolute SLO gates** (`gpu_benchmark.thresholds`): TTFT p95 and ITL p95
    from the *synchronous* run, optional throughput floor from the *saturated*
    run. The defaults (TTFT ≤ 200 ms, ITL ≤ 50 ms) are the reference document's
@@ -94,7 +164,7 @@ gpu_benchmark:
     'NVIDIA L40S':                        # EXACT nvidia-smi name — copy it from
       'Qwen/Qwen2.5-3B-Instruct':         # the report's GPU "Name" column
         ttft_p95_ms: 2000                 # partial dict: unlisted keys (itl,
-        min_throughput_req_s: 4.5         # profile) inherit the global values
+        min_throughput_req_s: 8.0         # profile) inherit the global values
 ```
 
 The evaluation records which thresholds were applied (`source` in
@@ -137,11 +207,19 @@ hardware should be"; the GPU-to-GPU delta catches "this card is slower than
 its siblings". Together they replace the need to compare against GB200-class
 absolute numbers.
 
-### Measured values (healthy hardware, vLLM 0.10.2 / guidellm 0.7.1)
+### Measured values (healthy hardware, guidellm 0.7.1, profile with max_concurrency=128)
 
-| GPU | Model | TTFT p95 sync (ms) | Throughput (req/s) | ITL p95 (ms) | cuBLAS (GFLOP/s) | Gates (validated) |
+| GPU | Model | TTFT p95 sync (ms) | Sustained throughput (req/s) | ITL p95 (ms) | cuBLAS (GFLOP/s) | Gates (validated) |
 |---|---|---|---|---|---|---|
-| NVIDIA L40S | Qwen/Qwen2.5-3B-Instruct | 37.5 (warm¹; 50–69 at constant rates) | 5.9 (stable, 6 runs) | 10.6–10.8 | 56 827–57 354 | ttft 200, thr 4.5 — PASS with ~5× TTFT headroom |
+| NVIDIA L40S | Qwen/Qwen2.5-3B-Instruct | 36–39 (warm¹; 55–90 at constant rates) | 12.8–15.4 over 4 runs, bare-metal AND virtualized (curve peak 3300–3900 tok/s ÷ 256 tok/req; vLLM 0.17.1, 40 s windows) | 9.7–10.8 | 57 042–57 934 | ttft 200, thr 10.5 — PASS with ~5× TTFT headroom |
+
+Throughput here is the SUSTAINED rate (peak of the load curve ÷
+tokens-per-request) measured under the BOUNDED probe
+(`max_concurrency=128` in the shared profile). Values measured under
+earlier profiles are NOT comparable and must not feed calibration: the
+pre-2026-08 semantics read the overload-probe row (historic 5.9 req/s on
+this GPU), and the unbounded 512-probe era measured ~10.9 req/s with
+bimodal truncation artifacts. Re-measure before recalibrating.
 
 ¹ Sync TTFT is only meaningful since the first-request exclusion: guidellm's
 FIRST request pays ~1.5 s of client-side startup (historic runs read

@@ -1,0 +1,125 @@
+---
+# Persist the bare-metal results on the CONTROLLER (the host is about to be
+# wiped/changed by the OpenNebula deploy — the inventory directory is the only
+# durable home). The post phase auto-loads this file and reports the
+# virtualization overhead. Merges over an existing file so benchmarking node
+# hosts one-by-one accumulates instead of overwriting.
+- name: Resolve baseline file path
+  ansible.builtin.set_fact:
+    _bm_baseline_path: >-
+      {{ (gpu_benchmark.baremetal.baseline_file | default('', true))
+         if (gpu_benchmark.baremetal.baseline_file | default('', true) | length > 0)
+         else (inventory_dir ~ '/gpu_baseline.json') }}
+    _bm_gpu_rows: []
+    _bm_llm_map: {}
+
+# One row per GPU: nvidia-smi identity + the hardware numbers, joined by index.
+- name: Build baseline GPU rows
+  ansible.builtin.set_fact:
+    _bm_gpu_rows: >-
+      {{ _bm_gpu_rows + [{
+        'index': item.index | int,
+        'name': item.name,
+        'vram_mib': item.vram_mib,
+        'numa_node': (_bm_gpu_numa | default({}))[item.index | string] | default(-1),
+        'cublas_gflops': ((_h.cublas | selectattr('gpu', 'eq', item.index | int)
+                           | map(attribute='gflops') | first | default(''))
+                          if (_h.cublas is not mapping) else ''),
+        'pcie_h2d_gbs': ((_h.pcie_bw | selectattr('gpu', 'eq', item.index | int)
+                          | map(attribute='h2d_gbs') | first | default(''))
+                         if (_h.pcie_bw is not mapping) else ''),
+        'pcie_d2h_gbs': ((_h.pcie_bw | selectattr('gpu', 'eq', item.index | int)
+                          | map(attribute='d2h_gbs') | first | default(''))
+                         if (_h.pcie_bw is not mapping) else '')
+      }] }}
+  loop: "{{ _h.nvidia_smi | default([]) }}"
+  loop_control:
+    label: "gpu {{ item.index }}"
+  vars:
+    _h: "{{ _gpu_health_hosts | first | default({}) }}"
+
+# Per model: the successfully-benchmarked GPUs with their full metric dicts
+# (evaluation/SLO verdicts are post-side concerns and are not persisted).
+- name: Build baseline LLM map
+  ansible.builtin.set_fact:
+    _bm_llm_map: >-
+      {{ _bm_llm_map | combine({
+        item.value.model: {
+          'status': item.value.status | default(''),
+          'per_gpu': (item.value.per_gpu | default([]) | selectattr('metrics', 'defined') | list)
+                     | json_query('[].{gpu: gpu, metrics: metrics}')
+        }
+      }) }}
+  loop: "{{ _llm | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+# _bm_entry is one full Jinja expression so native types (ints/floats)
+# survive ansible-core 2.18.
+- name: Build this host's baseline entry
+  ansible.builtin.set_fact:
+    _bm_entry: >-
+      {{ {'hosts': {inventory_hostname: {
+           'timestamp': ('%Y-%m-%dT%H:%M:%S' | strftime),
+           'driver_version': (_gpu_health_hosts | first | default({})).driver_version | default(''),
+           'cuda_version': (_gpu_health_hosts | first | default({})).cuda_version | default(''),
+           'versions': (_llm | dict2items | map(attribute='value') | selectattr('versions', 'defined')
+                        | map(attribute='versions') | first | default('')),
+           'load_profile': (gpu_benchmark.guidellm_profile ~ ' --constraint kind=max_duration,seconds='
+                            ~ (gpu_benchmark.guidellm_max_duration_s | default(20) | int)),
+           'gpu_count': _bm_gpu_count | int,
+           'gpus': _bm_gpu_rows,
+           'llm': _bm_llm_map
+      }}} }}
+
+# READ-MERGE-WRITE IN ONE TASK, serialized with throttle: 1 — with a
+# multi-host pre run (baremetal.hosts: 'all') the linear strategy runs hosts
+# in lockstep, and a separate load task would make every host merge over the
+# SAME pre-write state (last writer wins, other hosts' entries silently
+# lost). The lookup runs at template time inside the throttled task, so each
+# host sees the previous host's write. _entry is one full Jinja expression so
+# native types (ints/floats) survive ansible-core 2.18.
+# _raw is-mapping FIRST: ansible-core 2.18 auto-parses a JSON-looking lookup
+# result into a dict before from_json ever runs (from_json on a dict raises).
+# The startswith guard keeps a CORRUPT existing file from crashing the save;
+# the rescue below then writes this host's entry alone (better to lose the
+# corrupt merge target than hours of benchmark data).
+- name: Write baseline reference file on the controller (read-merge-write, serialized)
+  block:
+    - name: Merge over the existing baseline
+      ansible.builtin.copy:
+        content: >-
+          {{ ((_raw if (_raw is mapping)
+               else ((_raw | from_json)
+                     if (((_raw | string | trim).startswith('{')) and ((_raw | from_json) is mapping))
+                     else {}))
+              | combine(_entry, recursive=True)) | to_nice_json }}
+        dest: "{{ _bm_baseline_path }}"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+      throttle: 1
+      vars:
+        _raw: "{{ lookup('ansible.builtin.file', _bm_baseline_path, errors='ignore') | default('', true) }}"
+        _entry: "{{ _bm_entry }}"
+  rescue:
+    - name: Existing baseline unparseable — write this host alone
+      ansible.builtin.copy:
+        content: "{{ _bm_entry | to_nice_json }}"
+        dest: "{{ _bm_baseline_path }}"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+      throttle: 1
+
+    - name: Note the discarded corrupt baseline
+      ansible.builtin.set_fact:
+        verification_comments: >-
+          {{ verification_comments | default({}) | combine({
+            'GPU baseline (bare-metal, pre-deploy)':
+              'The existing gpu_baseline.json was unparseable and has been replaced with this run only.'
+          }) }}
+
+- name: Note where the baseline was saved
+  ansible.builtin.debug:
+    msg: "Bare-metal baseline for {{ inventory_hostname }} saved to {{ _bm_baseline_path }}"

@@ -19,6 +19,8 @@
           - _gpu_inventory.gpu_count | int == 2
           - _gpu_inventory.devices | map(attribute='short_address') | list == ['0009:01:00.0', '0019:01:00.0']
           - _gpu_inventory.devices[0].model == 'GB200'
+          # NUMA node captured for per-GPU-VM pinning (host-reported, stringly)
+          - _gpu_inventory.devices | map(attribute='numa_node') | map('int') | list == [0, 1]
         fail_msg: "parse_gpu_inventory produced {{ _gpu_inventory }}"
     - name: parse_nvidia_smi — CSV to list of dicts
       vars:
@@ -256,8 +258,13 @@
           - _functional.tests | length == 2
         fail_msg: "parse_functional produced {{ _functional }}"
 
-    - name: parse_guidellm — pick throughput run (max RPS) and extract metrics
+    - name: parse_guidellm — saturated headline from the curve peak, drain-burst peak from the max-RPS row
       vars:
+        # UNCAPPED probe profile: the truncation assert below exercises
+        # signature (a), which is disarmed when max_concurrency= is present
+        gpu_benchmark:
+          guidellm_status: successful
+          guidellm_profile: "--profile 'kind=sweep,warmup.value=1,warmup.mode=requests'"
         _guidellm_report: "{{ lookup('file', fixtures ~ '/guidellm.json') | from_json }}"
       ansible.builtin.include_role:
         name: gpu-benchmark
@@ -288,6 +295,9 @@
           - _llm_metrics.requests_errored | int == 1
           - _llm_metrics.requests_incomplete | int == 512   # 0 + 508 + 4
           - _llm_metrics.saturation_achieved | bool         # throughput probe had successful requests
+          # 3-row fixture: peak on the last row with the curve still rising
+          # (2118 -> 14563) — correctly labeled a truncated sweep
+          - (_llm_metrics.sweep_truncated | string) == 'True'
         fail_msg: "parse_guidellm produced {{ _llm_metrics }}"
     - name: parse_guidellm — synchronous phase selected by TYPE, not min-RPS (slow-GPU case)
       vars:
@@ -326,7 +336,603 @@
           - (_llm_metrics.itl_p95_ms | float) == 42.0
           - (_llm_metrics.tpot_p95_ms | float) == 44.0
           - not (_llm_metrics.saturation_achieved | bool)   # throughput probe completed 0/512
+          # a FAILED probe is 'GPU too slow', NOT a truncated sweep — the
+          # two labels are mutually exclusive (a re-run changes nothing)
+          - (_llm_metrics.sweep_truncated | string) == 'False'
         fail_msg: "parse_guidellm slow-GPU case produced {{ _llm_metrics }}"
+
+    # Saturated = the PEAK of the load curve, not the max-RPS row: the
+    # overload probe reports the highest instantaneous RPS while its token
+    # rate has already collapsed (L40S: probe 1709 tok/s vs curve peak 2805).
+    - name: parse_guidellm — saturated metrics come from the curve PEAK, not the overload probe
+      vars:
+        _guidellm_report:
+          benchmarks:
+            - id_: "synchronous"
+              config: {strategy: {type_: synchronous, rate: null}}
+              metrics:
+                requests_per_second: {successful: {mean: 0.33, percentiles: {p95: 0.33}}}
+                request_latency: {successful: {mean: 2.5, percentiles: {p95: 2.52}}}
+                time_to_first_token_ms: {successful: {mean: 40.0, percentiles: {p95: 47.6}}}
+                inter_token_latency_ms: {successful: {mean: 9.6, percentiles: {p95: 9.69}}}
+                time_per_output_token_ms: {successful: {mean: 9.7, percentiles: {p95: 9.83}}}
+                output_tokens_per_second: {successful: {mean: 102.0}}
+                output_token_count: {successful: {mean: 256.0}}
+                request_totals: {successful: 6, errored: 0, incomplete: 0, total: 6}
+            - id_: "peak"
+              config: {strategy: {type_: constant, rate: 16.3}}
+              metrics:
+                requests_per_second: {successful: {mean: 13.71, percentiles: {p95: 14.0}}}
+                request_latency: {successful: {mean: 4.9, percentiles: {p95: 5.2}}}
+                time_to_first_token_ms: {successful: {mean: 80.0, percentiles: {p95: 92.0}}}
+                inter_token_latency_ms: {successful: {mean: 24.0, percentiles: {p95: 25.54}}}
+                time_per_output_token_ms: {successful: {mean: 25.0, percentiles: {p95: 26.0}}}
+                output_tokens_per_second: {successful: {mean: 2805.0}}
+                output_token_count: {successful: {mean: 256.0}}
+                request_totals: {successful: 218, errored: 0, incomplete: 108, total: 326}
+            - id_: "throughput"
+              config: {strategy: {type_: throughput, rate: null}}
+              metrics:
+                requests_per_second: {successful: {mean: 31.95, percentiles: {p95: 32.0}}}
+                request_latency: {successful: {mean: 10.9, percentiles: {p95: 11.3}}}
+                time_to_first_token_ms: {successful: {mean: 7000.0, percentiles: {p95: 7290.0}}}
+                inter_token_latency_ms: {successful: {mean: 49.0, percentiles: {p95: 49.44}}}
+                time_per_output_token_ms: {successful: {mean: 50.0, percentiles: {p95: 51.0}}}
+                output_tokens_per_second: {successful: {mean: 1709.0}}
+                output_token_count: {successful: {mean: 256.0}}
+                request_totals: {successful: 122, errored: 0, incomplete: 508, total: 630}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_guidellm.yml
+    - name: assert peak-row semantics
+      ansible.builtin.assert:
+        that:
+          # headline = curve peak (2805), NOT the overload probe (1709)
+          - (_llm_metrics.output_tok_s_saturated | float) == 2805.0
+          # sustained = peak otps / tokens-per-request = 2805/256
+          - (_llm_metrics.throughput_req_s_mean | float) == 10.96
+          # saturated latencies come from the peak row (92 ms), not the 7.3 s burst
+          - (_llm_metrics.saturated.ttft_p95_ms | float) == 92.0
+          # the drain-burst peak rate KEEPS the max-RPS source
+          - (_llm_metrics.throughput_req_s_peak | float) == 31.95
+          # sync latencies unchanged (from the synchronous run)
+          - (_llm_metrics.ttft_p95_ms | float) == 47.6
+          # peak sits MID-curve (probe collapsed below it) -> full sweep
+          - (_llm_metrics.sweep_truncated | string) == 'False'
+        fail_msg: "parse_guidellm peak-row case produced {{ _llm_metrics }}"
+
+    # TRUNCATED sweep (seen live on vgpu2: probe under-measured -> constant
+    # ladder capped at ~4 req/s -> curve still rising into the probe row).
+    - name: parse_guidellm — truncated sweep detected (curve still rising at the edge)
+      vars:
+        # UNCAPPED probe profile — the vgpu2 incident shape (signature a)
+        gpu_benchmark:
+          guidellm_status: successful
+          guidellm_profile: "--profile 'kind=sweep,warmup.value=1,warmup.mode=requests'"
+        _guidellm_report:
+          benchmarks:
+            - id_: "synchronous"
+              config: {strategy: {type_: synchronous, rate: null}}
+              metrics:
+                requests_per_second: {successful: {mean: 0.33, percentiles: {p95: 0.33}}}
+                request_latency: {successful: {mean: 2.5, percentiles: {p95: 2.51}}}
+                time_to_first_token_ms: {successful: {mean: 36.0, percentiles: {p95: 38.2}}}
+                inter_token_latency_ms: {successful: {mean: 9.6, percentiles: {p95: 9.69}}}
+                time_per_output_token_ms: {successful: {mean: 9.7, percentiles: {p95: 9.8}}}
+                output_tokens_per_second: {successful: {mean: 102.0}}
+                output_token_count: {successful: {mean: 256.0}}
+                request_totals: {successful: 6, errored: 0, incomplete: 0, total: 6}
+            - id_: "ladder-top"
+              config: {strategy: {type_: constant, rate: 4.2}}
+              metrics:
+                requests_per_second: {successful: {mean: 4.25, percentiles: {p95: 4.3}}}
+                request_latency: {successful: {mean: 2.5, percentiles: {p95: 2.6}}}
+                time_to_first_token_ms: {successful: {mean: 58.0, percentiles: {p95: 60.5}}}
+                inter_token_latency_ms: {successful: {mean: 10.9, percentiles: {p95: 11.2}}}
+                time_per_output_token_ms: {successful: {mean: 11.0, percentiles: {p95: 11.3}}}
+                output_tokens_per_second: {successful: {mean: 937.0}}
+                output_token_count: {successful: {mean: 256.0}}
+                request_totals: {successful: 60, errored: 0, incomplete: 10, total: 70}
+            - id_: "throughput"
+              config: {strategy: {type_: throughput, rate: null}}
+              metrics:
+                requests_per_second: {successful: {mean: 5.73, percentiles: {p95: 5.8}}}
+                request_latency: {successful: {mean: 10.0, percentiles: {p95: 10.5}}}
+                time_to_first_token_ms: {successful: {mean: 7000.0, percentiles: {p95: 7423.3}}}
+                inter_token_latency_ms: {successful: {mean: 48.0, percentiles: {p95: 49.0}}}
+                time_per_output_token_ms: {successful: {mean: 49.0, percentiles: {p95: 50.0}}}
+                output_tokens_per_second: {successful: {mean: 1467.0}}
+                output_token_count: {successful: {mean: 256.0}}
+                request_totals: {successful: 110, errored: 0, incomplete: 400, total: 510}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_guidellm.yml
+    - name: assert truncated sweep detected
+      ansible.builtin.assert:
+        that:
+          - (_llm_metrics.sweep_truncated | string) == 'True'
+          # the lower-bound peak is still reported as measured
+          - (_llm_metrics.output_tok_s_saturated | float) == 1467.0
+        fail_msg: "parse_guidellm truncated case produced {{ _llm_metrics }}"
+
+    # SAME shape under a CAPPED probe (max_concurrency= in the profile): the
+    # probe is an orderly bounded-queue measurement, so the peak landing on
+    # it is the normal converged shape — signature (a) is disarmed.
+    - name: parse_guidellm — capped probe peak is converged, not truncated
+      vars:
+        gpu_benchmark:
+          guidellm_status: successful
+          guidellm_profile: "--profile 'kind=sweep,warmup.value=1,warmup.mode=requests,max_concurrency=128'"
+        _guidellm_report:
+          benchmarks:
+            - id_: "synchronous"
+              config: {strategy: {type_: synchronous, rate: null}}
+              metrics:
+                requests_per_second: {successful: {mean: 0.37, percentiles: {p95: 0.37}}}
+                request_latency: {successful: {mean: 2.5, percentiles: {p95: 2.51}}}
+                time_to_first_token_ms: {successful: {mean: 38.0, percentiles: {p95: 39.2}}}
+                inter_token_latency_ms: {successful: {mean: 9.6, percentiles: {p95: 9.69}}}
+                time_per_output_token_ms: {successful: {mean: 9.7, percentiles: {p95: 9.8}}}
+                output_tokens_per_second: {successful: {mean: 102.0}}
+                output_token_count: {successful: {mean: 256.0}}
+                request_totals: {successful: 14, errored: 0, incomplete: 0, total: 14}
+            - id_: "ladder-top"
+              config: {strategy: {type_: constant, rate: 13.7}}
+              metrics:
+                requests_per_second: {successful: {mean: 13.26, percentiles: {p95: 13.5}}}
+                request_latency: {successful: {mean: 4.0, percentiles: {p95: 4.5}}}
+                time_to_first_token_ms: {successful: {mean: 85.0, percentiles: {p95: 87.0}}}
+                inter_token_latency_ms: {successful: {mean: 17.0, percentiles: {p95: 18.0}}}
+                time_per_output_token_ms: {successful: {mean: 18.0, percentiles: {p95: 19.0}}}
+                output_tokens_per_second: {successful: {mean: 3076.0}}
+                output_token_count: {successful: {mean: 256.0}}
+                request_totals: {successful: 408, errored: 0, incomplete: 48, total: 456}
+            - id_: "throughput"
+              config: {strategy: {type_: throughput, rate: null}}
+              metrics:
+                requests_per_second: {successful: {mean: 15.31, percentiles: {p95: 18.1}}}
+                request_latency: {successful: {mean: 8.0, percentiles: {p95: 8.5}}}
+                time_to_first_token_ms: {successful: {mean: 1800.0, percentiles: {p95: 1845.3}}}
+                inter_token_latency_ms: {successful: {mean: 15.0, percentiles: {p95: 16.0}}}
+                time_per_output_token_ms: {successful: {mean: 16.0, percentiles: {p95: 17.0}}}
+                output_tokens_per_second: {successful: {mean: 3918.0}}
+                output_token_count: {successful: {mean: 256.0}}
+                request_totals: {successful: 610, errored: 0, incomplete: 120, total: 730}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_guidellm.yml
+    - name: assert the capped-probe peak is converged
+      ansible.builtin.assert:
+        that:
+          - (_llm_metrics.sweep_truncated | string) == 'False'
+          - (_llm_metrics.output_tok_s_saturated | float) == 3918.0
+        fail_msg: "parse_guidellm capped-probe case produced {{ _llm_metrics }}"
+
+    # Converged at the edge: peak on the last row but the curve FLATTENED
+    # (<5% over the previous row) — the knee was reached; NOT truncated.
+    - name: parse_guidellm — peak at the edge but flat is NOT truncated
+      vars:
+        _guidellm_report:
+          benchmarks:
+            - id_: "synchronous"
+              config: {strategy: {type_: synchronous, rate: null}}
+              metrics:
+                requests_per_second: {successful: {mean: 0.33, percentiles: {p95: 0.33}}}
+                request_latency: {successful: {mean: 2.5, percentiles: {p95: 2.51}}}
+                time_to_first_token_ms: {successful: {mean: 36.0, percentiles: {p95: 38.2}}}
+                inter_token_latency_ms: {successful: {mean: 9.6, percentiles: {p95: 9.69}}}
+                time_per_output_token_ms: {successful: {mean: 9.7, percentiles: {p95: 9.8}}}
+                output_tokens_per_second: {successful: {mean: 102.0}}
+                output_token_count: {successful: {mean: 256.0}}
+                request_totals: {successful: 6, errored: 0, incomplete: 0, total: 6}
+            - id_: "near-knee"
+              config: {strategy: {type_: constant, rate: 10.0}}
+              metrics:
+                requests_per_second: {successful: {mean: 10.0, percentiles: {p95: 10.2}}}
+                request_latency: {successful: {mean: 3.0, percentiles: {p95: 3.2}}}
+                time_to_first_token_ms: {successful: {mean: 80.0, percentiles: {p95: 90.0}}}
+                inter_token_latency_ms: {successful: {mean: 20.0, percentiles: {p95: 22.0}}}
+                time_per_output_token_ms: {successful: {mean: 21.0, percentiles: {p95: 23.0}}}
+                output_tokens_per_second: {successful: {mean: 2550.0}}
+                output_token_count: {successful: {mean: 256.0}}
+                request_totals: {successful: 150, errored: 0, incomplete: 40, total: 190}
+            - id_: "throughput"
+              config: {strategy: {type_: throughput, rate: null}}
+              metrics:
+                requests_per_second: {successful: {mean: 31.95, percentiles: {p95: 32.0}}}
+                request_latency: {successful: {mean: 5.0, percentiles: {p95: 5.5}}}
+                time_to_first_token_ms: {successful: {mean: 5000.0, percentiles: {p95: 5451.6}}}
+                inter_token_latency_ms: {successful: {mean: 45.0, percentiles: {p95: 47.0}}}
+                time_per_output_token_ms: {successful: {mean: 46.0, percentiles: {p95: 48.0}}}
+                output_tokens_per_second: {successful: {mean: 2600.0}}
+                output_token_count: {successful: {mean: 256.0}}
+                request_totals: {successful: 200, errored: 0, incomplete: 300, total: 500}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_guidellm.yml
+    - name: assert flat edge is not truncated
+      ansible.builtin.assert:
+        that:
+          - (_llm_metrics.sweep_truncated | string) == 'False'
+          - (_llm_metrics.output_tok_s_saturated | float) == 2600.0
+        fail_msg: "parse_guidellm flat-edge case produced {{ _llm_metrics }}"
+
+    # Sibling truncation shape: the LADDER TOP is the peak (still rising
+    # +94%) while the collapsed probe sits above it in RPS but below it in
+    # tok/s — equally probe-capped, must also be labeled truncated.
+    - name: parse_guidellm — ladder-top peak with collapsed probe is ALSO truncated
+      vars:
+        _guidellm_report:
+          benchmarks:
+            - id_: "c1"
+              config: {strategy: {type_: constant, rate: 3.0}}
+              metrics:
+                requests_per_second: {successful: {mean: 3.0, percentiles: {p95: 3.1}}}
+                request_latency: {successful: {mean: 2.5, percentiles: {p95: 2.6}}}
+                time_to_first_token_ms: {successful: {mean: 55.0, percentiles: {p95: 58.0}}}
+                inter_token_latency_ms: {successful: {mean: 10.5, percentiles: {p95: 10.9}}}
+                time_per_output_token_ms: {successful: {mean: 10.7, percentiles: {p95: 11.0}}}
+                output_tokens_per_second: {successful: {mean: 720.0}}
+                output_token_count: {successful: {mean: 256.0}}
+                request_totals: {successful: 45, errored: 0, incomplete: 5, total: 50}
+            - id_: "c2-top"
+              config: {strategy: {type_: constant, rate: 6.0}}
+              metrics:
+                requests_per_second: {successful: {mean: 6.0, percentiles: {p95: 6.1}}}
+                request_latency: {successful: {mean: 2.7, percentiles: {p95: 2.9}}}
+                time_to_first_token_ms: {successful: {mean: 60.0, percentiles: {p95: 63.0}}}
+                inter_token_latency_ms: {successful: {mean: 11.0, percentiles: {p95: 11.4}}}
+                time_per_output_token_ms: {successful: {mean: 11.2, percentiles: {p95: 11.6}}}
+                output_tokens_per_second: {successful: {mean: 1400.0}}
+                output_token_count: {successful: {mean: 256.0}}
+                request_totals: {successful: 85, errored: 0, incomplete: 15, total: 100}
+            - id_: "throughput"
+              config: {strategy: {type_: throughput, rate: null}}
+              metrics:
+                requests_per_second: {successful: {mean: 9.0, percentiles: {p95: 9.2}}}
+                request_latency: {successful: {mean: 9.0, percentiles: {p95: 9.5}}}
+                time_to_first_token_ms: {successful: {mean: 6500.0, percentiles: {p95: 6900.0}}}
+                inter_token_latency_ms: {successful: {mean: 45.0, percentiles: {p95: 47.0}}}
+                time_per_output_token_ms: {successful: {mean: 46.0, percentiles: {p95: 48.0}}}
+                output_tokens_per_second: {successful: {mean: 1300.0}}
+                output_token_count: {successful: {mean: 256.0}}
+                request_totals: {successful: 90, errored: 0, incomplete: 350, total: 440}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_guidellm.yml
+    - name: assert ladder-top truncation detected
+      ansible.builtin.assert:
+        that:
+          - (_llm_metrics.sweep_truncated | string) == 'True'
+          - (_llm_metrics.output_tok_s_saturated | float) == 1400.0
+        fail_msg: "parse_guidellm ladder-top case produced {{ _llm_metrics }}"
+
+    # A profile with no constant ladder at all (sync + healthy probe): there
+    # is no ladder to judge — never labeled truncated.
+    - name: parse_guidellm — sync+probe-only profile is not judged truncated
+      vars:
+        _guidellm_report:
+          benchmarks:
+            - id_: "synchronous"
+              config: {strategy: {type_: synchronous, rate: null}}
+              metrics:
+                requests_per_second: {successful: {mean: 0.33, percentiles: {p95: 0.33}}}
+                request_latency: {successful: {mean: 2.5, percentiles: {p95: 2.51}}}
+                time_to_first_token_ms: {successful: {mean: 36.0, percentiles: {p95: 38.2}}}
+                inter_token_latency_ms: {successful: {mean: 9.6, percentiles: {p95: 9.69}}}
+                time_per_output_token_ms: {successful: {mean: 9.7, percentiles: {p95: 9.8}}}
+                output_tokens_per_second: {successful: {mean: 102.0}}
+                output_token_count: {successful: {mean: 256.0}}
+                request_totals: {successful: 6, errored: 0, incomplete: 0, total: 6}
+            - id_: "throughput"
+              config: {strategy: {type_: throughput, rate: null}}
+              metrics:
+                requests_per_second: {successful: {mean: 20.0, percentiles: {p95: 21.0}}}
+                request_latency: {successful: {mean: 8.0, percentiles: {p95: 8.5}}}
+                time_to_first_token_ms: {successful: {mean: 4000.0, percentiles: {p95: 4500.0}}}
+                inter_token_latency_ms: {successful: {mean: 40.0, percentiles: {p95: 42.0}}}
+                time_per_output_token_ms: {successful: {mean: 41.0, percentiles: {p95: 43.0}}}
+                output_tokens_per_second: {successful: {mean: 2600.0}}
+                output_token_count: {successful: {mean: 256.0}}
+                request_totals: {successful: 180, errored: 0, incomplete: 250, total: 430}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_guidellm.yml
+    - name: assert sync+probe-only is not truncated
+      ansible.builtin.assert:
+        that:
+          - (_llm_metrics.sweep_truncated | string) == 'False'
+        fail_msg: "parse_guidellm sync+probe case produced {{ _llm_metrics }}"
+
+    # Old baselines (recorded under max-RPS semantics) stay comparable: the
+    # bare side is lifted to its stored SWEEP maximum.
+    - name: compare_baseline — sweep maxima level both sides under the new semantics
+      vars:
+        gpu_benchmark:
+          compare_min_samples: 30
+          compare_min_throughput_req_s: 1.0
+          baremetal: {baseline_tolerance_pct: 10}
+        _baseline:
+          hosts:
+            n1:
+              gpus: []
+              llm:
+                "m1":
+                  per_gpu:
+                    - gpu: 0
+                      metrics:
+                        output_tok_s_saturated: "1709.0"   # old probe-based headline
+                        throughput_req_s_mean: "6.68"
+                        ttft_p95_ms: "37.0"
+                        requests_successful: "220"
+                        sweep:
+                          - {strategy: constant, output_tok_s: "2805.0", rps: 13.7, ttft_p95_ms: 92.0, itl_p95_ms: 25.5, requests_ok: 218, requests_err: 0}
+                          - {strategy: throughput, output_tok_s: "1709.0", rps: 31.95, ttft_p95_ms: 7290.0, itl_p95_ms: 49.4, requests_ok: 122, requests_err: 0}
+        _post_llm:
+          "m1":
+            model: "m1"
+            per_gpu:
+              - gpu: 0
+                metrics:
+                  output_tok_s_saturated: "2750.0"   # new peak-based headline
+                  throughput_req_s_mean: "10.74"
+                  ttft_p95_ms: "38.0"
+                  requests_successful: "210"
+        _post_health_hosts: []
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_baseline.yml
+    - name: assert sweep lifts the old baseline to peak semantics
+      ansible.builtin.assert:
+        that:
+          # bare side must be the sweep max (2805), not the stored 1709 —
+          # overhead (2805-2750)/2805 = 2.0%, within tolerance
+          - (_baseline_delta.rows | selectattr('metric', 'search', 'output tok/s') | first).baremetal | float == 2805.0
+          - (_baseline_delta.rows | selectattr('metric', 'search', 'output tok/s') | first).ok
+          # sustained bare side lifted to 2805/256 = 10.96
+          - (_baseline_delta.rows | selectattr('metric', 'search', 'sustained') | first).baremetal | float == 10.96
+        fail_msg: "compare_baseline sweep-lift case produced {{ _baseline_delta }}"
+
+    # The sweep-lift divisor is DERIVED, not hardcoded 256: per-side stored
+    # tokens_per_request wins; a side without it falls back to the
+    # output_tokens= value from the shared profile (512 here).
+    - name: compare_baseline — non-256 profile derives the sweep-lift divisor
+      vars:
+        gpu_benchmark:
+          compare_min_samples: 30
+          compare_min_throughput_req_s: 1.0
+          baremetal: {baseline_tolerance_pct: 10}
+          guidellm_profile: >-
+            --profile 'kind=sweep,warmup.value=1,warmup.mode=requests'
+            --constraint kind=max_requests,count=100000
+            --data 'kind=synthetic_text,prompt_tokens=512,output_tokens=512'
+        _baseline:
+          hosts:
+            n1:
+              gpus: []
+              llm:
+                "m1":
+                  per_gpu:
+                    - gpu: 0
+                      metrics:
+                        # NO stored tokens_per_request -> profile value (512)
+                        output_tok_s_saturated: "1709.0"
+                        throughput_req_s_mean: "3.3"
+                        ttft_p95_ms: "37.0"
+                        requests_successful: "220"
+                        sweep:
+                          - {strategy: constant, output_tok_s: "2805.0", rps: 5.5, ttft_p95_ms: 92.0, itl_p95_ms: 25.5, requests_ok: 218, requests_err: 0}
+        _post_llm:
+          "m1":
+            model: "m1"
+            per_gpu:
+              - gpu: 0
+                metrics:
+                  # stored tokens_per_request (500) WINS over the profile
+                  output_tok_s_saturated: "2750.0"
+                  tokens_per_request: 500
+                  throughput_req_s_mean: "5.5"
+                  ttft_p95_ms: "38.0"
+                  requests_successful: "210"
+                  sweep_truncated: true
+                  sweep:
+                    - {strategy: constant, output_tok_s: "2750.0", rps: 5.5, ttft_p95_ms: 95.0, itl_p95_ms: 26.0, requests_ok: 210, requests_err: 0}
+        _post_health_hosts: []
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_baseline.yml
+    - name: assert the derived divisor on both sides
+      ansible.builtin.assert:
+        that:
+          # bare sustained = 2805/512 = 5.48 (a hardcoded 256 would say 10.96)
+          - (_baseline_delta.rows | selectattr('metric', 'search', 'sustained') | first).baremetal | float == 5.48
+          # virt sustained = 2750/500 = 5.5 (its stored tokens_per_request)
+          - (_baseline_delta.rows | selectattr('metric', 'search', 'sustained') | first).virtualized | float == 5.5
+          # the virt side's truncated sweep surfaces as a caveat naming the side
+          - _baseline_delta.caveats | select('search', 'TRUNCATED') | list | length == 1
+          - _baseline_delta.caveats | select('search', 'TRUNCATED') | first is search('this run')
+          - not (_baseline_delta.caveats | select('search', 'TRUNCATED') | first is search('baseline'))
+        fail_msg: "compare_baseline non-256 divisor case produced {{ _baseline_delta }}"
+
+    # DIRECTIONAL guard, baseline edition: when the virt-side best ITSELF
+    # comes from a truncated sweep (single-GPU host, or every GPU landed in
+    # the probe's low mode), an apparent overhead breach is INCONCLUSIVE —
+    # the row keeps ok with a note instead of flagging the cluster.
+    - name: compare_baseline — truncated virt side makes a breach inconclusive
+      vars:
+        gpu_benchmark:
+          compare_min_samples: 30
+          compare_min_throughput_req_s: 1.0
+          baremetal: {baseline_tolerance_pct: 10}
+        _baseline:
+          hosts:
+            n1:
+              gpus: []
+              llm:
+                "m1":
+                  per_gpu:
+                    - gpu: 0
+                      metrics:
+                        output_tok_s_saturated: "2684.78"
+                        throughput_req_s_mean: "10.49"
+                        ttft_p95_ms: "34.8"
+                        requests_successful: "220"
+        _post_llm:
+          "m1":
+            model: "m1"
+            per_gpu:
+              - gpu: 0
+                metrics:
+                  output_tok_s_saturated: "1467.0"
+                  throughput_req_s_mean: "5.73"
+                  ttft_p95_ms: "38.2"
+                  requests_successful: "210"
+                  sweep_truncated: true
+        _post_health_hosts: []
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_baseline.yml
+    - name: assert the truncated-virt breach is inconclusive, not a flag
+      ansible.builtin.assert:
+        that:
+          # ~45% apparent overhead on both throughput rows, yet ok with note
+          - (_baseline_delta.rows | selectattr('metric', 'search', 'output tok/s') | first).ok
+          - "'lower bound' in (_baseline_delta.rows | selectattr('metric', 'search', 'output tok/s') | first).note"
+          - (_baseline_delta.rows | selectattr('metric', 'search', 'sustained') | first).ok
+          # TTFT (sync-run, ladder-independent): 38.2 vs 34.8 = ~9.8% < 10 -> ok on merit
+          - (_baseline_delta.rows | selectattr('metric', 'search', 'TTFT') | first).ok
+          - _baseline_delta.status == 'ok'
+        fail_msg: "compare_baseline truncated-virt case produced {{ _baseline_delta }}"
+
+    # Control: the SAME numbers WITHOUT truncation must still flag — the
+    # guard must not blanket-suppress real overhead.
+    - name: compare_baseline — untruncated virt side with the same numbers still flags
+      vars:
+        gpu_benchmark:
+          compare_min_samples: 30
+          compare_min_throughput_req_s: 1.0
+          baremetal: {baseline_tolerance_pct: 10}
+        _baseline:
+          hosts:
+            n1:
+              gpus: []
+              llm:
+                "m1":
+                  per_gpu:
+                    - gpu: 0
+                      metrics:
+                        output_tok_s_saturated: "2684.78"
+                        throughput_req_s_mean: "10.49"
+                        ttft_p95_ms: "34.8"
+                        requests_successful: "220"
+        _post_llm:
+          "m1":
+            model: "m1"
+            per_gpu:
+              - gpu: 0
+                metrics:
+                  output_tok_s_saturated: "1467.0"
+                  throughput_req_s_mean: "5.73"
+                  ttft_p95_ms: "38.2"
+                  requests_successful: "210"
+                  sweep_truncated: false
+        _post_health_hosts: []
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_baseline.yml
+    - name: assert the untruncated breach still flags
+      ansible.builtin.assert:
+        that:
+          - not (_baseline_delta.rows | selectattr('metric', 'search', 'output tok/s') | first).ok
+          - _baseline_delta.status == 'flag'
+        fail_msg: "compare_baseline untruncated-control case produced {{ _baseline_delta }}"
+
+    # The load profile is the measurement definition: a baseline recorded
+    # under a different profile/window gets an explicit caveat (and NO
+    # caveat when it matches — or when an old baseline never stored it).
+    - name: compare_baseline — mismatched load profile raises a caveat
+      vars:
+        gpu_benchmark:
+          compare_min_samples: 30
+          compare_min_throughput_req_s: 1.0
+          baremetal: {baseline_tolerance_pct: 10}
+          guidellm_profile: "--profile 'kind=sweep,max_concurrency=128' --data 'kind=synthetic_text,output_tokens=256'"
+          guidellm_max_duration_s: 40
+        _baseline:
+          hosts:
+            n1:
+              gpus: []
+              load_profile: "--profile 'kind=sweep' --data 'kind=synthetic_text,output_tokens=256' --constraint kind=max_duration,seconds=20"
+              llm:
+                "m1":
+                  per_gpu:
+                    - gpu: 0
+                      metrics:
+                        output_tok_s_saturated: "2684.78"
+                        throughput_req_s_mean: "10.49"
+                        ttft_p95_ms: "34.8"
+                        requests_successful: "220"
+        _post_llm:
+          "m1":
+            model: "m1"
+            per_gpu:
+              - gpu: 0
+                metrics:
+                  output_tok_s_saturated: "2750.0"
+                  throughput_req_s_mean: "10.74"
+                  ttft_p95_ms: "38.0"
+                  requests_successful: "210"
+        _post_health_hosts: []
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_baseline.yml
+    - name: assert the profile-mismatch caveat fires
+      ansible.builtin.assert:
+        that:
+          - _baseline_delta.caveats | select('search', 'LOAD PROFILE') | list | length == 1
+        fail_msg: "compare_baseline profile-mismatch case produced {{ _baseline_delta.caveats }}"
+
+    - name: compare_baseline — matching load profile raises no caveat
+      vars:
+        gpu_benchmark:
+          compare_min_samples: 30
+          compare_min_throughput_req_s: 1.0
+          baremetal: {baseline_tolerance_pct: 10}
+          guidellm_profile: "--profile 'kind=sweep,max_concurrency=128' --data 'kind=synthetic_text,output_tokens=256'"
+          guidellm_max_duration_s: 40
+        _baseline:
+          hosts:
+            n1:
+              gpus: []
+              load_profile: "--profile 'kind=sweep,max_concurrency=128' --data 'kind=synthetic_text,output_tokens=256' --constraint kind=max_duration,seconds=40"
+              llm:
+                "m1":
+                  per_gpu:
+                    - gpu: 0
+                      metrics:
+                        output_tok_s_saturated: "2684.78"
+                        throughput_req_s_mean: "10.49"
+                        ttft_p95_ms: "34.8"
+                        requests_successful: "220"
+        _post_llm:
+          "m1":
+            model: "m1"
+            per_gpu:
+              - gpu: 0
+                metrics:
+                  output_tok_s_saturated: "2750.0"
+                  throughput_req_s_mean: "10.74"
+                  ttft_p95_ms: "38.0"
+                  requests_successful: "210"
+        _post_health_hosts: []
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_baseline.yml
+    - name: assert no caveat when the profile matches
+      ansible.builtin.assert:
+        that:
+          - _baseline_delta.caveats | select('search', 'LOAD PROFILE') | list | length == 0
+        fail_msg: "compare_baseline profile-match case produced {{ _baseline_delta.caveats }}"
 
     - name: parse_guidellm — minimal report (no config/otps/concurrency/totals) degrades gracefully
       vars:
@@ -378,6 +984,77 @@
           - _llm_eval.status == 'flag'
           - _llm_eval.gated | bool          # ttft/itl gates ARE applied
         fail_msg: "evaluate_llm produced {{ _llm_eval }}"
+
+    # The vgpu2 live case: truncated GPU1 recorded 5.73 req/s against the
+    # 8.0 floor. A lower bound below the gate is INCONCLUSIVE — it must not
+    # flag (the true capacity may clear the gate), and it must say so.
+    - name: evaluate_llm — truncated sweep below the throughput floor is inconclusive, not a flag
+      vars:
+        gpu_benchmark:
+          thresholds: {profile: chat, ttft_p95_ms: 200, itl_p95_ms: 50, min_throughput_req_s: 8.0}
+        _llm_metrics:
+          throughput_req_s_mean: 5.73
+          req_latency_p95_s: 2.5
+          ttft_p95_ms: 38.2
+          itl_p95_ms: 9.69
+          tpot_p95_ms: 9.8
+          sweep_truncated: true
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/evaluate_llm.yml
+    - name: assert truncated-below-floor is inconclusive
+      ansible.builtin.assert:
+        that:
+          - _llm_eval.throughput_ok | bool
+          - _llm_eval.throughput_inconclusive | bool
+          - _llm_eval.status == 'ok'
+        fail_msg: "evaluate_llm truncated-below-floor produced {{ _llm_eval }}"
+
+    # A truncated lower bound ABOVE the gate is a definitive pass — no
+    # inconclusive marker; and an UNtruncated value below the gate still flags.
+    - name: evaluate_llm — truncated above the floor passes cleanly; untruncated below still flags
+      vars:
+        gpu_benchmark:
+          thresholds: {profile: chat, ttft_p95_ms: 200, itl_p95_ms: 50, min_throughput_req_s: 8.0}
+        _llm_metrics:
+          throughput_req_s_mean: 10.97
+          req_latency_p95_s: 2.5
+          ttft_p95_ms: 40.0
+          itl_p95_ms: 9.69
+          tpot_p95_ms: 9.8
+          sweep_truncated: true
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/evaluate_llm.yml
+    - name: assert truncated-above-floor is a clean pass
+      ansible.builtin.assert:
+        that:
+          - _llm_eval.throughput_ok | bool
+          - not (_llm_eval.throughput_inconclusive | bool)
+          - _llm_eval.status == 'ok'
+        fail_msg: "evaluate_llm truncated-above-floor produced {{ _llm_eval }}"
+
+    - name: evaluate_llm — untruncated below the floor still flags
+      vars:
+        gpu_benchmark:
+          thresholds: {profile: chat, ttft_p95_ms: 200, itl_p95_ms: 50, min_throughput_req_s: 8.0}
+        _llm_metrics:
+          throughput_req_s_mean: 5.73
+          req_latency_p95_s: 2.5
+          ttft_p95_ms: 38.2
+          itl_p95_ms: 9.69
+          tpot_p95_ms: 9.8
+          sweep_truncated: false
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/evaluate_llm.yml
+    - name: assert untruncated-below-floor flags
+      ansible.builtin.assert:
+        that:
+          - not (_llm_eval.throughput_ok | bool)
+          - not (_llm_eval.throughput_inconclusive | bool)
+          - _llm_eval.status == 'flag'
+        fail_msg: "evaluate_llm untruncated-below-floor produced {{ _llm_eval }}"
 
     - name: evaluate_llm — null thresholds disable the SLO gates
       vars:
@@ -527,6 +1204,52 @@
           - _gpu_delta.metrics | rejectattr('ok') | list | length == 3
         fail_msg: "compare_gpus slow-GPU case produced {{ _gpu_delta }}"
 
+    # A truncated sweep suppresses ONLY the throughput comparison (its value
+    # is a lower bound, the gap is a measurement artifact — vgpu2 live case:
+    # 10.97 vs 5.73 req/s, 47.8% spread, hardware identical). Sync-run
+    # latency metrics still compare and still flag.
+    - name: compare_gpus — truncated sweep suppresses throughput, latency still compares
+      vars:
+        gpu_benchmark: {llm_variance_pct: 20}
+        _model_gpu_results:
+          - {gpu: 0, metrics: {throughput_req_s_mean: "10.97", req_latency_p95_s: "2.5", ttft_p95_ms: "40", itl_p95_ms: "9.7", tpot_p95_ms: "9.8", requests_successful: "120", sweep_truncated: false}}
+          - {gpu: 1, metrics: {throughput_req_s_mean: "5.73", req_latency_p95_s: "2.5", ttft_p95_ms: "100", itl_p95_ms: "9.7", tpot_p95_ms: "9.8", requests_successful: "120", sweep_truncated: true}}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_gpus.yml
+    - name: assert truncated-sweep suppression is scoped to throughput
+      ansible.builtin.assert:
+        that:
+          # 47.8% spread would flag, but the sweep is truncated -> suppressed with note
+          - (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).flagged_gpus | length == 0
+          - (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).ok
+          - "'sweep truncated on GPU 1' in (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).note"
+          # ttft (sync run, ladder-independent): 100 > 40*1.2 -> still flagged
+          - (_gpu_delta.metrics | selectattr('metric', 'eq', 'ttft_p95_ms') | first).flagged_gpus == [1]
+        fail_msg: "compare_gpus truncated case produced {{ _gpu_delta }}"
+
+    # DIRECTIONAL: a truncated BEST only understates the spread — an
+    # untruncated sibling below the variance bound has a GENUINE deficit
+    # and must still flag (throughput-only degradation would otherwise be
+    # masked by the sibling's measurement artifact).
+    - name: compare_gpus — truncated BEST does not shield a genuinely slow sibling
+      vars:
+        gpu_benchmark: {llm_variance_pct: 20}
+        _model_gpu_results:
+          - {gpu: 0, metrics: {throughput_req_s_mean: "10.97", req_latency_p95_s: "2.5", ttft_p95_ms: "40", itl_p95_ms: "9.7", tpot_p95_ms: "9.8", requests_successful: "120", sweep_truncated: true}}
+          - {gpu: 1, metrics: {throughput_req_s_mean: "5.0", req_latency_p95_s: "2.5", ttft_p95_ms: "41", itl_p95_ms: "9.7", tpot_p95_ms: "9.8", requests_successful: "120", sweep_truncated: false}}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_gpus.yml
+    - name: assert the untruncated sibling still flags
+      ansible.builtin.assert:
+        that:
+          # 5.0 < 10.97*0.8 and GPU 1's own sweep is complete -> real deficit
+          - (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).flagged_gpus == [1]
+          - not (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).ok
+          - "'sweep truncated on GPU 0' in (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).note"
+        fail_msg: "compare_gpus truncated-best case produced {{ _gpu_delta }}"
+
     - name: compare_gpus — 3 GPUs, only the outlier flagged; best is never flagged
       vars:
         gpu_benchmark: {llm_variance_pct: 20}
@@ -603,6 +1326,200 @@
           - (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).flagged_gpus | length == 0
           - "'below measurement floor' in (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).note"
         fail_msg: "compare_gpus below-floor case produced {{ _gpu_delta }}"
+
+    # ---- compare_baseline (virtualization overhead vs bare-metal) ----
+    - name: compare_baseline — within tolerance is ok, overhead signed correctly
+      vars:
+        gpu_benchmark:
+          compare_min_samples: 30
+          compare_min_throughput_req_s: 1.0
+          baremetal: {baseline_tolerance_pct: 10}
+        _baseline:
+          hosts:
+            n1:
+              timestamp: "2026-07-28T10:00:00"
+              driver_version: "570.195.03"
+              versions: "Name: guidellm Version: 0.7.1 Name: vllm Version: 0.10.2"
+              gpus:
+                - {index: 0, name: "NVIDIA L40S", vram_mib: "46068", cublas_gflops: "56000", pcie_h2d_gbs: "27.0", pcie_d2h_gbs: "26.0"}
+              llm:
+                "Qwen/Qwen2.5-3B-Instruct":
+                  status: ok
+                  per_gpu:
+                    - {gpu: 0, metrics: {output_tok_s_saturated: "1600.0", throughput_req_s_mean: "6.3", ttft_p95_ms: "35.0", requests_successful: "220"}}
+        _post_llm:
+          "Qwen/Qwen2.5-3B-Instruct":
+            model: "Qwen/Qwen2.5-3B-Instruct"
+            versions: "Name: guidellm Version: 0.7.1 Name: vllm Version: 0.10.2"
+            per_gpu:
+              - {gpu: 0, metrics: {output_tok_s_saturated: "1553.0", throughput_req_s_mean: "6.07", ttft_p95_ms: "36.4", requests_successful: "229"}}
+        _post_health_hosts:
+          - driver_version: "570.195.03"
+            nvidia_smi: [{index: "0", name: "NVIDIA L40S"}]
+            cublas: [{gpu: 0, gflops: 54500.0}]
+            pcie_bw: [{gpu: 0, h2d_gbs: 26.8, d2h_gbs: 25.7}]
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_baseline.yml
+    - name: assert within-tolerance baseline comparison is ok
+      ansible.builtin.assert:
+        that:
+          - _baseline_delta.status == 'ok'
+          - _baseline_delta.rows | length == 6   # 3 hardware + 3 LLM
+          - _baseline_delta.rows | rejectattr('ok') | list | length == 0
+          # cuBLAS overhead: (56000-54500)/56000*100 = 2.7 (positive = virt slower)
+          - (_baseline_delta.rows | selectattr('metric', 'eq', 'cuBLAS GFLOP/s') | first).overhead_pct | float == 2.7
+          # TTFT (lower-better): (36.4-35.0)/35.0*100 = 4.0
+          - (_baseline_delta.rows | selectattr('metric', 'search', 'TTFT') | first).overhead_pct | float == 4.0
+          # only the identity caveat — versions and driver match, counts match
+          - _baseline_delta.caveats | length == 1
+        fail_msg: "compare_baseline within-tolerance case produced {{ _baseline_delta }}"
+
+    # '+cu130' is a CUDA-build suffix on the SAME engine version — the
+    # version-mismatch caveat must NOT fire on it.
+    - name: compare_baseline — a +local CUDA suffix is not a version mismatch
+      vars:
+        gpu_benchmark:
+          compare_min_samples: 30
+          compare_min_throughput_req_s: 1.0
+          baremetal: {baseline_tolerance_pct: 10}
+        _baseline:
+          hosts:
+            n1:
+              versions: "Name: guidellm Version: 0.7.1 Name: vllm Version: 0.17.1"
+              driver_version: "610.43.02"
+              gpus: []
+              llm:
+                "m1":
+                  per_gpu:
+                    - {gpu: 0, metrics: {output_tok_s_saturated: "1600.0", throughput_req_s_mean: "6.3", ttft_p95_ms: "35.0", requests_successful: "220"}}
+        _post_llm:
+          "m1":
+            model: "m1"
+            versions: "Name: guidellm Version: 0.7.1 Name: vllm Version: 0.17.1+cu130"
+            per_gpu:
+              - {gpu: 0, metrics: {output_tok_s_saturated: "1550.0", throughput_req_s_mean: "6.1", ttft_p95_ms: "36.0", requests_successful: "200"}}
+        _post_health_hosts:
+          - driver_version: "610.43.02"
+            nvidia_smi: [{index: "0", name: "NVIDIA L40S"}]
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_baseline.yml
+    - name: assert cuda-build suffix does not fire the version caveat
+      ansible.builtin.assert:
+        that:
+          - _baseline_delta.caveats | select('search', 'vLLM version differs') | list | length == 0
+        fail_msg: "compare_baseline +cu suffix case produced {{ _baseline_delta.caveats }}"
+
+    - name: compare_baseline — a breach beyond tolerance flags; version mismatch is caveated
+      vars:
+        gpu_benchmark:
+          compare_min_samples: 30
+          compare_min_throughput_req_s: 1.0
+          baremetal: {baseline_tolerance_pct: 10}
+        _baseline:
+          hosts:
+            n1:
+              versions: "Name: guidellm Version: 0.7.1 Name: vllm Version: 0.10.2"
+              driver_version: "570.195.03"
+              gpus:
+                - {index: 0, name: "NVIDIA L40S", vram_mib: "46068", cublas_gflops: "56000", pcie_h2d_gbs: "27.0", pcie_d2h_gbs: "26.0"}
+              llm:
+                "m1":
+                  per_gpu:
+                    - {gpu: 0, metrics: {output_tok_s_saturated: "1600.0", throughput_req_s_mean: "6.3", ttft_p95_ms: "35.0", requests_successful: "220"}}
+        _post_llm:
+          "m1":
+            model: "m1"
+            versions: "Name: guidellm Version: 0.7.1 Name: vllm Version: 0.11.0"
+            per_gpu:
+              # tok/s 20% down, sustained 25% down, ttft 50% up — all breach 10%
+              - {gpu: 0, metrics: {output_tok_s_saturated: "1280.0", throughput_req_s_mean: "4.7", ttft_p95_ms: "52.5", requests_successful: "180"}}
+        _post_health_hosts:
+          - driver_version: "570.195.03"
+            nvidia_smi: [{index: "0", name: "NVIDIA L40S"}]
+            cublas: [{gpu: 0, gflops: 55000.0}]
+            pcie_bw: [{gpu: 0, h2d_gbs: 26.0, d2h_gbs: 25.0}]
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_baseline.yml
+    - name: assert breach flags and version caveat present
+      ansible.builtin.assert:
+        that:
+          - _baseline_delta.status == 'flag'
+          - not (_baseline_delta.rows | selectattr('metric', 'search', 'output tok/s') | first).ok
+          - not (_baseline_delta.rows | selectattr('metric', 'search', 'sustained') | first).ok
+          - not (_baseline_delta.rows | selectattr('metric', 'search', 'TTFT') | first).ok
+          - (_baseline_delta.rows | selectattr('metric', 'eq', 'cuBLAS GFLOP/s') | first).ok
+          - _baseline_delta.caveats | select('search', 'vLLM version differs') | list | length == 1
+        fail_msg: "compare_baseline breach case produced {{ _baseline_delta }}"
+
+    - name: compare_baseline — breach with tiny samples is NOT flagged (noise guard)
+      vars:
+        gpu_benchmark:
+          compare_min_samples: 30
+          compare_min_throughput_req_s: 1.0
+          baremetal: {baseline_tolerance_pct: 10}
+        _baseline:
+          hosts:
+            n1:
+              gpus: []
+              llm:
+                "m1":
+                  per_gpu:
+                    - {gpu: 0, metrics: {output_tok_s_saturated: "23.2", throughput_req_s_mean: "0.09", ttft_p95_ms: "254.0", requests_successful: "4"}}
+        _post_llm:
+          "m1":
+            model: "m1"
+            per_gpu:
+              - {gpu: 0, metrics: {output_tok_s_saturated: "18.7", throughput_req_s_mean: "0.07", ttft_p95_ms: "286.4", requests_successful: "3"}}
+        _post_health_hosts: []
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_baseline.yml
+    - name: assert tiny-sample baseline breach suppressed with note
+      ansible.builtin.assert:
+        that:
+          - _baseline_delta.status == 'ok'
+          - _baseline_delta.rows | rejectattr('ok') | list | length == 0
+          # tok/s overhead 19.4% > 10% but samples 3/4 < 30 => guarded
+          - "'insufficient sample' in (_baseline_delta.rows | selectattr('metric', 'search', 'output tok/s') | first).note"
+          # sustained also below the 1.0 req/s floor — either guard note is acceptable
+          - (_baseline_delta.rows | selectattr('metric', 'search', 'sustained') | first).ok
+        fail_msg: "compare_baseline tiny-sample case produced {{ _baseline_delta }}"
+
+    - name: compare_baseline — missing side never crashes or flags
+      vars:
+        gpu_benchmark:
+          compare_min_samples: 30
+          compare_min_throughput_req_s: 1.0
+          baremetal: {baseline_tolerance_pct: 10}
+        _baseline:
+          hosts:
+            n1:
+              gpus:
+                - {index: 0, name: "T4", vram_mib: "15360", cublas_gflops: "6200", pcie_h2d_gbs: "", pcie_d2h_gbs: ""}
+              llm: {}
+        _post_llm:
+          "m1":
+            model: "m1"
+            per_gpu:
+              - {gpu: 0, metrics: {output_tok_s_saturated: "1553.0", throughput_req_s_mean: "6.07", ttft_p95_ms: "36.4", requests_successful: "229"}}
+        _post_health_hosts:
+          - nvidia_smi: [{index: "0", name: "T4"}]
+            cublas: {skipped: "nvcc unavailable"}
+            pcie_bw: {skipped: "nvcc unavailable"}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_baseline.yml
+    - name: assert missing-side rows are informational
+      ansible.builtin.assert:
+        that:
+          - _baseline_delta.status == 'ok'
+          - _baseline_delta.rows | rejectattr('ok') | list | length == 0
+          - (_baseline_delta.rows | selectattr('metric', 'eq', 'cuBLAS GFLOP/s') | first).note == 'missing on one side'
+          - (_baseline_delta.rows | selectattr('metric', 'search', 'output tok/s') | first).note == 'missing on one side'
+        fail_msg: "compare_baseline missing-side case produced {{ _baseline_delta }}"
 
     - name: model_status — all GPUs ok yields ok
       vars:
@@ -730,6 +1647,41 @@
           - _nvidia_issues | select('search', 'PCIe link below max width') | list | length == 1
           - _nvidia_issues | select('search', 'x4 of x16') | list | length == 1
         fail_msg: "evaluate_nvidia pcie case produced {{ _nvidia_issues }}"
+
+    # pcie_expected_width: a platform that wires x8-of-x16 BY DESIGN (AWS g4dn
+    # T4) declares 8 and the known-good width raises no issue...
+    - name: evaluate_nvidia — declared expected width accepts the platform norm
+      vars:
+        gpu_benchmark: {pcie_expected_width: 8}
+        _nvidia_smi:
+          - {index: "0", name: "Tesla T4", vram_mib: "15360", ecc_uncorrected: "0", throttle: "0x0000000000000000", pcie_width_current: "8", pcie_width_max: "16"}
+        _expected_gpu_count: 1
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/evaluate_nvidia.yml
+    - name: assert expected-width x8 is accepted
+      ansible.builtin.assert:
+        that:
+          - _nvidia_ok | bool
+          - _nvidia_issues | length == 0
+        fail_msg: "evaluate_nvidia expected-width case produced {{ _nvidia_issues }}"
+
+    # ...but a link BELOW the declared width still flags.
+    - name: evaluate_nvidia — below the declared expected width still flags
+      vars:
+        gpu_benchmark: {pcie_expected_width: 8}
+        _nvidia_smi:
+          - {index: "0", name: "Tesla T4", vram_mib: "15360", ecc_uncorrected: "0", throttle: "0x0000000000000000", pcie_width_current: "4", pcie_width_max: "16"}
+        _expected_gpu_count: 1
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/evaluate_nvidia.yml
+    - name: assert below-expected width flagged
+      ansible.builtin.assert:
+        that:
+          - not (_nvidia_ok | bool)
+          - _nvidia_issues | select('search', 'x4 of x16') | list | length == 1
+        fail_msg: "evaluate_nvidia below-expected case produced {{ _nvidia_issues }}"
 
     - name: aggregate_status — all ok
       vars:

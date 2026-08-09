@@ -1,0 +1,280 @@
+---
+# Virtualization-overhead comparison: bare-metal (pre-deploy) baseline vs the
+# virtualized (post-deploy) run. PURE logic — unit-tested in test_logic.yml.
+#
+# In:  _baseline          gpu_baseline.json dict ({hosts: {<name>: {gpus, llm, ...}}})
+#      _post_llm          the post phase's _llm map (model entries with per_gpu)
+#      _post_health_hosts the post phase's _gpu_health.hosts list
+#      gpu_benchmark.baremetal.baseline_tolerance_pct, compare_min_samples,
+#      compare_min_throughput_req_s
+# Out: _baseline_delta {status, tolerance_pct, caveats: [], rows: [
+#        {metric, better, baremetal, virtualized, overhead_pct, ok, note}]}
+#
+# Comparison is BEST-vs-BEST across GPUs on each side (robust to passthrough
+# reordering — per-card identity is never assumed; stated in caveats).
+# overhead_pct is signed so that POSITIVE always means "virtualized is worse":
+# higher-better metrics use (bare-virt)/bare, lower-better use (virt-bare)/bare.
+# Noise guards mirror compare_gpus: no flag when either side's successful
+# request count is below compare_min_samples, or when a rate is below the
+# absolute throughput floor. A missing/zero bare-metal value skips the row.
+- name: Reset baseline-delta accumulators
+  ansible.builtin.set_fact:
+    _cb_rows: []
+    _cb_specs: []
+    _cb_caveats: []
+    _cb_bm_gpus: >-
+      {{ _baseline.hosts | default({}) | dict2items
+         | map(attribute='value.gpus') | select('defined') | flatten }}
+
+# --- hardware specs (bare side from baseline.gpus, virt side from health) ---
+- name: Build hardware comparison specs
+  ansible.builtin.set_fact:
+    _cb_specs: >-
+      {{ _cb_specs + ([{
+        'metric': item.label, 'better': item.better,
+        'bare': (_bare_vals | max) if (_bare_vals | length > 0) else '',
+        'virt': (_virt_vals | max) if (_virt_vals | length > 0) else '',
+        'samples_guard': true, 'floor_guard': true
+      }]) }}
+  loop:
+    - {label: 'cuBLAS GFLOP/s', better: higher, bkey: cublas_gflops, vlist: cublas, vkey: gflops}
+    - {label: 'PCIe H2D GB/s', better: higher, bkey: pcie_h2d_gbs, vlist: pcie_bw, vkey: h2d_gbs}
+    - {label: 'PCIe D2H GB/s', better: higher, bkey: pcie_d2h_gbs, vlist: pcie_bw, vkey: d2h_gbs}
+  loop_control:
+    label: "{{ item.label }}"
+  vars:
+    _bare_vals: >-
+      {{ _cb_bm_gpus | map(attribute=item.bkey) | map('string')
+         | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list }}
+    _virt_vals: >-
+      {{ _post_health_hosts | default([]) | map(attribute=item.vlist) | select('defined')
+         | reject('mapping') | flatten | map(attribute=item.vkey) | map('string')
+         | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list }}
+
+# --- LLM specs, per model present on BOTH sides ---
+- name: Build LLM comparison specs
+  ansible.builtin.set_fact:
+    _cb_specs: >-
+      {{ _cb_specs
+         + ([_spec_otps] if ((_b_otps | length > 0) or (_v_otps | length > 0)) else [])
+         + ([_spec_thr] if ((_b_thr | length > 0) or (_v_thr | length > 0)) else [])
+         + ([_spec_ttft] if ((_b_ttft | length > 0) or (_v_ttft | length > 0)) else []) }}
+  loop: "{{ _cb_models }}"
+  loop_control:
+    loop_var: _cb_model
+    label: "{{ _cb_model }}"
+  vars:
+    _cb_models: >-
+      {{ _post_llm | default({}) | dict2items | map(attribute='value')
+         | selectattr('model', 'defined') | map(attribute='model') | unique | list }}
+    _bare_pg: >-
+      {{ _baseline.hosts | default({}) | dict2items | map(attribute='value.llm') | select('defined')
+         | map('dict2items') | flatten | selectattr('key', 'eq', _cb_model)
+         | map(attribute='value.per_gpu') | select('defined') | flatten
+         | selectattr('metrics', 'defined') | map(attribute='metrics') | list }}
+    _virt_pg: >-
+      {{ _post_llm | default({}) | dict2items | map(attribute='value')
+         | selectattr('model', 'defined') | selectattr('model', 'eq', _cb_model)
+         | map(attribute='per_gpu') | select('defined') | flatten
+         | selectattr('metrics', 'defined') | map(attribute='metrics') | list }}
+    # tok/s from the stored headline AND the stored sweep maxima: the peak of
+    # the load curve is the stable capacity number (headline semantics changed
+    # to it in parse_guidellm), and reading the sweep here keeps OLD baselines
+    # comparable under the new semantics without re-running the pre phase.
+    _b_sw: "{{ _bare_pg | map(attribute='sweep') | select('defined') | flatten | map(attribute='output_tok_s') | map('string') | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list }}"
+    _v_sw: "{{ _virt_pg | map(attribute='sweep') | select('defined') | flatten | map(attribute='output_tok_s') | map('string') | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list }}"
+    _b_otps: >-
+      {{ (_bare_pg | map(attribute='output_tok_s_saturated') | map('string') | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list)
+         + _b_sw }}
+    _v_otps: >-
+      {{ (_virt_pg | map(attribute='output_tok_s_saturated') | map('string') | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list)
+         + _v_sw }}
+    # sustained rate candidates include sweep-peak / tokens-per-request. The
+    # divisor is DERIVED (per-side stored tokens_per_request, else the
+    # output_tokens= value from the shared profile, else 256) — a hardcoded
+    # 256 would inflate the lift 2x the day someone tunes output_tokens=512.
+    _tpr_profile: >-
+      {{ (gpu_benchmark.guidellm_profile | default('')
+          | regex_search('output_tokens=([0-9]+)', '\1') | default(['256'], true) | first) | int }}
+    _b_tpr: >-
+      {{ (_bare_pg | map(attribute='tokens_per_request') | select('defined') | map('string')
+          | select('match', '^[0-9.]+$') | map('float') | list | first | default(_tpr_profile)) | float }}
+    _v_tpr: >-
+      {{ (_virt_pg | map(attribute='tokens_per_request') | select('defined') | map('string')
+          | select('match', '^[0-9.]+$') | map('float') | list | first | default(_tpr_profile)) | float }}
+    _b_thr: >-
+      {{ (_bare_pg | map(attribute='throughput_req_s_mean') | map('string') | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list)
+         + ([((_b_sw | max) / (_b_tpr | float)) | round(2)] if (_b_sw | length > 0) else []) }}
+    _v_thr: >-
+      {{ (_virt_pg | map(attribute='throughput_req_s_mean') | map('string') | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list)
+         + ([((_v_sw | max) / (_v_tpr | float)) | round(2)] if (_v_sw | length > 0) else []) }}
+    _b_ttft: "{{ _bare_pg | map(attribute='ttft_p95_ms') | map('string') | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list }}"
+    _v_ttft: "{{ _virt_pg | map(attribute='ttft_p95_ms') | map('string') | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list }}"
+    # Untruncated-only virt candidates: when the virt-side BEST comes from a
+    # TRUNCATED sweep it is a lower bound, so an apparent overhead breach is
+    # INCONCLUSIVE (the true value may be within tolerance) — mirrored from
+    # the compare_gpus directional rule. A truncated BARE side needs no
+    # guard: it understates the baseline, so a breach against it is real.
+    # 'in [true,"True"]': ansible 2.18 stringifies stored bools.
+    _virt_pg_ut: >-
+      {{ (_virt_pg | rejectattr('sweep_truncated', 'defined') | list)
+         + (_virt_pg | selectattr('sweep_truncated', 'defined')
+            | rejectattr('sweep_truncated', 'in', [true, 'True']) | list) }}
+    _v_sw_ut: "{{ _virt_pg_ut | map(attribute='sweep') | select('defined') | flatten | map(attribute='output_tok_s') | map('string') | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list }}"
+    _v_otps_ut: >-
+      {{ (_virt_pg_ut | map(attribute='output_tok_s_saturated') | map('string') | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list)
+         + _v_sw_ut }}
+    _v_thr_ut: >-
+      {{ (_virt_pg_ut | map(attribute='throughput_req_s_mean') | map('string') | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list)
+         + ([((_v_sw_ut | max) / (_v_tpr | float)) | round(2)] if (_v_sw_ut | length > 0) else []) }}
+    _v_otps_lb: >-
+      {{ (_v_otps | length > 0)
+         and ((_v_otps_ut | length == 0) or ((_v_otps | max) > (_v_otps_ut | max))) }}
+    _v_thr_lb: >-
+      {{ (_v_thr | length > 0)
+         and ((_v_thr_ut | length == 0) or ((_v_thr | max) > (_v_thr_ut | max))) }}
+    _b_samp: "{{ _bare_pg | map(attribute='requests_successful') | map('string') | select('match', '^[0-9]+$') | map('int') | list }}"
+    _v_samp: "{{ _virt_pg | map(attribute='requests_successful') | map('string') | select('match', '^[0-9]+$') | map('int') | list }}"
+    _samples_ok: >-
+      {{ ((_b_samp | min) if (_b_samp | length > 0) else 0) >= (gpu_benchmark.compare_min_samples | default(30) | int)
+         and ((_v_samp | min) if (_v_samp | length > 0) else 0) >= (gpu_benchmark.compare_min_samples | default(30) | int) }}
+    _thr_floor_ok: >-
+      {{ ((_b_thr | max) if (_b_thr | length > 0) else 0.0) | float
+         >= (gpu_benchmark.compare_min_throughput_req_s | default(1.0) | float) }}
+    _spec_otps:
+      metric: "{{ _cb_model }} — output tok/s (peak)"
+      better: higher
+      bare: "{{ (_b_otps | max) if (_b_otps | length > 0) else '' }}"
+      virt: "{{ (_v_otps | max) if (_v_otps | length > 0) else '' }}"
+      samples_guard: "{{ _samples_ok }}"
+      floor_guard: true
+      virt_lower_bound: "{{ _v_otps_lb }}"
+    _spec_thr:
+      metric: "{{ _cb_model }} — sustained req/s"
+      better: higher
+      bare: "{{ (_b_thr | max) if (_b_thr | length > 0) else '' }}"
+      virt: "{{ (_v_thr | max) if (_v_thr | length > 0) else '' }}"
+      samples_guard: "{{ _samples_ok }}"
+      floor_guard: "{{ _thr_floor_ok }}"
+      virt_lower_bound: "{{ _v_thr_lb }}"
+    _spec_ttft:
+      metric: "{{ _cb_model }} — TTFT p95 ms (sync)"
+      better: lower
+      bare: "{{ (_b_ttft | min) if (_b_ttft | length > 0) else '' }}"
+      virt: "{{ (_v_ttft | min) if (_v_ttft | length > 0) else '' }}"
+      samples_guard: "{{ _samples_ok }}"
+      # TTFT comes from the sync run — a truncated ladder cannot understate it
+      floor_guard: true
+      virt_lower_bound: false
+
+# --- turn specs into rows with signed overhead and guard-aware verdicts ---
+- name: Build baseline-delta rows
+  ansible.builtin.set_fact:
+    _cb_rows: >-
+      {{ _cb_rows + [{
+        'metric': item.metric,
+        'better': item.better,
+        'baremetal': (_bare | float | round(2)) if (_have_both | bool) else (item.bare if (item.bare | string | length > 0) else ''),
+        'virtualized': (_virt | float | round(2)) if (_have_both | bool) else (item.virt if (item.virt | string | length > 0) else ''),
+        'overhead_pct': (_overhead | float | round(1)) if (_have_both | bool) else '',
+        'ok': _ok | bool,
+        'note': _note
+      }] }}
+  loop: "{{ _cb_specs }}"
+  loop_control:
+    label: "{{ item.metric }}"
+  vars:
+    _have_both: >-
+      {{ (item.bare | string | length > 0) and (item.virt | string | length > 0)
+         and ((item.bare | float) > 0.0) }}
+    _bare: "{{ (item.bare | float) if (_have_both | bool) else 0.0 }}"
+    _virt: "{{ (item.virt | float) if (_have_both | bool) else 0.0 }}"
+    _overhead: >-
+      {{ ((((_bare | float) - (_virt | float)) / (_bare | float) * 100)
+          if (item.better == 'higher')
+          else (((_virt | float) - (_bare | float)) / (_bare | float) * 100))
+         if (_have_both | bool) else 0.0 }}
+    _guards_ok: "{{ (item.samples_guard | bool) and (item.floor_guard | bool) }}"
+    _breach: >-
+      {{ (_have_both | bool) and ((_overhead | float)
+         > (gpu_benchmark.baremetal.baseline_tolerance_pct | default(10) | float)) }}
+    # A virt-side best that is itself a truncated-sweep LOWER BOUND makes an
+    # apparent breach inconclusive (true overhead may be within tolerance) —
+    # same directional rule as compare_gpus.
+    _virt_lb: "{{ item.virt_lower_bound | default(false) | bool }}"
+    _ok: "{{ (not (_breach | bool)) or (not (_guards_ok | bool)) or (_virt_lb | bool) }}"
+    _note: >-
+      {{ ('missing on one side' if (not (_have_both | bool))
+          else (('virtualized side is a lower bound (sweep truncated) — overhead inconclusive') if ((_breach | bool) and (_virt_lb | bool))
+                else ('insufficient sample' if ((_breach | bool) and (not (item.samples_guard | bool)))
+                      else ('below measurement floor' if ((_breach | bool) and (not (item.floor_guard | bool)))
+                            else '')))) }}
+
+- name: Build caveats
+  ansible.builtin.set_fact:
+    _cb_caveats: >-
+      {{ (['Best-vs-best comparison across GPUs on each side — per-card identity across passthrough is not assumed.'])
+         + (['GPU count differs: baseline covers ' ~ _bm_count ~ ' GPU(s), this run benchmarked ' ~ _post_count ~ '.']
+            if ((_bm_count | int) != (_post_count | int)) else [])
+         + (['vLLM version differs between runs (baseline: ' ~ _bm_vllm ~ ', this run: ' ~ _post_vllm ~ ') — overhead numbers include the version delta.']
+            if (_bm_vllm != _post_vllm and (_bm_vllm | length > 0) and (_post_vllm | length > 0)) else [])
+         + (['NVIDIA driver differs between runs (baseline: ' ~ _bm_drv ~ ', this run: ' ~ _post_drv ~ ').']
+            if (_bm_drv != _post_drv and (_bm_drv | length > 0) and (_post_drv | length > 0)) else [])
+         + (['Some load sweeps were TRUNCATED (rate ladder capped by a chaotic probe: '
+             ~ (['baseline'] if (_bm_trunc | length > 0) else []) | union(['this run'] if (_post_trunc | length > 0) else []) | join(' and ')
+             ~ ') — the affected side may understate its true throughput.']
+            if ((_bm_trunc | length > 0) or (_post_trunc | length > 0)) else [])
+         + (['LOAD PROFILE differs between runs (window/concurrency/data changed since the baseline was recorded) — throughput deltas include that difference; re-run the pre phase to refresh the baseline under the current profile.']
+            if ((_bm_profile | length > 0) and (_bm_profile != _cur_profile)) else []) }}
+  vars:
+    _bm_profile: >-
+      {{ _baseline.hosts | default({}) | dict2items | map(attribute='value.load_profile')
+         | select('defined') | select('string') | select('ne', '') | first | default('') | trim }}
+    _cur_profile: >-
+      {{ (gpu_benchmark.guidellm_profile ~ ' --constraint kind=max_duration,seconds='
+          ~ (gpu_benchmark.guidellm_max_duration_s | default(20) | int)) | trim }}
+    _bm_count: "{{ _cb_bm_gpus | length }}"
+    _post_count: >-
+      {{ _post_health_hosts | default([]) | map(attribute='nvidia_smi') | select('defined')
+         | flatten | length }}
+    _bm_versions: >-
+      {{ _baseline.hosts | default({}) | dict2items | map(attribute='value.versions')
+         | select('defined') | select('string') | first | default('') }}
+    _post_versions: >-
+      {{ _post_llm | default({}) | dict2items | map(attribute='value')
+         | selectattr('versions', 'defined') | map(attribute='versions') | first | default('') }}
+    # BASE version only ('0.17.1+cu130' -> '0.17.1'): a +local suffix is the
+    # same engine code in a different CUDA build — not a version mismatch.
+    _bm_vllm: "{{ (_bm_versions | regex_search('vllm Version: ([0-9][^ ]*)', '\\1') | default([''], true) | first).split('+') | first }}"
+    _post_vllm: "{{ (_post_versions | regex_search('vllm Version: ([0-9][^ ]*)', '\\1') | default([''], true) | first).split('+') | first }}"
+    _bm_drv: >-
+      {{ _baseline.hosts | default({}) | dict2items | map(attribute='value.driver_version')
+         | select('defined') | select('string') | select('ne', '') | first | default('') }}
+    _post_drv: >-
+      {{ _post_health_hosts | default([]) | map(attribute='driver_version')
+         | select('defined') | select('ne', '') | first | default('') }}
+    # 'in [true, "True"]': ansible 2.18 stringifies stored bools and the
+    # string 'False' would pass a truthy test. Old baselines lack the key.
+    _bm_trunc: >-
+      {{ _baseline.hosts | default({}) | dict2items | map(attribute='value.llm') | select('defined')
+         | map('dict2items') | flatten | map(attribute='value.per_gpu') | select('defined') | flatten
+         | selectattr('metrics', 'defined') | map(attribute='metrics')
+         | selectattr('sweep_truncated', 'defined')
+         | selectattr('sweep_truncated', 'in', [true, 'True']) | list }}
+    _post_trunc: >-
+      {{ _post_llm | default({}) | dict2items | map(attribute='value')
+         | map(attribute='per_gpu') | select('defined') | flatten
+         | selectattr('metrics', 'defined') | map(attribute='metrics')
+         | selectattr('sweep_truncated', 'defined')
+         | selectattr('sweep_truncated', 'in', [true, 'True']) | list }}
+
+- name: Assemble baseline delta
+  ansible.builtin.set_fact:
+    _baseline_delta:
+      status: "{{ 'flag' if (_cb_rows | rejectattr('ok') | list | length > 0) else 'ok' }}"
+      tolerance_pct: "{{ gpu_benchmark.baremetal.baseline_tolerance_pct | default(10) | float }}"
+      baseline_timestamp: >-
+        {{ _baseline.hosts | default({}) | dict2items | map(attribute='value.timestamp')
+           | select('defined') | first | default('') }}
+      caveats: "{{ _cb_caveats }}"
+      rows: "{{ _cb_rows }}"

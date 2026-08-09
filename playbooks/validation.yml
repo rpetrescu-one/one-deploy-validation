@@ -1,63 +1,113 @@
 ---
 - hosts: all
+  vars:
+    _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
   roles:
     - role: validation_common
+      when: not (_gb_pre | bool)
+
+- hosts: "{{ node_group | d('node') }}"
+  vars:
+    _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
+  tasks:
+    - name: Run bare-metal GPU baseline (pre-deploy phase)
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: baremetal/main.yml
+      when:
+        - _gb_pre | bool
+        - validation.run_gpu_benchmark | d(false)
+      tags:
+        - gpu_benchmark
 
 - hosts: "{{ frontend_group | d('frontend') }}"
+  vars:
+    _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
   roles:
     - role: test_vm
-      when: validation.run_test_vm | d(true)
+      when:
+        - validation.run_test_vm | d(true)
+        - not (_gb_pre | bool)
     - role: storage-benchmark
-      when: validation.run_storage_benchmark | d(true)
+      when:
+        - validation.run_storage_benchmark | d(true)
+        - not (_gb_pre | bool)
     - role: gpu-benchmark
-      when: validation.run_gpu_benchmark | d(false)
+      when:
+        - validation.run_gpu_benchmark | d(false)
+        - not (_gb_pre | bool)
       tags:
         - gpu_benchmark
     - role: ldap_auth
-      when: validation.run_ldap_auth | d(false)
+      when:
+        - validation.run_ldap_auth | d(false)
+        - not (_gb_pre | bool)
       tags:
         - ldap_auth
     - role: validation_frontend
+      when: not (_gb_pre | bool)
     - role: network_validation
-      when: validation.networks_verification | d(true)
+      when:
+        - validation.networks_verification | d(true)
+        - not (_gb_pre | bool)
 
 # Run connectivity tests between virtual machines
 - hosts: "{{ node_group | d('node') }},{{ frontend_group | d('frontend') }}"
   gather_facts: true
+  vars:
+    _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
   roles:
     - role: conn_matrix
-      when: validation.run_conn_matrix | d(true)
+      when:
+        - validation.run_conn_matrix | d(true)
+        - not (_gb_pre | bool)
 
 # Run network tests on the hypervisor hosts
 - hosts: "{{ node_group | d('node') }}"
+  vars:
+    _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
   roles:
     - role: network-benchmark
+      when: not (_gb_pre | bool)
 
 # VM HA Validation
 - hosts: "{{ frontend_group | d('frontend') }}"
+  vars:
+    _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
   tasks:
     - name: VM HA Validation
       include_role:
         name: vm-ha
-      when: validation.run_vm_ha | d(false)
+      when:
+        - validation.run_vm_ha | d(false)
+        - not (_gb_pre | bool)
 
 # Cleanup the test VMs
 - hosts: "{{ frontend_group | d('frontend') }}"
+  vars:
+    _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
   roles:
     - role: cleanup_test_vm
+      when: not (_gb_pre | bool)
 
 # Will launch validation framework on the frontends
 - hosts: "{{ frontend_group | d('frontend') }}"
+  vars:
+    _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
   roles:
     - role: validation
+      when: not (_gb_pre | bool)
 
 # Will launch OneFlow Smoke test
 - hosts: "{{ frontend_group | d('frontend') }}"
+  vars:
+    _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
   tasks:
     - block:
         - name: Run OneFlow validation
           import_role:
             name: oneflow_validation
+          when: not (_gb_pre | bool)
       rescue:
         - debug:
             msg: "OneFlow role failed, continue with the rest"
@@ -67,17 +117,24 @@
 
 # Run FE HA verification only when variable run_fe_ha is set to true
 - hosts: "{{ frontend_group | d('frontend') }}"
+  vars:
+    _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
   roles:
     - role: fe_ha
-      when: validation.run_fe_ha | d(false)
+      when:
+        - validation.run_fe_ha | d(false)
+        - not (_gb_pre | bool)
 
 # Run Federation validation when variable run_federation is set to true
 - hosts: "{{ frontend_group | d('frontend') }}"
+  vars:
+    _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
   roles:
     - role: federation
-      when: validation.run_federation | d(false)
+      when:
+        - validation.run_federation | d(false)
+        - not (_gb_pre | bool)
 
-# Render verification report
 - hosts: localhost
   gather_facts: false
   become: false
@@ -87,6 +144,7 @@
     report_pdf: "/tmp/cloud_verification_report_{{ report_name }}.pdf"
     report_css: "/tmp/print_fix_{{ report_name }}.css"
     report_frontend_host: "{{ groups[frontend_group | d('frontend')][0] }}"
+    _gb_pre: "{{ (gpu_benchmark_phase | d((hostvars[report_frontend_host].gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
     report_verification_result: "{{ hostvars[report_frontend_host].verification_result | default({'No verification results were found': 'N/A'}) }}"
     report_verification_comments: "{{ hostvars[report_frontend_host].verification_comments | default({}) }}"
     report_network_verification_results: "{{ hostvars[report_frontend_host].network_verification_results | default({'No Network verification results were found': {'N/A':'N/A'}}) }}"
@@ -138,12 +196,28 @@
       loop_control:
         label: "{{ item }}"
 
-    - name: Collect GPU benchmark results from frontend hosts
+    - name: Collect GPU benchmark results from frontend and node hosts
       ansible.builtin.set_fact:
         gpu_benchmark_results: "{{ gpu_benchmark_results | default({}) | combine(hostvars[item].gpu_benchmark_results | default({}), recursive=True) }}"
-      loop: "{{ groups[frontend_group | d('frontend')] }}"
+      loop: "{{ (groups[frontend_group | d('frontend')] + groups[node_group | d('node')]) | unique }}"
       loop_control:
         label: "{{ item }}"
+
+    - name: Fold node-host verification results into the report (bare-metal baseline)
+      ansible.builtin.set_fact:
+        report_verification_result: >-
+          {{ (({} if ((report_verification_result | default({})) == {'No verification results were found': 'N/A'})
+              else (report_verification_result | default({}))))
+             | combine(hostvars[item].verification_result | default({})) }}
+        report_verification_comments: >-
+          {{ (report_verification_comments | default({}))
+             | combine(hostvars[item].verification_comments | default({})) }}
+      loop: "{{ groups[node_group | d('node')] }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - _gb_pre | bool
+        - hostvars[item].verification_result is defined
 
     - name: Collect federation results from all frontend hosts
       # Build a map of frontend -> verification_result for federation checks
@@ -177,6 +251,7 @@
       loop: "{{ groups[frontend_group | d('frontend')] }}"
       loop_control:
         label: "{{ item }}"
+      when: not (_gb_pre | bool)
 
     - name: Build hypervisor architecture inventory context
       ansible.builtin.set_fact:
@@ -191,6 +266,7 @@
       loop: "{{ groups[node_group | d('node')] }}"
       loop_control:
         label: "{{ item }}"
+      when: not (_gb_pre | bool)
 
     - name: Discover OpenNebula architecture for report
       ansible.builtin.shell: |
@@ -562,11 +638,13 @@
       register: report_architecture_cmd
       changed_when: false
       failed_when: false
+      when: not (_gb_pre | bool)
 
     - name: Parse architecture discovery result
       ansible.builtin.set_fact:
         discovered_report_architecture: "{{ report_architecture_cmd.stdout | trim | from_json }}"
       when:
+        - not (_gb_pre | bool)
         - report_architecture_cmd.stdout is defined
         - report_architecture_cmd.stdout | trim | length > 0
 

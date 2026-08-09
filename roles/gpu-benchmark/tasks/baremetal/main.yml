@@ -1,0 +1,142 @@
+---
+# BARE-METAL GPU baseline (gpu_benchmark.phase=pre). Runs DIRECTLY on a node
+# host's OS before the OpenNebula deploy — no OpenNebula, no VM, no
+# passthrough. Same hardware tests and the SAME GuideLLM load profile as the
+# post-deploy phase (shared gpu_benchmark.guidellm_profile), so the two runs
+# are directly comparable; results are saved on the controller as
+# <inventory_dir>/gpu_baseline.json for the post phase to load.
+#
+# Invasiveness contract: everything this flow puts on the host is tracked in
+# _bm_installed_pkgs / _bm_keyring_added / the workdir, and cleanup.yml (in
+# the always block, so it runs on failure too) removes exactly that —
+# anything that pre-existed (driver, toolkit, dcgm) is used but never touched.
+- name: Merge gpu_benchmark config over role defaults (bare-metal)
+  ansible.builtin.set_fact:
+    gpu_benchmark: "{{ _gpu_benchmark_defaults | combine(gpu_benchmark | default({}), recursive=True) }}"
+
+# hosts: 'all' => every node host; [] => the first one; a list => as given;
+# a bare string 'n1' is wrapped, NOT split into characters by | list. The
+# config value is read INLINE (no intermediate templated var: ansible-core
+# 2.18 would stringify it and 'is string' would misfire).
+- name: Resolve bare-metal target hosts
+  ansible.builtin.set_fact:
+    _bm_targets: >-
+      {{ (groups[node_group | d('node')])
+         if ((gpu_benchmark.baremetal.hosts is string)
+             and (gpu_benchmark.baremetal.hosts == 'all'))
+         else (([gpu_benchmark.baremetal.hosts]
+                if (gpu_benchmark.baremetal.hosts is string)
+                else (gpu_benchmark.baremetal.hosts | list))
+               if ((gpu_benchmark.baremetal.hosts | length) > 0)
+               else ([groups[node_group | d('node')] | first])) }}
+
+- name: Bare-metal GPU baseline on {{ inventory_hostname }}
+  when: inventory_hostname in _bm_targets
+  block:
+    - name: Reset bare-metal facts
+      ansible.builtin.set_fact:
+        _bm_installed_pkgs: []
+        _bm_keyring_added: false
+        _bm_wd: "{{ gpu_benchmark.baremetal.workdir }}"
+        _gpu_health_hosts: []
+        _llm: {}
+        _bm_failed: false
+
+    - name: Preflight (GPU inventory, driver detection, manifest)
+      ansible.builtin.include_tasks: baremetal/preflight.yml
+
+    - name: Hardware diagnostics (nvidia-smi, cuBLAS, PCIe, DCGM)
+      ansible.builtin.include_tasks: baremetal/hardware.yml
+
+    - name: LLM benchmark per model
+      ansible.builtin.include_tasks: baremetal/llm_model.yml
+      loop: "{{ gpu_benchmark.models }}"
+      loop_control:
+        loop_var: _model
+        label: "{{ _model }}"
+
+    # aggregate_status reads the _gpu_health FACT (post-flow shape) — build it
+    # from the bare-metal host entries so hardware flags reach the verdict.
+    - name: Assemble health fact for aggregation
+      ansible.builtin.set_fact:
+        _gpu_health:
+          hosts: "{{ _gpu_health_hosts }}"
+          nvidia_ok: "{{ (_gpu_health_hosts | map(attribute='nvidia_ok') | select('eq', false) | list | length) == 0 }}"
+
+    - name: Aggregate status
+      ansible.builtin.include_tasks: lib/aggregate_status.yml
+
+    - name: Record bare-metal result
+      ansible.builtin.set_fact:
+        gpu_benchmark_results: >-
+          {{ gpu_benchmark_results | default({}) | combine({
+            (inventory_hostname ~ ' (bare-metal baseline)'): {
+              'discovery': {'gpu_count': _bm_gpu_count | int,
+                            'hosts': [{'host_id': 0, 'gpu_count': _bm_gpu_count | int}]},
+              'gpu_health': {'hosts': _gpu_health_hosts,
+                             'driver_version': (_gpu_health_hosts | first | default({})).driver_version | default(''),
+                             'cuda_version': (_gpu_health_hosts | first | default({})).cuda_version | default(''),
+                             'nvidia_ok': (_gpu_health_hosts | map(attribute='nvidia_ok') | select('eq', false) | list | length) == 0},
+              'llm': _llm,
+              'status': _cluster_status,
+              'meta': {
+                'phase': 'pre',
+                'timestamp': ('%Y-%m-%dT%H:%M:%S' | strftime),
+                'appliance_template_id': '',
+                'driver_version': (_gpu_health_hosts | first | default({})).driver_version | default(''),
+                'cuda_version': (_gpu_health_hosts | first | default({})).cuda_version | default(''),
+                'models': gpu_benchmark.models,
+                'thresholds': gpu_benchmark.thresholds,
+                'reference': gpu_benchmark.reference | default({}),
+                'llm_variance_pct': gpu_benchmark.llm_variance_pct,
+                'rate_window_s': (gpu_benchmark.guidellm_max_duration_s | default(20) | int),
+                'load_profile': ('GuideLLM sweep, synthetic chat load (512 prompt / 256 output tokens, '
+                  ~ (gpu_benchmark.guidellm_max_duration_s | default(20) | int)
+                  ~ ' s per rate; first request per rate excluded as warmup) — BARE-METAL host run (no virtualization)')
+              }
+            }
+          }) }}
+
+    - name: Save baseline reference on the controller
+      ansible.builtin.include_tasks: baremetal/baseline_save.yml
+
+    - name: Record verification status
+      ansible.builtin.set_fact:
+        verification_result: >-
+          {{ verification_result | default({}) | combine({
+            'GPU baseline (bare-metal, pre-deploy)':
+              ('failed - benchmark produced no results' if _cluster_status == 'failed'
+               else ('warning - anomalies flagged' if _cluster_status == 'flag' else 'ok'))
+          }) }}
+
+  rescue:
+    # Keep whatever completed (hardware data survives an LLM failure) and
+    # record the cause; cleanup still runs via always.
+    - name: Record bare-metal failure
+      ansible.builtin.set_fact:
+        _bm_failed: true
+        gpu_benchmark_results: >-
+          {{ gpu_benchmark_results | default({}) | combine({
+            (inventory_hostname ~ ' (bare-metal baseline)'): {
+              'discovery': {'gpu_count': _bm_gpu_count | default(0) | int,
+                            'hosts': [{'host_id': 0, 'gpu_count': _bm_gpu_count | default(0) | int}]},
+              'gpu_health': {'hosts': _gpu_health_hosts | default([])},
+              'llm': _llm | default({}),
+              'status': 'failed',
+              'error': (ansible_failed_result.msg | default('unknown error') | string | truncate(300, true)),
+              'meta': {'phase': 'pre', 'timestamp': ('%Y-%m-%dT%H:%M:%S' | strftime),
+                       'models': gpu_benchmark.models}
+            }
+          }) }}
+      no_log: true
+
+    - name: Record verification status (failure)
+      ansible.builtin.set_fact:
+        verification_result: >-
+          {{ verification_result | default({}) | combine({
+            'GPU baseline (bare-metal, pre-deploy)': 'failed - see report'
+          }) }}
+
+  always:
+    - name: Clean the host (remove everything this run added)
+      ansible.builtin.include_tasks: baremetal/cleanup.yml

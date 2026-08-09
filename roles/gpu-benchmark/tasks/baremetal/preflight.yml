@@ -1,0 +1,220 @@
+---
+# Bare-metal preflight: what GPUs does the host have, what is already
+# installed (the MANIFEST — cleanup removes only what we add on top), and is
+# there a working NVIDIA driver (install it if allowed and missing).
+# Sentinel-guarded: cleanup will `rm -rf` this path, so REFUSE to adopt a
+# pre-existing non-empty directory that is not ours (a mis-set workdir like
+# /root would otherwise be deleted at cleanup).
+- name: Create the working directory (everything we add lives under it)
+  ansible.builtin.shell: |
+    if [ -d "{{ _bm_wd }}" ] && [ -n "$(ls -A '{{ _bm_wd }}' 2>/dev/null)" ] && [ ! -f "{{ _bm_wd }}/.gpu-bench-workdir" ]; then
+      echo "WORKDIR_CONFLICT"; exit 42
+    fi
+    mkdir -p "{{ _bm_wd }}"
+    chmod 700 "{{ _bm_wd }}"
+    touch "{{ _bm_wd }}/.gpu-bench-workdir"
+  register: _bm_wd_guard
+  changed_when: true
+  failed_when: false
+
+- name: Abort on workdir conflict
+  ansible.builtin.fail:
+    msg: >-
+      gpu_benchmark.baremetal.workdir ({{ _bm_wd }}) already exists, is not
+      empty, and was not created by this role — refusing to adopt (cleanup
+      would delete it). Point workdir at a dedicated path.
+  when: "'WORKDIR_CONFLICT' in (_bm_wd_guard.stdout | default(''))"
+
+# The pre phase is for hosts BEFORE the OpenNebula deploy: on a deployed
+# host the GPUs are bound to vfio-pci for passthrough (the driver install
+# cannot claim them) and the run would only litter the OS — hit for real when
+# a stale shell-history command re-ran phase=pre after the deploy.
+- name: Detect an existing OpenNebula installation
+  ansible.builtin.shell: |
+    dpkg -l 'opennebula*' 2>/dev/null | grep -c '^ii' || true
+  register: _bm_one_pkgs
+  changed_when: false
+
+- name: Refuse to run the pre phase on a deployed host
+  ansible.builtin.fail:
+    msg: >-
+      {{ inventory_hostname }} already has OpenNebula installed
+      ({{ _bm_one_pkgs.stdout | trim }} packages) — the bare-metal baseline
+      phase is meant for hosts BEFORE the deploy (GPUs here are typically
+      bound to vfio for passthrough). Run the normal post validation instead
+      (no gpu_benchmark_phase extra var), or set
+      gpu_benchmark.baremetal.allow_on_deployed: true to override.
+  when:
+    - (_bm_one_pkgs.stdout | trim | default('0')) | int > 0
+    - not (gpu_benchmark.baremetal.allow_on_deployed | default(false) | bool)
+
+- name: Inventory NVIDIA GPUs on the PCI bus
+  ansible.builtin.shell: |
+    lspci -Dnn 2>/dev/null | grep -iE 'class \[03(00|02)\]|\[0300\]|\[0302\]' | grep -i '10de' || true
+  register: _bm_lspci
+  changed_when: false
+
+- name: Record GPU count
+  ansible.builtin.set_fact:
+    _bm_gpu_count: "{{ _bm_lspci.stdout_lines | default([]) | length }}"
+
+- name: Fail when the host has no NVIDIA GPUs
+  ansible.builtin.fail:
+    msg: >-
+      No NVIDIA GPUs found on the PCI bus of {{ inventory_hostname }} — nothing
+      to baseline. Check the host or remove it from gpu_benchmark.baremetal.hosts.
+  when: (_bm_gpu_count | int) == 0
+
+# The manifest: presence BEFORE we touch anything. Cleanup purges only
+# packages this run installs (recorded into _bm_installed_pkgs as we go).
+# dcgm_running: cleanup must stop the DCGM engine if WE started it — even
+# when the package pre-existed. autoremove_pending: cleanup only dares
+# `apt-get autoremove` when the host had NOTHING autoremovable beforehand
+# (otherwise it could purge pre-existing packages unrelated to this run).
+- name: Probe pre-existing software (manifest)
+  ansible.builtin.shell: |
+    printf 'driver=%s\n'  "$(command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1 && echo yes || echo no)"
+    printf 'nvcc=%s\n'    "$(command -v nvcc >/dev/null 2>&1 && echo yes || echo no)"
+    printf 'dcgmi=%s\n'   "$(command -v dcgmi >/dev/null 2>&1 && echo yes || echo no)"
+    printf 'venv=%s\n'    "$(python3 -c 'import ensurepip' >/dev/null 2>&1 && echo yes || echo no)"
+    printf 'keyring=%s\n' "$(dpkg -s cuda-keyring >/dev/null 2>&1 && echo yes || echo no)"
+    if systemctl is-active --quiet nvidia-dcgm 2>/dev/null || pgrep -x nv-hostengine >/dev/null 2>&1; then
+      printf 'dcgm_running=yes\n'
+    else
+      printf 'dcgm_running=no\n'
+    fi
+    printf 'autoremove_pending=%s\n' "$(apt-get -s autoremove 2>/dev/null | grep -c '^Remv' || true)"
+  register: _bm_probe
+  changed_when: false
+
+- name: Parse manifest
+  ansible.builtin.set_fact:
+    _bm_had_driver: "{{ 'driver=yes' in _bm_probe.stdout }}"
+    _bm_had_nvcc: "{{ 'nvcc=yes' in _bm_probe.stdout }}"
+    _bm_had_dcgmi: "{{ 'dcgmi=yes' in _bm_probe.stdout }}"
+    _bm_had_venv: "{{ 'venv=yes' in _bm_probe.stdout }}"
+    _bm_had_keyring: "{{ 'keyring=yes' in _bm_probe.stdout }}"
+    _bm_had_dcgm_running: "{{ 'dcgm_running=yes' in _bm_probe.stdout }}"
+    _bm_autoremove_clean: >-
+      {{ (_bm_probe.stdout | regex_search('autoremove_pending=([0-9]+)', '\1')
+          | default(['1'], true) | first | int) == 0 }}
+
+- name: Fail when driver is missing and installs are forbidden
+  ansible.builtin.fail:
+    msg: >-
+      {{ inventory_hostname }} has {{ _bm_gpu_count }} NVIDIA GPU(s) but no
+      working NVIDIA driver, and gpu_benchmark.baremetal.allow_driver_install
+      is false. Install a driver or allow the role to manage one.
+  when:
+    - not (_bm_had_driver | bool)
+    - not (gpu_benchmark.baremetal.allow_driver_install | bool)
+
+# Driver install (temporary — purged at cleanup because it lands in
+# _bm_installed_pkgs). cuda-keyring gives us the official NVIDIA repo for this
+# distro; cuda-drivers is NVIDIA's driver metapackage. Needs egress.
+# failed_when: false + progressive markers: the manifest MUST be recorded from
+# whatever the script got through BEFORE we fail — a keyring added or a
+# half-installed driver on a failed run must still reach cleanup (recording
+# in a task that only runs on success leaks them to the rescue path).
+# DRIVER_PKG_ATTEMPTED is emitted BEFORE apt-get install on purpose: purging
+# a package that failed to install is harmless; leaking one that half
+# installed is not.
+- name: Install NVIDIA driver (will be removed at cleanup)
+  ansible.builtin.shell: |
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    . /etc/os-release
+    DISTRO="${ID}${VERSION_ID//./}"
+    ARCH="$(uname -m)"; if [ "$ARCH" = "aarch64" ]; then ARCH=sbsa; else ARCH=x86_64; fi
+    BASE="https://developer.download.nvidia.com/compute/cuda/repos/${DISTRO}/${ARCH}"
+    if ! dpkg -s cuda-keyring >/dev/null 2>&1; then
+      TMP="$(mktemp -d)"
+      curl -fsSL -m 60 --connect-timeout 10 "${BASE}/cuda-keyring_1.1-1_all.deb" -o "${TMP}/k.deb" || wget -q --timeout=30 --tries=2 -O "${TMP}/k.deb" "${BASE}/cuda-keyring_1.1-1_all.deb"
+      dpkg -i "${TMP}/k.deb"
+      rm -rf "$TMP"
+      echo "KEYRING_ADDED"
+    fi
+    timeout 300 apt-get update >/dev/null
+    echo "DRIVER_PKG_ATTEMPTED"
+    timeout 1200 apt-get install -y cuda-drivers >/dev/null
+    # nouveau (the in-kernel driver) claims the GPUs on a clean install and
+    # blocks the NVIDIA module ("GPU ... is already bound to nouveau", hit on
+    # E2E runs 1-2). Unloading the MODULE is a losing race: something reloads
+    # it within a second even with a modprobe.d blacklist (proven on the test
+    # server). The stable fix, validated by hand on 8x T4: UNBIND the devices
+    # from nouveau at the PCI level — the module may stay loaded but holds no
+    # devices, nothing re-binds them (rebinding needs an explicit bind/probe),
+    # and the NVIDIA probe then claims them cleanly. Blacklist kept as noise
+    # reduction (manifest-tracked, removed at cleanup).
+    if [ ! -f /etc/modprobe.d/gpu-bench-blacklist-nouveau.conf ]; then
+      printf 'blacklist nouveau\noptions nouveau modeset=0\n' > /etc/modprobe.d/gpu-bench-blacklist-nouveau.conf
+      echo "BLACKLIST_ADDED"
+    fi
+    udevadm settle --timeout=30 2>/dev/null || true
+    if [ -d /sys/bus/pci/drivers/nouveau ]; then
+      UNBOUND=0
+      for a in $(ls /sys/bus/pci/drivers/nouveau/ | grep '^0000:'); do
+        echo "$a" > /sys/bus/pci/drivers/nouveau/unbind 2>/dev/null && UNBOUND=$((UNBOUND+1))
+      done
+      if [ "$UNBOUND" -gt 0 ]; then echo "NOUVEAU_UNBOUND=$UNBOUND"; fi
+      if [ "$UNBOUND" -eq 0 ] && ls /sys/bus/pci/drivers/nouveau/ | grep -q '^0000:'; then echo "NOUVEAU_STUCK"; fi
+    fi
+    modprobe nvidia 2>/dev/null || true
+    echo "DRIVER_INSTALLED"
+  args:
+    executable: /bin/bash
+  register: _bm_drv_install
+  changed_when: true
+  failed_when: false
+  when: not (_bm_had_driver | bool)
+
+- name: Record driver install in the manifest (runs on failure too)
+  ansible.builtin.set_fact:
+    _bm_installed_pkgs: >-
+      {{ _bm_installed_pkgs
+         + (['cuda-drivers'] if ('DRIVER_PKG_ATTEMPTED' in (_bm_drv_install.stdout | default(''))) else []) }}
+    _bm_keyring_added: "{{ 'KEYRING_ADDED' in (_bm_drv_install.stdout | default('')) }}"
+    _bm_nouveau_unloaded: "{{ 'NOUVEAU_UNBOUND=' in (_bm_drv_install.stdout | default('')) }}"
+    _bm_blacklist_added: "{{ 'BLACKLIST_ADDED' in (_bm_drv_install.stdout | default('')) }}"
+  when: not (_bm_had_driver | bool)
+
+- name: Abort when the driver install failed (manifest already recorded)
+  ansible.builtin.fail:
+    msg: >-
+      NVIDIA driver install failed on {{ inventory_hostname }} (rc
+      {{ _bm_drv_install.rc | default('?') }}):
+      {{ (_bm_drv_install.stderr | default('') | trim).splitlines() | last
+         | default(_bm_drv_install.stdout | default('no output') | trim | truncate(200, true), true) }}
+      — cleanup will remove what was added.
+  when:
+    - not (_bm_had_driver | bool)
+    - (_bm_drv_install.rc | default(1) | int) != 0
+
+- name: Verify the driver actually claims the GPUs
+  ansible.builtin.shell: |
+    nvidia-smi -L 2>&1 | grep -c '^GPU' || true
+  register: _bm_smi_check
+  changed_when: false
+
+- name: Fail when the driver cannot see the GPUs (with diagnostics)
+  ansible.builtin.shell: |
+    echo "=== nvidia-smi ==="; nvidia-smi -L 2>&1 | head -5
+    echo "=== loaded modules ==="; lsmod | grep -iE 'nvidia|nouveau' || echo none
+    echo "=== dmesg (driver) ==="; dmesg 2>/dev/null | grep -iE 'nvrm|nouveau' | tail -5
+  register: _bm_drv_diag
+  changed_when: false
+  failed_when: false
+  when: (_bm_smi_check.stdout | trim | default('0')) | int == 0
+
+- name: Abort on unusable driver
+  ansible.builtin.fail:
+    msg: >-
+      NVIDIA driver present but no GPU is visible on {{ inventory_hostname }}.
+      {{ 'The GPUs could NOT be unbound from nouveau — blacklist it and
+      reboot, then re-run: echo "blacklist nouveau" >
+      /etc/modprobe.d/blacklist-nouveau.conf && update-initramfs -u && reboot.'
+         if ('NOUVEAU_STUCK' in (_bm_drv_install.stdout | default('')))
+         else 'The kernel module could not claim the devices — a reboot may be
+      required.' }}
+      Diagnostics: {{ (_bm_drv_diag.stdout | default('')) | truncate(400, true) }}
+  when: (_bm_smi_check.stdout | trim | default('0')) | int == 0

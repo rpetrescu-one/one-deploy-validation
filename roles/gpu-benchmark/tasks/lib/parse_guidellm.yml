@@ -1,5 +1,8 @@
 ---
-- name: Select saturated and synchronous benchmarks (by RPS mean)
+# Sort by RPS gives: the sweep display order, the min-RPS fallback for the
+# synchronous run, and the max-RPS row for the drain-burst peak rate. The
+# SATURATED headline itself is selected later by max output tok/s (curve peak).
+- name: Sort benchmarks by achieved RPS (display order and fallbacks)
   ansible.builtin.set_fact:
     _gl_sorted: >-
       {{ _guidellm_report.benchmarks
@@ -38,7 +41,7 @@
         {{ ((_sat_otps | float) / (_sat_outtok | float)) | round(2)
            if ((_sat_otps | string | length > 0) and ((_sat_outtok | default('0') | float) > 0))
            else (_sat.requests_per_second[_s].mean | float | round(2)) }}
-      throughput_req_s_peak: "{{ _sat.requests_per_second[_s].mean | float | round(2) }}"
+      throughput_req_s_peak: "{{ _sat_rps_row.requests_per_second[_s].mean | float | round(2) }}"
       output_tok_s_saturated: "{{ _sat_otps }}"
       req_latency_p95_s: "{{ _syn.request_latency[_s].percentiles.p95 | float }}"
       ttft_p95_ms: "{{ _syn.time_to_first_token_ms[_s].percentiles.p95 | float }}"
@@ -49,12 +52,51 @@
         ttft_p95_ms: "{{ _sat.time_to_first_token_ms[_s].percentiles.p95 | float }}"
         itl_p95_ms: "{{ _sat.inter_token_latency_ms[_s].percentiles.p95 | float }}"
         tpot_p95_ms: "{{ _sat.time_per_output_token_ms[_s].percentiles.p95 | float }}"
+        # The PEAK row's own sample count — the honest denominator for
+        # judging the peak-derived throughput (the whole-sweep total above
+        # includes rows the headline no longer comes from).
+        requests_ok: "{{ ((_sat.request_totals | default({})).successful | default(0)) | int }}"
+      # Tokens-per-request the sustained rate was computed with — consumers
+      # (compare_baseline sweep-lift) must divide by the SAME number.
+      tokens_per_request: "{{ (_sat_outtok | default('256', true)) if ((_sat_outtok | string | length) > 0) else 256 }}"
       requests_successful: "{{ _llm_sweep | map(attribute='requests_ok') | map('string') | select('ne', '') | map('int') | sum }}"
       requests_errored: "{{ _llm_sweep | map(attribute='requests_err') | map('string') | select('ne', '') | map('int') | sum }}"
       requests_incomplete: "{{ _llm_sweep | map(attribute='requests_incomplete') | map('string') | select('ne', '') | map('int') | sum }}"
-      saturation_achieved: >-
-        {{ (_tp_by_type | length == 0)
-           or ((((_tp_by_type | first).metrics.request_totals | default({})).successful | default(0) | int) > 0) }}
+      saturation_achieved: "{{ _sat_ok }}"
+      # TRUNCATED SWEEP: guidellm derives the constant-rate ladder from its
+      # throughput probe; a probe that lands in the chaotic low mode (seen
+      # live: 1467 vs 2807 tok/s on identical L40S) caps the whole ladder,
+      # so the curve never reaches its knee — the reported peak is then a
+      # LOWER BOUND on capacity, not a measurement of it. Two signatures,
+      # both restricted to CONCURRENT rows (constant/throughput — the sync
+      # row is single-stream by design) and both requiring the curve to
+      # still RISE >5% into the peak: (a) the peak sits on the
+      # highest-rate row tested; (b) the peak sits on the TOP of the
+      # constant ladder while the probe above it collapsed lower. A failed
+      # probe (saturation not achieved) is NOT truncation — that label
+      # already says the GPU class is too slow for the load, and a re-run
+      # would not change it. When the profile BOUNDS the probe
+      # (max_concurrency= in guidellm_profile), the probe is an orderly
+      # saturated measurement, not an unbounded-queue collapse: the peak
+      # landing on the probe row is then the NORMAL converged shape and
+      # signature (a) is disarmed (measured stable ±0.5% across runs on
+      # L40S). Signature (b) stays armed — a capped probe that still
+      # collapses below the ladder top remains a truncation.
+      sweep_truncated: >-
+        {{ (_sat_ok | bool)
+           and (_sat_otps | string | length > 0)
+           and ((((not (_probe_capped | bool)))
+                 and (_lad_rows | length >= 2)
+                 and (_lad_last | string | length > 0) and ((_lad_last | float) > 0)
+                 and (_lad_prev | string | length > 0) and ((_lad_prev | float) > 0)
+                 and ((_lad_last | float) >= (_sat_otps | float))
+                 and ((_lad_last | float) > ((_lad_prev | float) * 1.05)))
+                or
+                ((_c_rows | length >= 2)
+                 and (_c_last | string | length > 0) and ((_c_last | float) > 0)
+                 and (_c_prev | string | length > 0) and ((_c_prev | float) > 0)
+                 and ((_c_last | float) >= (_sat_otps | float))
+                 and ((_c_last | float) > ((_c_prev | float) * 1.05)))) }}
       sweep: "{{ _llm_sweep }}"
   vars:
     _tp_by_type: >-
@@ -64,7 +106,47 @@
       {{ _gl_sorted | selectattr('config.strategy.type_', 'defined')
          | selectattr('config.strategy.type_', 'eq', 'synchronous') | list }}
     _syn: "{{ (_syn_by_type | first | default(_gl_sorted | first)).metrics }}"
-    _sat: "{{ (_gl_sorted | last).metrics }}"
+    # SATURATED = the PEAK of the load curve (max output tok/s), NOT the
+    # max-RPS row: on a fast GPU the max-RPS row is the 512-concurrent
+    # THROUGHPUT probe measured during overload collapse (queueing, ITL x4),
+    # which under-reports capacity and is chaotic run-to-run (observed on
+    # L40S: headline 1520-2052 while the curve peak sat stably at ~2805).
+    # Falls back to max-RPS when no benchmark reports token rates.
+    _by_otps: >-
+      {{ _gl_sorted | selectattr('metrics.output_tokens_per_second', 'defined')
+         | sort(attribute='metrics.output_tokens_per_second.' ~ gpu_benchmark.guidellm_status ~ '.mean') }}
+    _sat: "{{ ((_by_otps | last).metrics) if (_by_otps | length > 0) else ((_gl_sorted | last).metrics) }}"
+    # The drain-burst peak rate keeps its OLD source (max-RPS row) — the
+    # report note explicitly describes it as the short-window burst.
+    _sat_rps_row: "{{ (_gl_sorted | last).metrics }}"
     _s: "{{ gpu_benchmark.guidellm_status }}"
     _sat_otps: "{{ ((_sat.output_tokens_per_second | default({}))[_s] | default({})).mean | default('') }}"
     _sat_outtok: "{{ ((_sat.output_token_count | default({}))[_s] | default({})).mean | default('') }}"
+    _sat_ok: >-
+      {{ (_tp_by_type | length == 0)
+         or ((((_tp_by_type | first).metrics.request_totals | default({})).successful | default(0) | int) > 0) }}
+    _probe_capped: "{{ 'max_concurrency=' in (gpu_benchmark.guidellm_profile | default('')) }}"
+    # RPS-ascending CONCURRENT rows (constant + throughput probe; rows
+    # without a strategy type — legacy reports — are conservatively
+    # excluded) and the constant-only ladder. Their last two rows feed the
+    # truncation signatures above.
+    _lad_rows: >-
+      {{ _gl_sorted | selectattr('config.strategy.type_', 'defined')
+         | selectattr('config.strategy.type_', 'in', ['constant', 'throughput'])
+         | selectattr('metrics.output_tokens_per_second', 'defined') | list }}
+    _c_rows: >-
+      {{ _gl_sorted | selectattr('config.strategy.type_', 'defined')
+         | selectattr('config.strategy.type_', 'eq', 'constant')
+         | selectattr('metrics.output_tokens_per_second', 'defined') | list }}
+    _lad_last: >-
+      {{ ((((_lad_rows | last).metrics.output_tokens_per_second | default({}))[_s] | default({})).mean | default(''))
+         if (_lad_rows | length > 0) else '' }}
+    _lad_prev: >-
+      {{ (((_lad_rows[-2].metrics.output_tokens_per_second | default({}))[_s] | default({})).mean | default(''))
+         if (_lad_rows | length >= 2) else '' }}
+    _c_last: >-
+      {{ ((((_c_rows | last).metrics.output_tokens_per_second | default({}))[_s] | default({})).mean | default(''))
+         if (_c_rows | length > 0) else '' }}
+    _c_prev: >-
+      {{ (((_c_rows[-2].metrics.output_tokens_per_second | default({}))[_s] | default({})).mean | default(''))
+         if (_c_rows | length >= 2) else '' }}

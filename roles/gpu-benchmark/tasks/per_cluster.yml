@@ -8,6 +8,7 @@
         _appliance_image_id: ""
         _gpu_health: {}
         _llm: {}
+        _baseline_delta: {}
 
     - name: Discover GPUs
       ansible.builtin.include_tasks: discover.yml
@@ -33,6 +34,29 @@
       ansible.builtin.set_fact:
         _appliance_template_id: "{{ _export_template_id }}"
         _appliance_image_id: "{{ _export_image_id }}"
+      when: _gpu_inventory.gpu_count | int > 0
+
+    # The DISK resize in the instantiation context must never SHRINK the OS
+    # disk: OpenNebula rejects SIZE < image size ("SIZE of 40960MB is less
+    # than the image size of 102400MB" — hit with the public-marketplace
+    # service_Vllm appliance, whose image is 100 GB vs the ONEAI one's 8 GB).
+    # Use max(configured vm.disk_mb, actual image size).
+    - name: Query appliance image size (never shrink below it)
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        oneimage show {{ _appliance_image_id }} -j
+        | python3 -c "import json,sys; print(json.load(sys.stdin)['IMAGE']['SIZE'])"
+      register: _appliance_img_size
+      changed_when: false
+      failed_when: false
+      when: _gpu_inventory.gpu_count | int > 0
+
+    - name: Resolve the VM disk size
+      ansible.builtin.set_fact:
+        _appliance_disk_mb: >-
+          {{ [gpu_benchmark.vm.disk_mb | int,
+              (_appliance_img_size.stdout | default('0') | trim | default('0', true) | int)] | max }}
       when: _gpu_inventory.gpu_count | int > 0
 
     - name: Strip USER_INPUTS from the exported template (CLI prompting unusable without TTY)
@@ -100,8 +124,53 @@
       ansible.builtin.include_tasks: llm_benchmark.yml
       when: _gpu_inventory.gpu_count | int > 0
 
+    # Virtualization-overhead comparison against the bare-metal baseline
+    # written by a pre-deploy run (gpu_benchmark_phase=pre). No file => no
+    # comparison, zero impact. ignore_errors + re-default: a CORRUPT baseline
+    # file must degrade to "no comparison" (with a note), never fail the
+    # whole otherwise-successful benchmark into the rescue path.
+    # _raw is-mapping FIRST: ansible-core 2.18 auto-parses a JSON-looking
+    # lookup result into a dict before from_json ever runs.
+    - name: Load bare-metal baseline (if present)
+      ansible.builtin.set_fact:
+        _baseline: >-
+          {{ _raw if (_raw is mapping)
+             else ((_raw | from_json)
+                   if ((_raw | string | length > 0) and ((_raw | from_json) is mapping))
+                   else {}) }}
+      vars:
+        _bl_path: >-
+          {{ (gpu_benchmark.baremetal.baseline_file | default('', true))
+             if (gpu_benchmark.baremetal.baseline_file | default('', true) | length > 0)
+             else ((inventory_dir | default('', true)) ~ '/gpu_baseline.json') }}
+        _raw: "{{ lookup('ansible.builtin.file', _bl_path, errors='ignore') | default('', true) }}"
+      ignore_errors: true
+      register: _baseline_load
+
+    - name: Degrade to no-comparison on an unparseable baseline
+      ansible.builtin.set_fact:
+        _baseline: {}
+        _cluster_note: >-
+          {{ ((_cluster_note | default('') ~ ' ') if (_cluster_note | default('')) else '')
+             ~ 'gpu_baseline.json exists but could not be parsed — virtualization-overhead comparison skipped' }}
+      when: (_baseline_load is failed) or (_baseline is not defined) or (_baseline is not mapping)
+
+    - name: Compare against the bare-metal baseline
+      ansible.builtin.include_tasks: lib/compare_baseline.yml
+      vars:
+        _post_llm: "{{ _llm | default({}) }}"
+        _post_health_hosts: "{{ (_gpu_health | default({})).hosts | default([]) }}"
+      when: (_baseline.hosts | default({}) | length) > 0
+
     - name: Aggregate cluster status
       ansible.builtin.include_tasks: lib/aggregate_status.yml
+
+    # A baseline-tolerance breach flags the cluster (never un-flags anything).
+    - name: Fold baseline verdict into cluster status
+      ansible.builtin.set_fact:
+        _cluster_status: >-
+          {{ 'flag' if (((_baseline_delta | default({})).status | default('ok')) == 'flag'
+                        and _cluster_status == 'ok') else _cluster_status }}
 
     - name: Assemble cluster result
       ansible.builtin.set_fact:
@@ -111,6 +180,7 @@
               'discovery': _gpu_inventory,
               'gpu_health': _gpu_health | default({}),
               'llm': _llm | default({}),
+              'baseline_delta': _baseline_delta | default({}),
               'note': _cluster_note | default(''),
               'status': _cluster_status,
               'meta': {

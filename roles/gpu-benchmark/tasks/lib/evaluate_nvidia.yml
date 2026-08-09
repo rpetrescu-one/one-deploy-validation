@@ -34,9 +34,17 @@
          or ((_thr_is_hex | bool) and (_thr_bad_bits | int == 0)) }}
     _pw_cur: "{{ _g.pcie_width_current | default('') | trim }}"
     _pw_max: "{{ _g.pcie_width_max | default('') | trim }}"
+    # pcie_expected_width (inventory knob, default null): platforms that wire
+    # GPUs below the card's max BY DESIGN (AWS g4dn: T4 at x8 of x16) declare
+    # it so the known-good width does not raise an issue; anything BELOW the
+    # declared width still does. String-based null test on purpose: 2.18
+    # stringifies task vars, so `is none` on the intermediate var misfires.
+    _pw_expected: "{{ gpu_benchmark.pcie_expected_width | default('', true) }}"
     _pcie_bad: >-
       {{ (_pw_cur is match('^[0-9]+$')) and (_pw_max is match('^[0-9]+$'))
-         and ((_pw_cur | int) < (_pw_max | int)) }}
+         and ((_pw_cur | int) < (_pw_max | int))
+         and ((not (_pw_expected | string is match('^[0-9]+$')))
+              or ((_pw_cur | int) < (_pw_expected | int))) }}
     _gpu_issues: >-
       {{ (['GPU ' ~ _g.index ~ ' uncorrected ECC errors: ' ~ _ecc_val] if (_ecc_bad | bool) else [])
          + (['GPU ' ~ _g.index ~ ' throttled: ' ~ _thr_val] if (not (_thr_ok | bool)) else [])

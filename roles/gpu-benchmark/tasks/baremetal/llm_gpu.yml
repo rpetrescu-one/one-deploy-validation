@@ -1,0 +1,226 @@
+---
+# One bare-metal LLM benchmark on a SINGLE GPU (_gpu), pinned via
+# CUDA_VISIBLE_DEVICES with tensor-parallel 1 — the direct-on-host mirror of
+# llm_benchmark_gpu.yml (same sequence, same shared GuideLLM profile, same
+# parsers), so pre and post numbers are comparable. Appends to
+# _model_gpu_results. The ssh-pipe-hang discipline applies unchanged: the
+# ansible connection is ssh, so every forking program writes to FILES.
+- name: Benchmark model {{ _model }} on GPU {{ _gpu }} (bare-metal)
+  block:
+    # numactl prefix pins BOTH the server and the load generator to the NUMA
+    # node of the GPU under test — an unpinned multi-socket run measures
+    # scheduler luck (same L40S: 1660 vs 2685 tok/s purely on placement).
+    # Empty prefix when pinning is off, numactl is unavailable, or the node
+    # is unknown (-1).
+    - name: Reset per-GPU facts
+      ansible.builtin.set_fact:
+        _power: {}
+        _numa_prefix: >-
+          {{ ('numactl --cpunodebind=' ~ _n ~ ' --preferred=' ~ _n ~ ' ')
+             if ((gpu_benchmark.baremetal.numa_pin | bool)
+                 and (_bm_numactl_ok | default(false) | bool)
+                 and ((_n | int) >= 0))
+             else '' }}
+      vars:
+        _n: "{{ (_bm_gpu_numa | default({}))[_gpu | string] | default(-1) }}"
+
+    # Requested-but-inactive pinning silently changes what the baseline
+    # measures — surface it in the report instead.
+    - name: Note when NUMA pinning was requested but is inactive on GPU {{ _gpu }}
+      ansible.builtin.set_fact:
+        verification_comments: >-
+          {{ verification_comments | default({}) | combine({
+            'GPU baseline (bare-metal, pre-deploy)':
+              'NUMA pinning was requested (baremetal.numa_pin) but is INACTIVE on GPU ' ~ _gpu ~
+              ' (numactl unavailable or NUMA node unknown) — the baseline ran unpinned.'
+          }) }}
+      when:
+        - gpu_benchmark.baremetal.numa_pin | bool
+        - _numa_prefix | default('') | length == 0
+
+    # SEPARATE task from the serve below (a pkill in the same compound as the
+    # plain string 'vllm serve' would match itself — see lint_shell.py).
+    - name: Stop any previous vLLM server (frees the port for GPU {{ _gpu }})
+      ansible.builtin.shell: |
+        kill $(cat {{ _bm_wd }}/power_sampler.pid 2>/dev/null) 2>/dev/null || true
+        pkill -f '[v]llm serve' 2>/dev/null || true
+        sleep 5
+        pkill -9 -f '[v]llm serve' 2>/dev/null || true
+        true
+      changed_when: true
+      failed_when: false
+
+    # Detached (nohup, all fds redirected): without it the serve holds this
+    # task's ssh channel for as long as it runs. Binds 127.0.0.1 — a
+    # pre-deploy host must not expose an LLM port to the network.
+    # Folded scalar: same-indent lines join into ONE logical line (the nohup
+    # compound must be single-line so '&' detaches the whole bash -c).
+    - name: Serve {{ _model }} on GPU {{ _gpu }} (bare-metal, TP=1)
+      ansible.builtin.shell: >
+        rm -f {{ _bm_wd }}/vllm_serve.log;
+        nohup bash -c 'source {{ _bm_wd }}/venv/bin/activate &&
+        export HF_HOME={{ _bm_wd }}/hf XDG_CACHE_HOME={{ _bm_wd }}/cache XDG_CONFIG_HOME={{ _bm_wd }}/config &&
+        export TRITON_CACHE_DIR={{ _bm_wd }}/cache/triton TORCHINDUCTOR_CACHE_DIR={{ _bm_wd }}/cache/inductor &&
+        export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES={{ _gpu }} &&
+        {% if gpu_benchmark.hf_token %}export HF_TOKEN={{ gpu_benchmark.hf_token }} &&{% endif %}
+        exec {{ _numa_prefix | default('') }}vllm serve {{ _model }} --host 127.0.0.1 --port {{ gpu_benchmark.vllm_context.api_port }}
+        --gpu-memory-utilization {{ gpu_benchmark.vllm_context.gpu_mem_util }}
+        --max-model-len {{ gpu_benchmark.vllm_context.model_max_length }}
+        --tensor-parallel-size 1' >> {{ _bm_wd }}/vllm_serve.log 2>&1
+        < /dev/null & sleep 2; echo serve-launched
+      register: _serve_start
+      changed_when: true
+      no_log: "{{ (gpu_benchmark.hf_token | length > 0) | bool }}"
+
+    # Poll the endpoint AND the process — fail NOW if the server died (a
+    # crashed serve otherwise burns the whole serve_timeout_s in blind polls).
+    - name: Wait until vLLM is serving (fail fast if it dies) on GPU {{ _gpu }}
+      ansible.builtin.shell: |
+        for i in $(seq 1 {{ (gpu_benchmark.serve_timeout_s | int) // 10 }}); do
+          if curl -sf -m 5 http://127.0.0.1:{{ gpu_benchmark.vllm_context.api_port }}/v1/models >/dev/null 2>&1; then echo serving; exit 0; fi
+          if ! pgrep -f '[v]llm serve' >/dev/null 2>&1; then
+            echo "vLLM server process died during startup on GPU {{ _gpu }} — log tail:"
+            tail -n 15 {{ _bm_wd }}/vllm_serve.log 2>/dev/null
+            exit 2
+          fi
+          sleep 10
+        done
+        echo "vLLM did not start serving within {{ gpu_benchmark.serve_timeout_s }} s"
+        exit 1
+      register: _serve
+      changed_when: false
+
+    # Representative warm-up (~512-token prefill x2), same as the post phase.
+    - name: Warm up on GPU {{ _gpu }} (representative prefill)
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gpu_benchmark.vllm_context.api_port }}/v1/completions"
+        method: POST
+        body_format: json
+        body:
+          model: "{{ _model }}"
+          prompt: "{{ 'benchmark warm up token ' * 100 }}"
+          max_tokens: 8
+        status_code: [200]
+        timeout: 120
+      register: _warmup
+      until: _warmup.status | default(0) == 200
+      retries: 5
+      delay: 10
+      loop: [1, 2]
+      loop_control:
+        label: "warm-up {{ item }}"
+
+    - name: Start power sampler for GPU {{ _gpu }}
+      ansible.builtin.shell: |
+        rm -f {{ _bm_wd }}/power_g{{ _gpu }}.csv {{ _bm_wd }}/power_sampler.pid
+        nohup bash -c 'while true; do nvidia-smi -i {{ _gpu }} --query-gpu=power.draw,clocks.sm,temperature.gpu --format=csv,noheader,nounits >> {{ _bm_wd }}/power_g{{ _gpu }}.csv; sleep {{ gpu_benchmark.power_sampling.interval_s | int }}; done' > /dev/null 2>&1 < /dev/null &
+        echo $! > {{ _bm_wd }}/power_sampler.pid
+      changed_when: true
+      failed_when: false
+      when: gpu_benchmark.power_sampling.enabled | bool
+
+    # SAME shared profile as the post phase (gpu_benchmark.guidellm_profile) —
+    # the whole point of the baseline. Output to a file: guidellm's
+    # multiprocessing workers must never hold this task's channel.
+    - name: Run GuideLLM benchmark on GPU {{ _gpu }} (bare-metal)
+      ansible.builtin.shell: |
+        source {{ _bm_wd }}/venv/bin/activate
+        export HF_HOME={{ _bm_wd }}/hf XDG_CACHE_HOME={{ _bm_wd }}/cache XDG_CONFIG_HOME={{ _bm_wd }}/config
+        export TRITON_CACHE_DIR={{ _bm_wd }}/cache/triton TORCHINDUCTOR_CACHE_DIR={{ _bm_wd }}/cache/inductor
+        {{ _numa_prefix | default('') }}guidellm run --backend 'kind=openai_http,target=http://127.0.0.1:{{ gpu_benchmark.vllm_context.api_port }},model={{ _model }}' {{ gpu_benchmark.guidellm_profile }} --constraint kind=max_duration,seconds={{ gpu_benchmark.guidellm_max_duration_s | default(20) | int }} --tokenizer 'kind=huggingface_auto,model={{ _model }}' --output 'kind=json,path={{ _bm_wd }}/result_g{{ _gpu }}.json' --disable-console-interactive > {{ _bm_wd }}/guidellm_g{{ _gpu }}.log 2>&1 < /dev/null
+        rc=$?
+        tail -c 8000 {{ _bm_wd }}/guidellm_g{{ _gpu }}.log
+        exit $rc
+      args:
+        executable: /bin/bash
+      register: _bench
+      changed_when: true
+
+    - name: Stop power sampler and read samples for GPU {{ _gpu }}
+      ansible.builtin.shell: |
+        kill $(cat {{ _bm_wd }}/power_sampler.pid 2>/dev/null) 2>/dev/null || true
+        rm -f {{ _bm_wd }}/power_sampler.pid
+        cat {{ _bm_wd }}/power_g{{ _gpu }}.csv 2>/dev/null
+        true
+      register: _power_csv_out
+      changed_when: true
+      failed_when: false
+      when: gpu_benchmark.power_sampling.enabled | bool
+
+    - name: Parse power samples for GPU {{ _gpu }}
+      ansible.builtin.include_tasks: lib/parse_power.yml
+      vars:
+        _power_csv: "{{ _power_csv_out.stdout | default('') }}"
+      when: gpu_benchmark.power_sampling.enabled | bool
+
+    - name: Read the GuideLLM JSON report for GPU {{ _gpu }}
+      ansible.builtin.command: cat {{ _bm_wd }}/result_g{{ _gpu }}.json
+      register: _gl_json
+      changed_when: false
+
+    - name: Parse GuideLLM metrics for GPU {{ _gpu }}
+      ansible.builtin.include_tasks: lib/parse_guidellm.yml
+      vars:
+        _guidellm_report: "{{ _gl_json.stdout | from_json }}"
+
+    - name: Resolve SLO thresholds for GPU {{ _gpu }}
+      ansible.builtin.include_tasks: lib/resolve_thresholds.yml
+      vars:
+        _gpu_name: >-
+          {{ ((_nvidia_smi | default([]))[_gpu | int]
+              | default(_nvidia_smi | default([]) | first | default({}))).name | default('') }}
+
+    - name: Evaluate metrics for GPU {{ _gpu }} against SLO thresholds
+      ansible.builtin.include_tasks: lib/evaluate_llm.yml
+      vars:
+        _eval_thresholds: "{{ _resolved_thresholds }}"
+        _eval_thresholds_source: "{{ _resolved_thresholds_source }}"
+
+    # numa_pinned persists WHETHER the pin was actually active (numactl may be
+    # unavailable or the node unknown) — the overhead comparison must be able
+    # to tell a pinned baseline from an unpinned one.
+    - name: Record GPU {{ _gpu }} result
+      ansible.builtin.set_fact:
+        _model_gpu_results: >-
+          {{ _model_gpu_results + [{
+            'gpu': _gpu | int,
+            'metrics': _llm_metrics | combine({
+              'power': _power | default({}),
+              'tokens_per_watt': _tpw,
+              'numa_pinned': (_numa_prefix | default('') | length > 0)
+            }),
+            'evaluation': _llm_eval
+          }] }}
+      vars:
+        _otps: "{{ _llm_metrics.output_tok_s_saturated | default('') }}"
+        _pavg: "{{ (_power | default({})).power_avg_w | default('') }}"
+        _tpw: >-
+          {{ (((_otps | float) / (_pavg | float)) | round(2))
+             if ((_otps | string | length > 0) and (_pavg | string | length > 0)
+                 and ((_pavg | float) > 0))
+             else '' }}
+
+  rescue:
+    # The workdir is deleted at cleanup, so failure evidence must live in the
+    # recorded result itself, not in files.
+    - name: Collect failure diagnostics for GPU {{ _gpu }} (best effort)
+      ansible.builtin.shell: |
+        echo "=== vllm_serve.log (tail 30) ==="
+        tail -n 30 {{ _bm_wd }}/vllm_serve.log 2>/dev/null || echo "(missing)"
+        echo "=== guidellm log (tail 30) ==="
+        tail -n 30 {{ _bm_wd }}/guidellm_g{{ _gpu }}.log 2>/dev/null || echo "(missing)"
+      register: _gpu_diag
+      changed_when: false
+      failed_when: false
+
+    - name: Record GPU {{ _gpu }} failure
+      ansible.builtin.set_fact:
+        _model_gpu_results: >-
+          {{ _model_gpu_results + [{
+            'gpu': _gpu | int,
+            'status': 'failed',
+            'error': ((ansible_failed_result.msg | default('error') | string | truncate(300, true))
+                      ~ ' | diagnostics: '
+                      ~ (_gpu_diag.stdout | default('none') | string | truncate(1200, true)))
+          }] }}
+      no_log: true

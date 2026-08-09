@@ -1,0 +1,150 @@
+---
+# Bare-metal LLM benchmark for ONE model: venv (once per host), then each GPU
+# separately — the same structure as the post-deploy llm_benchmark_one.yml,
+# executed directly on the host. The functional API suite is post-only (it
+# validates the DEPLOYMENT's serving stack, not the hardware).
+- name: Reset per-model facts
+  ansible.builtin.set_fact:
+    _model_gpu_results: []
+    _gpu_delta: {}
+    _bm_llm_key: "{{ _model }}"
+
+- name: Benchmark model {{ _model }} (bare-metal)
+  block:
+    # Idempotent: fast when the venv already exists (second model reuses it).
+    # python3-venv is apt-installed only if the module is missing (-> manifest).
+    # failed_when: false + explicit fail AFTER the manifest recording: a pip
+    # failure must not skip recording the apt package we just installed
+    # (cleanup would leak it).
+    - name: Ensure python venv with pinned vLLM + guidellm
+      ansible.builtin.shell: |
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        # ensurepip, NOT the venv module: Ubuntu ships the venv stdlib module
+        # but venv CREATION needs ensurepip from python3-venv (E2E run 3:
+        # "ensurepip is not available ... apt install python3.12-venv").
+        # Capture the EXACT packages apt sets up: purging only the meta
+        # package leaves the real payload (python3.12-venv) behind when
+        # autoremove is skipped (seen on E2E run 4).
+        if ! python3 -c 'import ensurepip' >/dev/null 2>&1; then
+          timeout 300 apt-get update >/dev/null
+          NEWPKGS=$(timeout 300 apt-get install -y python3-venv 2>&1 | grep -oE '^Setting up [a-z0-9.+-]+' | awk '{print $3}' | paste -sd' ' -)
+          echo "VENV_PKG_INSTALLED=${NEWPKGS:-python3-venv}"
+        fi
+        # Python HEADERS too: TorchInductor (torch.compile, on by default in
+        # vLLM) compiles C against Python.h at runtime — on a clean server the
+        # EngineCore dies with InductorError/gcc exit 1 (E2E run 5; fix
+        # validated by hand: serve came up right after python3-dev).
+        if ! python3 -c 'import sysconfig,os,sys; sys.exit(0 if os.path.exists(os.path.join(sysconfig.get_paths()["include"], "Python.h")) else 1)' >/dev/null 2>&1; then
+          timeout 300 apt-get update >/dev/null 2>&1 || true
+          DEVPKGS=$(timeout 300 apt-get install -y python3-dev 2>&1 | grep -oE '^Setting up [a-z0-9.+-]+' | awk '{print $3}' | paste -sd' ' -)
+          echo "DEV_PKG_INSTALLED=${DEVPKGS:-python3-dev}"
+        fi
+        # numactl for NUMA-pinned benchmarking (multi-socket correctness).
+        if [ "{{ gpu_benchmark.baremetal.numa_pin | bool | lower }}" = "true" ] && ! command -v numactl >/dev/null 2>&1; then
+          timeout 300 apt-get update >/dev/null 2>&1 || true
+          NPKGS=$(timeout 300 apt-get install -y numactl 2>&1 | grep -oE '^Setting up [a-z0-9.+-]+' | awk '{print $3}' | paste -sd' ' -)
+          echo "NUMACTL_PKG_INSTALLED=${NPKGS:-numactl}"
+        fi
+        if command -v numactl >/dev/null 2>&1; then echo "NUMACTL_OK"; fi
+        if [ ! -x {{ _bm_wd }}/venv/bin/pip ]; then python3 -m venv {{ _bm_wd }}/venv; fi
+        # --no-cache-dir + XDG redirect: pip/torch otherwise leave GBs in
+        # /root/.cache, which would survive the cleanup (clean-OS violation).
+        export XDG_CACHE_HOME={{ _bm_wd }}/cache XDG_CONFIG_HOME={{ _bm_wd }}/config
+        # transformers<5: vllm 0.10.2 declares only transformers>=4.55.2 (no
+        # upper bound) and pip then resolves a 5.x whose tokenizer API dropped
+        # all_special_tokens_extended -> the serve dies at startup (E2E run 4).
+        # Newer vllm (0.17.x) pins transformers<5 itself, so this stays
+        # compatible with both (verified against PyPI metadata).
+        {{ _bm_wd }}/venv/bin/pip install --quiet --no-cache-dir 'vllm=={{ gpu_benchmark.baremetal.vllm_version }}' 'transformers<5' 'guidellm==0.7.1' > {{ _bm_wd }}/pip.log 2>&1 < /dev/null
+        echo "VENV_READY"
+      args:
+        executable: /bin/bash
+      register: _bm_venv
+      changed_when: true
+      failed_when: false
+
+    - name: Record python3-venv/python3-dev/numactl installs in the manifest (runs on failure too)
+      ansible.builtin.set_fact:
+        _bm_numactl_ok: "{{ 'NUMACTL_OK' in (_bm_venv.stdout | default('')) }}"
+        _bm_installed_pkgs: >-
+          {{ (_bm_installed_pkgs
+              + ((_bm_venv.stdout | default('') | regex_search('VENV_PKG_INSTALLED=([^\n]*)', '\1')
+                  | default([''], true) | first).split())
+              + ((_bm_venv.stdout | default('') | regex_search('DEV_PKG_INSTALLED=([^\n]*)', '\1')
+                  | default([''], true) | first).split())
+              + ((_bm_venv.stdout | default('') | regex_search('NUMACTL_PKG_INSTALLED=([^\n]*)', '\1')
+                  | default([''], true) | first).split()))
+             | select('ne', '') | list | unique }}
+
+    - name: Abort when the venv setup failed (manifest already recorded)
+      ansible.builtin.fail:
+        msg: >-
+          venv/vLLM setup failed on {{ inventory_hostname }} (rc
+          {{ _bm_venv.rc | default('?') }}). pip log tail:
+          {{ (_bm_venv.stdout | default('') | trim) | truncate(200, true) }}
+          {{ (_bm_venv.stderr | default('') | trim) | truncate(300, true) }}
+      when: (_bm_venv.rc | default(1) | int) != 0 or ('VENV_READY' not in (_bm_venv.stdout | default('')))
+
+    - name: Benchmark each GPU (bare-metal)
+      ansible.builtin.include_tasks: baremetal/llm_gpu.yml
+      loop: "{{ range(_bm_bench_gpus | int) | list }}"
+      loop_control:
+        loop_var: _gpu
+        label: "gpu {{ _gpu }}"
+
+    - name: Capture tool versions for the record
+      ansible.builtin.shell: |
+        {{ _bm_wd }}/venv/bin/pip show guidellm vllm 2>/dev/null | grep -E '^(Name|Version):' | paste -sd' ' -
+      register: _tool_versions
+      changed_when: false
+      failed_when: false
+
+    - name: Compute GPU-to-GPU delta for {{ _model }}
+      ansible.builtin.include_tasks: lib/compare_gpus.yml
+      when: (_model_gpu_results | selectattr('metrics', 'defined') | list | length | int) > 1
+
+    - name: Derive model status
+      ansible.builtin.include_tasks: lib/model_status.yml
+      vars:
+        _functional: {}
+
+    - name: Record model result
+      ansible.builtin.set_fact:
+        _llm: >-
+          {{ _llm | combine({_bm_llm_key: {
+            'host_id': 0,
+            'model': _model,
+            'per_gpu': _model_gpu_results | sort(attribute='gpu'),
+            'delta': _gpu_delta | default({}),
+            'functional': {},
+            'provisioning_s': '',
+            'versions': (_tool_versions.stdout | default('') | trim),
+            'status': _model_status
+          }}) }}
+
+  rescue:
+    - name: Record model failure (bare-metal)
+      ansible.builtin.set_fact:
+        _llm: >-
+          {{ _llm | combine({_bm_llm_key: {
+            'host_id': 0,
+            'model': _model,
+            'per_gpu': _model_gpu_results | default([]),
+            'status': 'failed',
+            'error': (ansible_failed_result.msg | default('error'))
+          }}) }}
+      no_log: true
+
+  always:
+    # Free the GPU for the next model (venv and model cache stay for reuse;
+    # cleanup.yml removes them at the end of the whole run).
+    - name: Stop the vLLM server and power sampler
+      ansible.builtin.shell: |
+        kill $(cat {{ _bm_wd }}/power_sampler.pid 2>/dev/null) 2>/dev/null || true
+        pkill -f '[v]llm serve' 2>/dev/null || true
+        sleep 3
+        pkill -9 -f '[v]llm serve' 2>/dev/null || true
+        true
+      changed_when: true
+      failed_when: false

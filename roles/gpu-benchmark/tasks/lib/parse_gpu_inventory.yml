@@ -14,5 +14,5 @@
         _pci_list
         | selectattr('VENDOR', 'defined') | selectattr('VENDOR', 'eq', '10de')
         | selectattr('CLASS', 'defined') | selectattr('CLASS', 'eq', '0302')
-        | json_query('[].{short_address: SHORT_ADDRESS, vendor: VENDOR, device: DEVICE, model: DEVICE_NAME}')
+        | json_query('[].{short_address: SHORT_ADDRESS, vendor: VENDOR, device: DEVICE, model: DEVICE_NAME, numa_node: NUMA_NODE}')
       }}

@@ -5,6 +5,7 @@
     _gpu_delta: {}
     _functional: {}
     _provision_s: ""
+    _tool_versions: {}
     _prov_start: "{{ lookup('pipe', 'date +%s') }}"
     _llm_pci_count: >-
       {{ (_llm_host.gpu_count | int)
@@ -25,7 +26,8 @@
           model_id: "{{ _model }}"
           vm_name: "gpu-bench-{{ _model | regex_replace('[^A-Za-z0-9._-]', '_') }}-h{{ _llm_host.host_id }}{{ current_cluster.name_suffix }}"
           image_id: "{{ _appliance_image_id | default('') }}"
-          disk_size_mb: "{{ gpu_benchmark.vm.disk_mb }}"
+          disk_size_mb: "{{ _appliance_disk_mb | default(gpu_benchmark.vm.disk_mb) }}"
+          pin_policy: "{{ gpu_benchmark.vm.pin_policy | default('') }}"
 
     - name: Wait for SSH on the model VM
       become: true

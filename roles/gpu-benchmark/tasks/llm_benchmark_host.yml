@@ -1,6 +1,9 @@
 ---
+# vm_per_gpu chooses the flow: default = ONE VM with all of the host's GPUs
+# (llm_benchmark_one.yml); per-GPU-VM = one pinned VM per GPU
+# (llm_benchmark_one_pervm.yml). Both share the same per-GPU engine and libs.
 - name: Benchmark each model on host {{ _llm_host.host_id }}
-  ansible.builtin.include_tasks: llm_benchmark_one.yml
+  ansible.builtin.include_tasks: "{{ 'llm_benchmark_one_pervm.yml' if (gpu_benchmark.vm_per_gpu | default(false) | bool) else 'llm_benchmark_one.yml' }}"
   loop: "{{ gpu_benchmark.models }}"
   loop_control:
     loop_var: _model

@@ -8,9 +8,25 @@ NIC = [ NETWORK="{{ _ctx.vnet }}" ]
 {% if _ctx.host_id is defined %}
 SCHED_REQUIREMENTS = "ID=\"{{ _ctx.host_id }}\""
 {% endif %}
+{# vm_per_gpu mode attaches ONE exact device by address; the default mode
+   requests pci_count generic NVIDIA GPUs and lets the scheduler pick. #}
+{% if _ctx.pci_address is defined and (_ctx.pci_address | string | length > 0) %}
+PCI = [ SHORT_ADDRESS="{{ _ctx.pci_address }}" ]
+{% else %}
 {% for i in range(_ctx.pci_count | int) %}
 PCI = [ VENDOR="10de", CLASS="0302" ]
 {% endfor %}
+{% endif %}
+{# NUMA placement — MUTUALLY EXCLUSIVE by OpenNebula design: instantiate
+   rejects the combination with "NUMA node affinity cannot be set for pinned
+   VMs" (hit live on ONE 7.4). When the GPU node is known (vm_per_gpu mode)
+   NODE_AFFINITY wins: it guarantees the locality that matters; PIN_POLICY is
+   emitted only when no node is known. #}
+{% if (_ctx.numa_node is defined) and ((_ctx.numa_node | int(-1)) >= 0) %}
+TOPOLOGY = [ NODE_AFFINITY = "{{ _ctx.numa_node | int }}" ]
+{% elif (_ctx.pin_policy | default('') | string | length) > 0 %}
+TOPOLOGY = [ PIN_POLICY = "{{ _ctx.pin_policy }}" ]
+{% endif %}
 {# OS-disk resize. Must live IN this file: the ONE 7.2 CLI refuses to combine a
    template file with creation options ("conflicting options: disk"), and the
    instantiate merge REPLACES the template's DISK vector, so this is a resize,

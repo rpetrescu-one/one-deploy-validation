@@ -25,7 +25,7 @@
           host_id: "{{ _gpu_host.host_id }}"
           vm_name: "gpu-bench-health-h{{ _gpu_host.host_id }}{{ current_cluster.name_suffix }}"
           image_id: "{{ _appliance_image_id | default('') }}"
-          disk_size_mb: "{{ gpu_benchmark.vm.disk_mb }}"
+          disk_size_mb: "{{ _appliance_disk_mb | default(gpu_benchmark.vm.disk_mb) }}"
 
     - name: Wait for SSH on the health VM
       become: true
@@ -82,7 +82,7 @@
       failed_when: false
       when: (gpu_benchmark.cublas.enabled | bool)
             or (gpu_benchmark.pcie_bw.enabled | bool)
-            or (gpu_benchmark.dcgm.enabled | bool)
+            or ((gpu_benchmark.dcgm.enabled | bool) and (gpu_benchmark.dcgm.run_in_vm | default(true) | bool))
 
     - name: Stage cuBLAS source on the frontend
       ansible.builtin.copy:
@@ -122,10 +122,29 @@
       ansible.builtin.shell: |
         ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }} bash -s <<'REMOTE_EOF'
         set -e
+        # The NVIDIA repo cuda-toolkit package puts nvcc in /usr/local/cuda/bin
+        # (outside the default PATH) — without this the install succeeds and
+        # the compile still dies with nvcc-not-found (hit on bare metal).
+        # NOTE: no apostrophes in heredoc comments (ansible argument splitter).
+        # timeout on every apt call: a throttled repo (observed: NVIDIA CDN at
+        # 5 KB/s on a lab) must become a bounded, recorded skip — not an
+        # hour-long stall of the whole validation.
+        export PATH="/usr/local/cuda/bin:$PATH"
+        export DEBIAN_FRONTEND=noninteractive
         if ! command -v nvcc >/dev/null 2>&1; then
           if [ "{{ gpu_benchmark.cublas.allow_toolkit_install | bool | lower }}" = "true" ]; then
-            apt-get update >/dev/null
-            apt-get install -y cuda-toolkit >/dev/null 2>&1 || apt-get install -y nvidia-cuda-toolkit >/dev/null
+            if [ "{{ gpu_benchmark.vm_apt_https | default(false) | bool | lower }}" = "true" ]; then
+              # port 80 refused upstream / NVIDIA CDN throttled on this
+              # network: switch the VM apt sources to https and prefer the
+              # distro toolkit package over the NVIDIA-repo one.
+              sed -i "s|http://|https://|g" /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+              sed -i "s|http://|https://|g" /etc/apt/sources.list 2>/dev/null || true
+              timeout 300 apt-get update >/dev/null
+              timeout 900 apt-get install -y nvidia-cuda-toolkit >/dev/null 2>&1 || timeout 900 apt-get install -y cuda-toolkit >/dev/null
+            else
+              timeout 300 apt-get update >/dev/null
+              timeout 900 apt-get install -y cuda-toolkit >/dev/null 2>&1 || timeout 900 apt-get install -y nvidia-cuda-toolkit >/dev/null
+            fi
           else
             echo "NVCC_MISSING"; exit 42
           fi
@@ -192,15 +211,30 @@
       ansible.builtin.shell: |
         ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no -oServerAliveInterval=15 -oServerAliveCountMax=4 root@{{ _vm_ip }} bash -s <<'REMOTE_EOF'
         set -e
+        if [ "{{ gpu_benchmark.vm_apt_https | default(false) | bool | lower }}" = "true" ]; then
+          sed -i "s|http://|https://|g" /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+          sed -i "s|http://|https://|g" /etc/apt/sources.list 2>/dev/null || true
+        fi
+        # newest CUDA variant first: a CUDA 13 image needs the -cuda13 DCGM
+        # build (the older ladder without it left such appliances erroring).
         try_install() {
-          apt-get install -y datacenter-gpu-manager >/dev/null 2>&1 && return 0
-          apt-get install -y datacenter-gpu-manager-4-cuda12 >/dev/null 2>&1 && return 0
-          apt-get install -y datacenter-gpu-manager-4-core >/dev/null 2>&1 && return 0
+          timeout 600 apt-get install -y datacenter-gpu-manager-4-cuda13 >/dev/null 2>&1 && return 0
+          timeout 600 apt-get install -y datacenter-gpu-manager-4-cuda12 >/dev/null 2>&1 && return 0
+          timeout 600 apt-get install -y datacenter-gpu-manager >/dev/null 2>&1 && return 0
+          timeout 600 apt-get install -y datacenter-gpu-manager-4-core >/dev/null 2>&1 && return 0
           return 1
+        }
+        start_engine() {
+          systemctl restart nvidia-dcgm >/dev/null 2>&1 </dev/null || (setsid nv-hostengine >/dev/null 2>&1 </dev/null &) || true
+          sleep 3
+        }
+        run_diag() {
+          rc=0
+          timeout --kill-after=30 {{ gpu_benchmark.dcgm.timeout_s | int }} dcgmi diag -r {{ gpu_benchmark.dcgm.level | int }} -j >/root/dcgm_result.json 2>/root/dcgm_result.err </dev/null || rc=$?
         }
         if ! command -v dcgmi >/dev/null 2>&1; then
           if [ "{{ gpu_benchmark.dcgm.allow_install | bool | lower }}" = "true" ]; then
-            apt-get update >/dev/null 2>&1 || true
+            timeout 300 apt-get update >/dev/null 2>&1 || true
             if ! try_install; then
               # DCGM not in the configured repos (the appliance may use Ubuntu
               # nvidia-cuda-toolkit, not the NVIDIA CUDA repo). Add the official
@@ -212,7 +246,7 @@
               TMP="$(mktemp -d)"
               if curl -fsSL "${BASE}/cuda-keyring_1.1-1_all.deb" -o "${TMP}/k.deb" 2>/dev/null || wget -qO "${TMP}/k.deb" "${BASE}/cuda-keyring_1.1-1_all.deb" 2>/dev/null; then
                 dpkg -i "${TMP}/k.deb" >/dev/null 2>&1 || true
-                apt-get update >/dev/null 2>&1 || true
+                timeout 300 apt-get update >/dev/null 2>&1 || true
                 try_install || { echo "DCGM install failed after adding NVIDIA repo (${DISTRO}/${ARCH})"; exit 42; }
               else
                 echo "DCGM repo unreachable for ${DISTRO}/${ARCH} (airgap? set dcgm.enabled=false)"; exit 42
@@ -223,18 +257,25 @@
             echo "dcgmi not installed and dcgm.allow_install is false"; exit 42
           fi
         fi
-        systemctl start nvidia-dcgm >/dev/null 2>&1 </dev/null || (setsid nv-hostengine >/dev/null 2>&1 </dev/null &) || true
-        sleep 3
-        # dcgmi output goes to a FILE, never to this ssh channel. A DCGM diag
-        # plugin/subprocess that lingers after dcgmi exits and inherited the
-        # channel would keep ssh (and this Ansible task) blocked forever — a
-        # full level-3 diag hung the task ~1.5h on the lab even though the diag
-        # itself passed. Writing to a file (then cat) removes dcgmi and its
-        # children from the channel. --kill-after force-KILLs a diag that
-        # ignores SIGTERM at the timeout. Hard timeout so a hung plugin or a
-        # network blip becomes a captured skip, not a stalled playbook.
-        timeout --kill-after=30 {{ gpu_benchmark.dcgm.timeout_s | int }} dcgmi diag -r {{ gpu_benchmark.dcgm.level | int }} -j >/root/dcgm_result.json 2>/root/dcgm_result.err </dev/null
-        rc=$?
+        # dcgmi output goes to a FILE, never to this ssh channel (a lingering
+        # diag child holding the channel blocked this task ~1.5h on the lab).
+        # run_diag uses rc=... || rc=$? so set -e does not abort: dcgmi exits
+        # nonzero when a diagnostic FAILS while still writing a full JSON
+        # report — the file-has-JSON branch below must run for those exits.
+        start_engine
+        run_diag
+        # PRESENT-but-INCOMPATIBLE dcgmi: an appliance can ship an older DCGM
+        # that rejects the installed CUDA (seen live: Detected unsupported
+        # Cuda version on a CUDA 13.1 image). One bounded upgrade attempt via
+        # the ladder above, then retry the diag once.
+        if grep -qi "unsupported cuda" /root/dcgm_result.json /root/dcgm_result.err 2>/dev/null; then
+          if [ "{{ gpu_benchmark.dcgm.allow_install | bool | lower }}" = "true" ]; then
+            timeout 300 apt-get update >/dev/null 2>&1 || true
+            try_install || true
+            start_engine
+            run_diag
+          fi
+        fi
         if [ -s /root/dcgm_result.json ] && head -c1 /root/dcgm_result.json | grep -q '{'; then
           cat /root/dcgm_result.json
           exit 0
@@ -251,7 +292,9 @@
       register: _dcgm_out
       changed_when: true
       failed_when: false
-      when: gpu_benchmark.dcgm.enabled | bool
+      when:
+        - gpu_benchmark.dcgm.enabled | bool
+        - gpu_benchmark.dcgm.run_in_vm | default(true) | bool
 
     - name: Parse DCGM diagnostics
       ansible.builtin.include_tasks: lib/parse_dcgm.yml

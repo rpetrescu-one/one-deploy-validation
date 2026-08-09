@@ -1,9 +1,32 @@
 {
   "PCI_DEVICES": {
     "PCI": [
-      {"SHORT_ADDRESS": "0009:01:00.0", "VENDOR": "10de", "DEVICE": "2941", "CLASS": "0302", "DEVICE_NAME": "GB200", "VMID": "-1"},
-      {"SHORT_ADDRESS": "0019:01:00.0", "VENDOR": "10de", "DEVICE": "2941", "CLASS": "0302", "DEVICE_NAME": "GB200", "VMID": "-1"},
-      {"SHORT_ADDRESS": "0000:00:1f.2", "VENDOR": "8086", "DEVICE": "a352", "CLASS": "0106", "DEVICE_NAME": "SATA", "VMID": "-1"}
+      {
+        "SHORT_ADDRESS": "0009:01:00.0",
+        "VENDOR": "10de",
+        "DEVICE": "2941",
+        "CLASS": "0302",
+        "DEVICE_NAME": "GB200",
+        "VMID": "-1",
+        "NUMA_NODE": "0"
+      },
+      {
+        "SHORT_ADDRESS": "0019:01:00.0",
+        "VENDOR": "10de",
+        "DEVICE": "2941",
+        "CLASS": "0302",
+        "DEVICE_NAME": "GB200",
+        "VMID": "-1",
+        "NUMA_NODE": "1"
+      },
+      {
+        "SHORT_ADDRESS": "0000:00:1f.2",
+        "VENDOR": "8086",
+        "DEVICE": "a352",
+        "CLASS": "0106",
+        "DEVICE_NAME": "SATA",
+        "VMID": "-1"
+      }
     ]
   }
 }

@@ -1,0 +1,105 @@
+---
+# ONE GPU in ITS OWN VM (vm_per_gpu mode): instantiate with the exact PCI
+# device + NUMA affinity, benchmark through the shared per-GPU engine
+# (llm_benchmark_gpu.yml with _cuda_gpu=0 — the VM sees a single GPU, while
+# `_gpu` stays the HOST index for records/labels), then ALWAYS terminate the
+# VM. VM-level failures (instantiate/ssh) are recorded per GPU and do not
+# abort the other GPUs.
+- name: GPU {{ _gpu }} of host {{ _llm_host.host_id }} in its own VM
+  block:
+    # An empty/None SHORT_ADDRESS would fall through to a GENERIC PCI request
+    # in the template — the scheduler could hand this VM a GPU another per-GPU
+    # VM already holds. Refuse instead; the rescue records it per GPU.
+    # default(..., true) catches None (onehost can report the key as NULL),
+    # not just undefined.
+    - name: Refuse to instantiate without an exact PCI address for GPU {{ _gpu }}
+      ansible.builtin.fail:
+        msg: >-
+          Host {{ _llm_host.host_id }} reports no PCI SHORT_ADDRESS for GPU
+          {{ _gpu }} — cannot attach it exclusively in vm_per_gpu mode.
+      vars:
+        _dev: "{{ (_llm_host.devices | default([]))[_gpu | int] | default({}) }}"
+      when: (_dev.short_address | default('', true) | string | length) == 0
+
+    - name: Instantiate appliance VM for GPU {{ _gpu }} (pinned)
+      ansible.builtin.include_tasks: instantiate_vm.yml
+      vars:
+        _template_id: "{{ _appliance_template_id }}"
+        _dev: "{{ (_llm_host.devices | default([]))[_gpu | int] | default({}) }}"
+        _ctx:
+          vnet: "{{ _gpu_vnet_name | default(gpu_benchmark.vnet_name) }}"
+          pci_address: "{{ _dev.short_address | default('', true) }}"
+          pci_count: 1
+          numa_node: "{{ _dev.numa_node | default(-1, true) }}"
+          pin_policy: "{{ gpu_benchmark.vm.pin_policy | default('') }}"
+          host_id: "{{ _llm_host.host_id }}"
+          model_id: "{{ _model }}"
+          vm_name: "gpu-bench-{{ _model | regex_replace('[^A-Za-z0-9._-]', '_') }}-h{{ _llm_host.host_id }}-g{{ _gpu }}{{ current_cluster.name_suffix }}"
+          image_id: "{{ _appliance_image_id | default('') }}"
+          disk_size_mb: "{{ _appliance_disk_mb | default(gpu_benchmark.vm.disk_mb) }}"
+
+    - name: Wait for SSH on the model VM (GPU {{ _gpu }})
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no -oConnectTimeout=10
+        root@{{ _vm_ip }} true
+      register: _ssh_ready
+      until: _ssh_ready.rc == 0
+      retries: 20
+      delay: 15
+      changed_when: false
+
+    - name: Stop the appliance auto-serve (we serve ourselves)
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }}
+        "systemctl stop one-appliance 2>/dev/null; pkill -f '[v]llm serve' 2>/dev/null; sleep 2; true"
+      changed_when: true
+      failed_when: false
+
+    # The shared engine records under `_gpu` (host index); the VM exposes its
+    # single GPU as CUDA device 0, hence _cuda_gpu.
+    - name: Benchmark GPU {{ _gpu }} (shared engine, CUDA device 0)
+      ansible.builtin.include_tasks: llm_benchmark_gpu.yml
+      vars:
+        _cuda_gpu: 0
+
+    # Once, from the LAST GPU's still-serving VM: functional API suite + tool
+    # versions (identical in every VM — same appliance image).
+    - name: Run functional API suite (last GPU's VM)
+      ansible.builtin.include_tasks: llm_functional.yml
+      when:
+        - gpu_benchmark.functional.enabled | bool
+        - (_gpu | int) == ((_llm_pci_count | int) - 1)
+        - (_model_gpu_results | sort(attribute='gpu') | last | default({})).metrics is defined
+
+    - name: Capture tool versions for the record (last GPU's VM)
+      become: true
+      become_user: oneadmin
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }}
+        'source /root/vllm_gpu_env/bin/activate 2>/dev/null;
+        pip show guidellm vllm 2>/dev/null | grep -E "^(Name|Version):" | paste -sd" " -'
+      register: _tool_versions
+      changed_when: false
+      failed_when: false
+      when: (_gpu | int) == ((_llm_pci_count | int) - 1)
+
+  rescue:
+    # VM-level failure (instantiate/ssh) — per-GPU benchmark failures are
+    # already handled inside llm_benchmark_gpu.yml and do not reach here.
+    - name: Record GPU {{ _gpu }} VM-level failure
+      ansible.builtin.set_fact:
+        _model_gpu_results: >-
+          {{ _model_gpu_results + [{
+            'gpu': _gpu | int,
+            'status': 'failed',
+            'error': ('VM-level failure: ' ~ (ansible_failed_result.msg | default('error') | string | truncate(300, true)))
+          }] }}
+      no_log: true
+
+  always:
+    - name: Terminate the GPU {{ _gpu }} VM
+      ansible.builtin.include_tasks: cleanup.yml

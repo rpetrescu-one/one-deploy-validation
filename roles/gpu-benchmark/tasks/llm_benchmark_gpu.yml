@@ -21,7 +21,7 @@
       ansible.builtin.shell: >
         ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }}
         "rm -f /root/vllm_serve.log;
-        nohup bash -c 'source /root/vllm_gpu_env/bin/activate && export CUDA_VISIBLE_DEVICES={{ _gpu }} &&
+        nohup bash -c 'source /root/vllm_gpu_env/bin/activate && export CUDA_VISIBLE_DEVICES={{ _cuda_gpu | default(_gpu) }} &&
         {% if gpu_benchmark.hf_token %}export HF_TOKEN={{ gpu_benchmark.hf_token }} &&{% endif %}
         exec vllm serve {{ _model }} --host 0.0.0.0 --port {{ gpu_benchmark.vllm_context.api_port }}
         --gpu-memory-utilization {{ gpu_benchmark.vllm_context.gpu_mem_util }}
@@ -87,7 +87,7 @@
       ansible.builtin.shell: >
         ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _vm_ip }}
         "rm -f /root/power_g{{ _gpu }}.csv /root/power_sampler.pid;
-        nohup bash -c 'while true; do nvidia-smi -i {{ _gpu }}
+        nohup bash -c 'while true; do nvidia-smi -i {{ _cuda_gpu | default(_gpu) }}
         --query-gpu=power.draw,clocks.sm,temperature.gpu --format=csv,noheader,nounits
         >> /root/power_g{{ _gpu }}.csv; sleep {{ gpu_benchmark.power_sampling.interval_s | int }}; done'
         > /dev/null 2>&1 < /dev/null & echo \$! > /root/power_sampler.pid"
@@ -103,10 +103,8 @@
         "source /root/vllm_gpu_env/bin/activate && mkdir -p /root/benchmark_results &&
         guidellm run
         --backend 'kind=openai_http,target=http://localhost:{{ gpu_benchmark.vllm_context.api_port }},model={{ _model }}'
-        --profile 'kind=sweep,warmup.value=1,warmup.mode=requests'
+        {{ gpu_benchmark.guidellm_profile }}
         --constraint kind=max_duration,seconds={{ gpu_benchmark.guidellm_max_duration_s | default(20) | int }}
-        --constraint kind=max_requests,count=100000
-        --data 'kind=synthetic_text,prompt_tokens=512,output_tokens=256'
         --tokenizer 'kind=huggingface_auto,model={{ _model }}'
         --output 'kind=json,path=/root/benchmark_results/result_g{{ _gpu }}.json'
         --disable-console-interactive > /root/guidellm_g{{ _gpu }}.log 2>&1 < /dev/null;

@@ -272,6 +272,19 @@ validation:
 gpu_benchmark:
   appliance_market_name: 'vLLM Inference Engine'
   vnet_name: public
+  # BARE-METAL BASELINE (pre-deploy): run the same benchmark directly on a
+  # node host BEFORE the OpenNebula deploy and save the results as the
+  # reference the post-deploy run is compared against (virtualization
+  # overhead section in the report). Invoke with:
+  #   make validation I=... ANSIBLE_ARGS='-e gpu_benchmark_phase=pre'
+  # Everything the pre run adds to the host is removed afterwards (clean OS).
+  # phase: post                       # or set it here instead of via -e
+  # baremetal:
+  #   hosts: []                       # [] = first node host; list; or 'all'
+  #   workdir: /root/gpu-bench-tmp    # venv+model+caches live (and die) here
+  #   vllm_version: "0.10.2"          # pin to the appliance's vLLM
+  #   allow_driver_install: true      # install+purge driver if host has none
+  #   baseline_tolerance_pct: 10      # flag virt worse than bare-metal by more
   models:
     - "Qwen/Qwen2.5-3B-Instruct"
     # Full certification set (needs larger GPUs; Llama is gated -> set hf_token):
@@ -295,17 +308,21 @@ gpu_benchmark:
   # runs, where to read the measured values, what margins to apply):
   # roles/gpu-benchmark/README.md.
   reference:
-    # L40S (vLLM 0.10.2, guidellm 0.7.1) — VALIDATED on the lab (PASS):
-    # TTFT p95 sync 37.5 ms warm (first-request exclusion active) -> gate 200
-    # has ~5x headroom while still catching real degradation; throughput
-    # 5.9 req/s stable over 6 runs -> floor 4.5 (~25% margin); ITL
-    # 10.6-10.8 ms -> the inherited chat SLO of 50 ms has ample headroom.
-    # Full calibration procedure and the first-request-exclusion caveat:
-    # roles/gpu-benchmark/README.md.
+    # L40S (guidellm 0.7.1, profile with max_concurrency=128) — VALIDATED
+    # on the lab (PASS). Sustained req/s = curve peak tok/s / 256 tok/req:
+    # with the BOUNDED probe (stable, no overload chaos) healthy L40S
+    # measured 12.8-15.4 req/s across 4 runs (bare-metal + virtualized) ->
+    # floor 10.5 (mean ~14.3 - 25%; ~18% under the weakest healthy card).
+    # TTFT p95 sync ~36-39 ms warm -> gate 200 has ~5x headroom; ITL
+    # 9.7-10.8 ms -> the inherited chat SLO of 50 ms has ample headroom.
+    # (Historic floors: 4.5 under pre-2026-08 max-RPS semantics; 8.0 under
+    # peak semantics with the UNCAPPED 512 probe — both NOT comparable to
+    # measurements taken under the current profile.) Full calibration
+    # procedure and caveats: roles/gpu-benchmark/README.md.
     'NVIDIA L40S':
       'Qwen/Qwen2.5-3B-Instruct':
         ttft_p95_ms: 200
-        min_throughput_req_s: 4.5
+        min_throughput_req_s: 10.5
     # GB200-class hardware meets the reference doc's chat SLOs directly — no
     # entry needed (global thresholds apply). Add measured entries per model
     # once certified runs exist, e.g.:

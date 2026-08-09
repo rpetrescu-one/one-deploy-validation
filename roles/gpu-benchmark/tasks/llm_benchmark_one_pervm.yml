@@ -1,0 +1,63 @@
+---
+# Per (host, model), vm_per_gpu MODE: each GPU gets ITS OWN appliance VM,
+# attached by exact PCI address and (when the host reports the device NUMA
+# node) pinned to that node via TOPOLOGY — apples-to-apples with a NUMA-pinned
+# bare-metal baseline. Shares the per-GPU engine (llm_benchmark_gpu.yml) and
+# all lib logic with the default all-GPUs-one-VM flow (llm_benchmark_one.yml).
+# Cost: one appliance boot + model download PER GPU.
+- name: Reset per-model accumulators (per-GPU-VM mode)
+  ansible.builtin.set_fact:
+    _model_gpu_results: []
+    _gpu_delta: {}
+    _functional: {}
+    _provision_s: ""
+    _tool_versions: {}
+    _prov_start: "{{ lookup('pipe', 'date +%s') }}"
+    _llm_pci_count: >-
+      {{ (_llm_host.gpu_count | int)
+         if (gpu_benchmark.gpu_count == 'all')
+         else ([gpu_benchmark.gpu_count | int, _llm_host.gpu_count | int] | min) }}
+    _llm_key: "{{ _model }}{{ '' if (_gpu_inventory.hosts | length | int == 1) else ' · host ' ~ _llm_host.host_id }}"
+
+- name: Benchmark model {{ _model }} on host {{ _llm_host.host_id }} (one VM per GPU)
+  block:
+    - name: Benchmark each GPU in its own pinned VM
+      ansible.builtin.include_tasks: llm_benchmark_pervm_gpu.yml
+      loop: "{{ range(_llm_pci_count | int) | list }}"
+      loop_control:
+        loop_var: _gpu
+        label: "gpu {{ _gpu }}"
+
+    - name: Compute GPU-to-GPU delta for {{ _model }}
+      ansible.builtin.include_tasks: lib/compare_gpus.yml
+      when: (_model_gpu_results | selectattr('metrics', 'defined') | list | length | int) > 1
+
+    - name: Derive model status
+      ansible.builtin.include_tasks: lib/model_status.yml
+
+    - name: Record model result
+      ansible.builtin.set_fact:
+        _llm: >-
+          {{ _llm | combine({_llm_key: {
+            'host_id': _llm_host.host_id,
+            'model': _model,
+            'per_gpu': _model_gpu_results | sort(attribute='gpu'),
+            'delta': _gpu_delta | default({}),
+            'functional': _functional | default({}),
+            'provisioning_s': _provision_s | default(''),
+            'versions': (_tool_versions.stdout | default('') | trim),
+            'status': _model_status
+          }}) }}
+
+  rescue:
+    - name: Record model failure (per-GPU-VM mode)
+      ansible.builtin.set_fact:
+        _llm: >-
+          {{ _llm | combine({_llm_key: {
+            'host_id': _llm_host.host_id,
+            'model': _model,
+            'per_gpu': _model_gpu_results | default([]),
+            'status': 'failed',
+            'error': (ansible_failed_result.msg | default('error'))
+          }}) }}
+      no_log: true

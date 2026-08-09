@@ -537,10 +537,12 @@
   <section class="data-section"><div class="section-title">GPU / LLM Benchmark Results</div>
   {% for host, data in gpu_benchmark_results.items() %}
   <div class="section-title" style="margin-top:14px">{{ host }} — status: {{ data.status | default('n/a') }}{% if data.note | default('') %} ({{ data.note }}){% endif %}</div>
+  {% if data.error | default('') | string | length > 0 %}<div class="mini-pre">Error: {{ data.error | e }}</div>{% endif %}
   {% set _all_smi = (data.gpu_health | default({})).hosts | default([]) | selectattr('nvidia_smi', 'defined') | map(attribute='nvidia_smi') | flatten | list %}
   {% set _vrams = _all_smi | map(attribute='vram_mib') | map('string') | select('ne', '') | unique | list %}
   {% if _all_smi | length > 0 %}<div class="mini-pre">Platform: {{ _all_smi | length }}&times; {{ _all_smi | map(attribute='name') | unique | join(' / ') }}{% if _vrams | length == 1 %} ({{ ((_vrams[0] | int) / 1024) | round(0) | int }} GiB VRAM each){% endif %}{% if data.meta.driver_version | default('') %} — driver {{ data.meta.driver_version }}{% endif %}{% if data.meta.cuda_version | default('') %}, CUDA {{ data.meta.cuda_version }}{% endif %}</div>{% endif %}
-  {% if data.meta is defined and data.meta %}<div class="mini-pre">Run: {{ data.meta.timestamp | default('') }} — appliance template ID {{ data.meta.appliance_template_id | default('n/a', true) }} — model(s): {{ data.meta.models | default([]) | join(', ') }}</div>{% endif %}
+  {% if (data.meta | default({})).phase | default('post') == 'pre' %}<div class="mini-pre"><strong>Bare-metal pre-deploy baseline</strong> — executed directly on the host OS (no OpenNebula, no virtualization). These results are saved as the reference the post-deploy run is compared against.</div>{% endif %}
+  {% if data.meta is defined and data.meta %}<div class="mini-pre">Run: {{ data.meta.timestamp | default('') }}{% if (data.meta.phase | default('post')) != 'pre' %} — appliance template ID {{ data.meta.appliance_template_id | default('n/a', true) }}{% endif %} — model(s): {{ data.meta.models | default([]) | join(', ') }}</div>{% endif %}
   {% set _kpi_tok = [] %}{% set _kpi_ttft = [] %}{% set _kpi_gf = [] %}
   {% for lk, lm in (data.llm | default({})).items() %}{% for g in lm.per_gpu | default([]) %}{% if g.metrics is defined %}{% if (g.metrics.output_tok_s_saturated | default('') | string | length) > 0 %}{% if _kpi_tok.append(g.metrics.output_tok_s_saturated | float) %}{% endif %}{% endif %}{% if _kpi_ttft.append(g.metrics.ttft_p95_ms | float) %}{% endif %}{% endif %}{% endfor %}{% endfor %}
   {% for h in (data.gpu_health | default({})).hosts | default([]) %}{% if h.cublas is defined and h.cublas.skipped is not defined %}{% for c in h.cublas %}{% if _kpi_gf.append(c.gflops | float) %}{% endif %}{% endfor %}{% endif %}{% endfor %}
@@ -573,11 +575,13 @@
   {% if (m.versions | default('')) or (m.provisioning_s | default('') | string | length > 0) %}<div class="mini-pre">{{ m.versions | default('') }}{% if m.provisioning_s | default('') | string | length > 0 %}{% if m.versions | default('') %} — {% endif %}provisioning: VM create &rarr; model serving in {{ m.provisioning_s }} s{% endif %}</div>{% endif %}
   {% if (m.per_gpu | default([]) | length) > 0 %}
   <div class="table-scroll"><table class="gtable"><thead><tr><th>GPU</th><th class="num">Output tok/s (sat)</th><th class="num">Sustained req/s (sat)</th><th class="num">Req latency p95 (s, sync)</th><th class="num">TTFT p95 (ms, sync)</th><th class="num">ITL p95 (ms, sync)</th><th class="num">TPOT p95 (ms, sync)</th><th class="num">TTFT p95 (ms, sat)</th><th>SLO</th></tr></thead><tbody>
-  {% for g in m.per_gpu | default([]) %}{% if g.metrics is defined %}<tr><td>{{ g.gpu }}</td><td class="num">{% if g.metrics.output_tok_s_saturated | default('') | string | length > 0 %}{{ g.metrics.output_tok_s_saturated | float | round(0) | int }}{% else %}—{% endif %}</td><td class="num">{{ g.metrics.throughput_req_s_mean | float | round(2) }}</td><td class="num">{{ g.metrics.req_latency_p95_s | float | round(3) }}</td><td class="num">{{ g.metrics.ttft_p95_ms | float | round(1) }}</td><td class="num">{{ g.metrics.itl_p95_ms | float | round(2) }}</td><td class="num">{{ g.metrics.tpot_p95_ms | float | round(2) }}</td><td class="num">{% if (g.metrics.saturated | default({})).ttft_p95_ms is defined %}{{ g.metrics.saturated.ttft_p95_ms | float | round(1) }}{% else %}—{% endif %}</td><td>{% set _ev = g.evaluation | default({}) %}{% if _ev.gated is defined and not (_ev.gated | bool) %}not evaluated{% else %}{{ _ev.status | default('n/a') }}{% if (_ev.source | default('global')) != 'global' %} (ref){% endif %}{% endif %}</td></tr>{% else %}<tr><td>{{ g.gpu }}</td><td colspan="8">Failed: {{ g.error | default('unknown error') | e }}</td></tr>{% endif %}{% endfor %}
+  {% for g in m.per_gpu | default([]) %}{% if g.metrics is defined %}<tr><td>{{ g.gpu }}</td><td class="num">{% if g.metrics.output_tok_s_saturated | default('') | string | length > 0 %}{{ g.metrics.output_tok_s_saturated | float | round(0) | int }}{% else %}—{% endif %}</td><td class="num">{{ g.metrics.throughput_req_s_mean | float | round(2) }}</td><td class="num">{{ g.metrics.req_latency_p95_s | float | round(3) }}</td><td class="num">{{ g.metrics.ttft_p95_ms | float | round(1) }}</td><td class="num">{{ g.metrics.itl_p95_ms | float | round(2) }}</td><td class="num">{{ g.metrics.tpot_p95_ms | float | round(2) }}</td><td class="num">{% if (g.metrics.saturated | default({})).ttft_p95_ms is defined %}{{ g.metrics.saturated.ttft_p95_ms | float | round(1) }}{% else %}—{% endif %}</td><td>{% set _ev = g.evaluation | default({}) %}{% if _ev.gated is defined and not (_ev.gated | bool) %}not evaluated{% else %}{{ _ev.status | default('n/a') }}{% if (_ev.throughput_inconclusive | default(false) | string) == 'True' %}*{% endif %}{% if (_ev.source | default('global')) != 'global' %} (ref){% endif %}{% endif %}</td></tr>{% else %}<tr><td>{{ g.gpu }}</td><td colspan="8">Failed: {{ g.error | default('unknown error') | e }}</td></tr>{% endif %}{% endfor %}
   </tbody></table></div>
   {% set _unsat = _okg | selectattr('metrics.saturation_achieved', 'defined') | map(attribute='metrics.saturation_achieved') | map('string') | select('equalto', 'False') | list %}
   {% if _unsat | length > 0 %}<div class="mini-pre"><strong>Saturation not achieved:</strong> the concurrent throughput probe completed 0 requests within each rate window on {{ _unsat | length }} of {{ _okg | length }} GPU(s) — this GPU class is too slow for that load. The figures below are the PEAK single-stream rate reached, not a sustained ceiling the GPU can hold under concurrency.</div>
-  {% else %}<div class="mini-pre">Sustained req/s = saturated token rate &divide; tokens-per-request (the steady-state request rate the GPU holds){% set _pk = (_okg | map(attribute='metrics.throughput_req_s_peak') | select('defined') | map('float') | list) %}{% if _pk | length > 0 %}; guidellm's short-window peak rate was up to {{ _pk | max | round(1) }} req/s (a drain burst, not sustainable){% endif %}. Headline throughput is output tokens/s, which is stable run-to-run.</div>{% endif %}
+  {% elif _okg | length > 0 %}<div class="mini-pre">Sustained req/s = saturated token rate &divide; tokens-per-request (the steady-state request rate the GPU holds){% set _pk = (_okg | map(attribute='metrics.throughput_req_s_peak') | select('defined') | map('float') | list) %}{% if _pk | length > 0 %}; guidellm's short-window peak rate was up to {{ _pk | max | round(1) }} req/s (a drain burst, not sustainable){% endif %}. Headline throughput is output tokens/s, which is stable run-to-run.</div>{% endif %}
+  {% set _tgpu = [] %}{% for g in _okg %}{% if (g.metrics.sweep_truncated | default(false) | string) == 'True' %}{% if _tgpu.append(g.gpu) %}{% endif %}{% endif %}{% endfor %}
+  {% if _tgpu | length > 0 %}<div class="mini-pre"><strong>Sweep truncated on GPU {{ _tgpu | join(', GPU ') }}:</strong> guidellm derives its constant-rate ladder from a short throughput probe, and the probe under-measured (the overload region is chaotic) — the tested rates never reached the throughput knee, so the peak/sustained figures for {{ 'this GPU are' if _tgpu | length == 1 else 'these GPUs are' }} a LOWER BOUND on capacity, not a measurement of it. Throughput gaps against {{ 'this GPU' if _tgpu | length == 1 else 'these GPUs' }} are treated as a measurement artifact, not flagged; an SLO verdict marked '*' means the throughput gate was inconclusive (lower bound below the gate). Re-running the benchmark usually restores a full curve.</div>{% endif %}
   {% endif %}
   {% set _tok_series = [] %}{% set _ttft_series = [] %}
   {% for g in m.per_gpu | default([]) %}{% if (g.metrics | default({})).sweep is defined %}
@@ -600,7 +604,7 @@
   </div>
   {% endif %}
   {% for g in m.per_gpu | default([]) %}{% if (g.metrics | default({})).power is defined and g.metrics.power %}
-  <div class="mini-pre">GPU {{ g.gpu }} under load: avg {{ g.metrics.power.power_avg_w }} W (max {{ g.metrics.power.power_max_w }} W), max temp {{ g.metrics.power.temp_max_c }} &deg;C, min SM clock {{ g.metrics.power.sm_clock_min_mhz }} MHz{% if g.metrics.tokens_per_watt | default('') | string | length > 0 %} — {{ g.metrics.tokens_per_watt }} output tokens/s per watt (run-average power){% endif %}</div>
+  <div class="mini-pre">GPU {{ g.gpu }} under load: avg {{ g.metrics.power.power_avg_w }} W (max {{ g.metrics.power.power_max_w }} W), max temp {{ g.metrics.power.temp_max_c }} &deg;C, min SM clock {{ g.metrics.power.sm_clock_min_mhz }} MHz{% if g.metrics.tokens_per_watt | default('') | string | length > 0 %} — &asymp;{{ g.metrics.tokens_per_watt }} output tokens/s per watt (approximation: peak token rate &divide; run-average power over the whole sweep){% endif %}</div>
   {% endif %}{% endfor %}
   {% if m.functional is defined and m.functional and (m.functional.tests | default([]) | length > 0) %}
   <div class="section-title" style="margin-top:10px">API functional conformance — {{ 'ok' if (m.functional.status | default('ok')) == 'ok' else 'FLAG' }} ({{ m.functional.tests | selectattr('status', 'eq', 'pass') | list | length }}/{{ m.functional.tests | length }} passed)</div>
@@ -625,7 +629,88 @@
   {% endif %}
   {% if (m.status | default('')) == 'failed' and (_okg | length == 0) and (m.error is defined) %}<div class="mini-pre">Failed: {{ m.error | default('unknown error') | e }}</div>{% endif %}
   {% endfor %}
-  {% endfor %}</section>
+  {% set _bd = data.baseline_delta | default({}) %}
+  {% if _bd and (_bd.rows | default([]) | length > 0) %}
+  <div class="section-title" style="margin-top:14px">Virtualization overhead vs bare-metal baseline — {{ 'FLAG' if (_bd.status | default('ok')) == 'flag' else 'ok' }} (tolerance {{ _bd.tolerance_pct | float | round(0) | int }}%)</div>
+  <div class="mini-pre">Bare-metal baseline recorded pre-deploy{% if _bd.baseline_timestamp | default('') %} on {{ _bd.baseline_timestamp }}{% endif %} (gpu_baseline.json). Positive overhead = the virtualized deployment is slower than bare metal.{% for c in _bd.caveats | default([]) %} {{ c }}{% endfor %}</div>
+  {# Rows with BOTH sides measured feed the narrative + the combined chart. #}
+  {% set _bdn = [] %}
+  {% for r in _bd.rows %}{% if (r.baremetal | string | length > 0) and (r.virtualized | string | length > 0) and ((r.baremetal | float) > 0) and ((r.virtualized | float) > 0) %}{% if _bdn.append(r) %}{% endif %}{% endif %}{% endfor %}
+  {% if _bdn | length > 0 %}
+  {% set _tol = _bd.tolerance_pct | default(10) | float %}
+  {% set _hwnames = ['cuBLAS GFLOP/s', 'PCIe H2D GB/s', 'PCIe D2H GB/s'] %}
+  {% set _hwrows = _bdn | selectattr('metric', 'in', _hwnames) | list %}
+  {% set _thr_rows = _bdn | selectattr('metric', 'search', 'tok/s|sustained') | list %}
+  {% set _ttft_rows = _bdn | selectattr('metric', 'search', 'TTFT') | list %}
+  {# Within-tolerance is judged STRICTLY on overhead_pct — rows kept 'ok' only
+     by a measurement guard (low samples / throughput floor) are listed apart,
+     never silently counted as green. #}
+  {% set _okc = [] %}{% set _guarded = [] %}
+  {% for r in _bdn %}{% if (r.overhead_pct | float) <= _tol %}{% if _okc.append(r) %}{% endif %}{% elif r.ok %}{% if _guarded.append(r) %}{% endif %}{% endif %}{% endfor %}
+  <div class="mini-pre"><strong>Summary:</strong>
+  {%- if _hwrows | length > 0 %}{% set _hww = _hwrows | map(attribute='overhead_pct') | map('float') | map('abs') | max %} Raw GPU compute and PCIe bandwidth run within {{ _hww | round(1) }}% of bare metal{{ ' (virtualization overhead is negligible at the hardware level)' if (_hww | float) <= 3 else '' }}.{% endif %}
+  {%- for r in _thr_rows %} {{ 'LLM throughput (' ~ r.metric ~ ') is ' ~ (r.overhead_pct | float | abs | round(1)) ~ '% ' ~ ('BELOW' if (r.overhead_pct | float) > 0 else 'above') ~ ' the bare-metal baseline.' }}{% endfor %}
+  {%- for r in _ttft_rows %} {{ 'Time to first token is ' ~ (r.overhead_pct | float | abs | round(1)) ~ '% ' ~ ('higher' if (r.overhead_pct | float) > 0 else 'lower') ~ ' than bare metal.' }}{% endfor %}
+  {{ _okc | length }}/{{ _bdn | length }} compared metrics fall within the &plusmn;{{ _tol | round(0) | int }}% tolerance{% if _guarded | length > 0 %}; {{ _guarded | length }} exceed it but are not flagged because a measurement guard applies ({{ _guarded | map(attribute='metric') | join(', ') }} — see the notes in the table){% endif %}{{ ' — see the caveats above before reading these as pure virtualization cost' if (_bd.caveats | default([]) | length > 1) else '' }}.</div>
+  {# One chart, both runs: bare-metal is the 100% reference bar, each metric bar
+     is the virtualized result relative to it (higher-better inverted for
+     latencies so MORE is always BETTER). Colors follow the table verdict. #}
+  {% set _cmp_bars = [] %}
+  {% if _cmp_bars.append({'label': 'Baseline', 'value': 100.0, 'color': '#94a3b8'}) %}{% endif %}
+  {% set _multi = (_thr_rows | selectattr('metric', 'search', 'output tok/s') | list | length) > 1 %}
+  {% for r in _bdn %}
+  {% set _bmv = r.baremetal | float %}{% set _vv = r.virtualized | float %}
+  {% set _rel = (_vv / _bmv * 100) if (r.better | default('higher')) == 'higher' else (_bmv / _vv * 100) %}
+  {% set _col = '#15803d' if _rel >= 100 else ('#1a7ba4' if r.ok else '#b91c1c') %}
+  {# LLM metric names are '<model> — <kind>'; with several models the bar
+     label keeps the metric KIND plus the model tail (last path segment) —
+     a blind truncate would render N identical 'Qwen/Qwen…' bars. #}
+  {% set _kind = ('cuBLAS' if r.metric == 'cuBLAS GFLOP/s' else ('PCIe H2D' if r.metric == 'PCIe H2D GB/s' else ('PCIe D2H' if r.metric == 'PCIe D2H GB/s' else ('tok/s' if 'output tok/s' in r.metric else ('req/s' if 'sustained' in r.metric else ('TTFT' if 'TTFT' in r.metric else (r.metric | truncate(9, true, '')))))))) %}
+  {% set _lbl = ((((r.metric.split(' — ') | first).split('/') | last) | truncate(10, true, '…')) ~ ' ' ~ _kind) if (_multi and (' — ' in r.metric)) else _kind %}
+  {% if _cmp_bars.append({'label': _lbl, 'value': _rel | round(1), 'color': _col}) %}{% endif %}
+  {% endfor %}
+  {{ bar_chart('Virtualized performance relative to bare-metal (100% = baseline; more is better)', _cmp_bars, '%') }}
+  {% endif %}
+  <div class="table-scroll"><table class="gtable"><thead><tr><th>Metric</th><th class="num">Bare-metal</th><th class="num">Virtualized</th><th class="num">Overhead %</th><th>Status</th></tr></thead><tbody>
+  {% for r in _bd.rows %}<tr><td>{{ r.metric }}</td><td class="num">{{ (r.baremetal | float | round(2)) if (r.baremetal | string | length > 0) else '—' }}</td><td class="num">{{ (r.virtualized | float | round(2)) if (r.virtualized | string | length > 0) else '—' }}</td><td class="num">{{ r.overhead_pct if (r.overhead_pct | string | length > 0) else '—' }}</td><td>{{ ('ok' if r.ok else 'FLAG') }}{% if r.note | default('') %} ({{ r.note }}){% endif %}</td></tr>{% endfor %}
+  </tbody></table></div>
+  {% endif %}
+  {% endfor %}
+  <div class="section-title" style="margin-top:16px">Legend — terms and abbreviations</div>
+  <div class="table-scroll"><table class="gtable"><thead><tr><th style="width:22%">Term</th><th>Meaning</th></tr></thead><tbody>
+  <tr><td colspan="2"><strong>LLM latency &amp; load</strong></td></tr>
+  <tr><td>TTFT</td><td>Time To First Token — delay before the first token of the answer appears; what a user perceives as responsiveness</td></tr>
+  <tr><td>ITL</td><td>Inter-Token Latency — gap between consecutive output tokens while the answer streams</td></tr>
+  <tr><td>TPOT</td><td>Time Per Output Token — average generation time per output token</td></tr>
+  <tr><td>p95</td><td>95th percentile — 95% of requests performed at least this well; captures the near-worst-case experience rather than the average</td></tr>
+  <tr><td>sync</td><td>synchronous run — one request at a time, no concurrency; isolates pure latency</td></tr>
+  <tr><td>sat</td><td>saturated — the PEAK-throughput point of the load sweep (the maximum sustained generation rate; loads beyond it collapse into queueing)</td></tr>
+  <tr><td>req/s, tok/s</td><td>requests per second; generated output tokens per second</td></tr>
+  <tr><td>Sustained req/s</td><td>saturated output-token rate &divide; tokens per request — the steady-state request rate the GPU holds</td></tr>
+  <tr><td>Avg concurrency</td><td>average number of requests in flight during a load step</td></tr>
+  <tr><td colspan="2"><strong>Hardware diagnostics</strong></td></tr>
+  <tr><td>cuBLAS SGEMM</td><td>NVIDIA linear-algebra benchmark (single-precision matrix multiply) — raw GPU compute</td></tr>
+  <tr><td>GFLOP/s</td><td>billions of floating-point operations per second</td></tr>
+  <tr><td>PCIe H2D / D2H</td><td>Host-to-Device / Device-to-Host copy bandwidth over the PCIe bus (GB/s) — the CPU&harr;GPU data path</td></tr>
+  <tr><td>PCIe width (x8/x16)</td><td>number of PCIe lanes the GPU link negotiated vs the card maximum</td></tr>
+  <tr><td>DCGM</td><td>NVIDIA Data Center GPU Manager — the vendor GPU diagnostic/acceptance suite</td></tr>
+  <tr><td>ECC</td><td>Error-Correcting Code memory — uncorrected error counter (0 is healthy)</td></tr>
+  <tr><td>SM clock</td><td>Streaming Multiprocessor (GPU core) frequency, MHz</td></tr>
+  <tr><td>VBIOS</td><td>GPU firmware version</td></tr>
+  <tr><td>Compute cap</td><td>CUDA compute capability — the GPU architecture generation</td></tr>
+  <tr><td>VRAM</td><td>GPU on-board memory</td></tr>
+  <tr><td colspan="2"><strong>Verdicts &amp; method</strong></td></tr>
+  <tr><td>SLO</td><td>Service Level Objective — the performance gate a metric is judged against</td></tr>
+  <tr><td>(ref)</td><td>the gate came from the hardware-calibrated reference table for this GPU/model, not from the global profile</td></tr>
+  <tr><td>FLAG / WARN</td><td>a check outside tolerance — informational; the validation continues and reports it</td></tr>
+  <tr><td>not evaluated</td><td>no numeric gate configured for this GPU/model (calibration run) — the metric was measured but not judged</td></tr>
+  <tr><td>Sweep truncated</td><td>the tested load ladder never reached the throughput knee (guidellm derives it from a chaotic probe) — the reported throughput is a lower bound, and throughput gaps against the affected GPU are not flagged; '*' on an SLO verdict = the throughput gate was inconclusive (lower bound below the gate)</td></tr>
+  <tr><td>TP</td><td>tensor parallelism — splitting one model across N GPUs; TP=1 means each GPU serves the whole model alone</td></tr>
+  <tr><td>vLLM / GuideLLM</td><td>the inference server, respectively the load-generator tool driving the benchmark</td></tr>
+  <tr><td>Tokens per watt</td><td>energy efficiency — output tokens/s &divide; average GPU power draw during the run</td></tr>
+  <tr><td>Bare-metal baseline</td><td>pre-deploy run executed directly on the host OS; "Overhead %" compares the virtualized deployment against it (positive = virtualized slower)</td></tr>
+  </tbody></table></div>
+  </section>
   {% endif %}
 
   {% if validation_vars.run_network_benchmark | default(false) and network_benchmark is defined and network_benchmark | length > 0 %}

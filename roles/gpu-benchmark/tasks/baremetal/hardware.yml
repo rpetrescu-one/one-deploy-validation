@@ -1,0 +1,296 @@
+---
+# Bare-metal hardware diagnostics — the same tests as the post-deploy health
+# phase (gpu_health_host.yml) executed directly on the host, parsed by the
+# same shared lib/ tasks so the recorded shapes are identical.
+- name: Reset hardware facts
+  ansible.builtin.set_fact:
+    _cublas: []
+    _cublas_flagged: []
+    _pcie_bw: []
+    _pcie_bw_flagged: []
+    _dcgm: {}
+    _nvidia_smi: []
+    _nvidia_issues: []
+    _bm_gpu_numa: {}
+    _bm_bench_gpus: >-
+      {{ (_bm_gpu_count | int)
+         if (gpu_benchmark.gpu_count == 'all')
+         else ([gpu_benchmark.gpu_count | int, _bm_gpu_count | int] | min) }}
+
+- name: Query driver and CUDA versions
+  ansible.builtin.shell: |
+    nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n1
+    nvidia-smi -q | grep -m1 'CUDA Version' | grep -oE '[0-9]+[.][0-9]+'
+  register: _drv
+  changed_when: false
+  failed_when: false
+
+- name: Run nvidia-smi query
+  ansible.builtin.shell: >
+    nvidia-smi --query-gpu=index,name,memory.total,ecc.errors.uncorrected.aggregate.total,clocks_throttle_reasons.active,pcie.link.width.current,pcie.link.width.max,compute_cap,vbios_version,power.limit,clocks.max.sm,temperature.gpu
+    --format=csv,noheader,nounits
+  register: _nvsmi
+  changed_when: false
+  failed_when: false
+
+- name: Parse nvidia-smi
+  ansible.builtin.include_tasks: lib/parse_nvidia_smi.yml
+  vars:
+    _nvidia_smi_csv: "{{ _nvsmi.stdout | default('') }}"
+
+# GPU index -> NUMA node (for the numactl pinning of the LLM phase). The
+# nvidia-smi bus id ("00000000:C1:00.0") maps to the sysfs device path
+# ("0000:c1:00.0" — 4-hex domain, lowercase). -1 = unknown/single-node.
+- name: Map GPU index to NUMA node
+  ansible.builtin.shell: |
+    nvidia-smi --query-gpu=index,pci.bus_id --format=csv,noheader | while IFS=, read -r idx bus; do
+      bus=$(echo "$bus" | tr -d ' ' | tr 'A-F' 'a-f')
+      addr="0000:$(echo "$bus" | cut -d: -f2-)"
+      node=$(cat /sys/bus/pci/devices/${addr}/numa_node 2>/dev/null || echo -1)
+      echo "$(echo "$idx" | tr -d ' '),${node}"
+    done
+  register: _bm_numa_out
+  changed_when: false
+  failed_when: false
+
+- name: Record GPU NUMA map
+  ansible.builtin.set_fact:
+    _bm_gpu_numa: >-
+      {{ _bm_gpu_numa | combine({ (item.split(',')[0] | trim): (item.split(',')[1] | trim | int) }) }}
+  loop: "{{ _bm_numa_out.stdout_lines | default([]) | select('match', '^[0-9]+,') | list }}"
+  loop_control:
+    label: "gpu {{ item }}"
+
+# Expected = the LSPCI count (driver-vs-bus disagreement is the real fault
+# probed here), NOT the gpu_count benchmark cap — nvidia-smi lists every GPU
+# regardless of the cap, and expected=cap would false-flag "only 8/1 visible".
+- name: Evaluate NVIDIA health
+  ansible.builtin.include_tasks: lib/evaluate_nvidia.yml
+  vars:
+    _expected_gpu_count: "{{ _bm_gpu_count }}"
+
+- name: Copy CUDA test sources to the host
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "0644"
+  loop:
+    - {src: cublas_sgemm.cu, dest: "{{ _bm_wd }}/cublas_sgemm.cu", knob: "{{ gpu_benchmark.cublas.enabled }}"}
+    - {src: pcie_bandwidth.cu, dest: "{{ _bm_wd }}/pcie_bandwidth.cu", knob: "{{ gpu_benchmark.pcie_bw.enabled }}"}
+  loop_control:
+    label: "{{ item.src }}"
+  when: item.knob | bool
+
+# /usr/local/cuda/bin on PATH: the NVIDIA repo's cuda-toolkit installs nvcc
+# there, OUTSIDE the default PATH — without this the install "succeeds" and
+# the compile still dies with "nvcc: command not found" (E2E run 3).
+- name: Detect or install CUDA toolkit, then compile
+  ansible.builtin.shell: |
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    export PATH="/usr/local/cuda/bin:$PATH"
+    # apt_try: ATTEMPTED marker BEFORE the install (a timeout mid-install
+    # leaves half-configured packages that must still reach the cleanup
+    # manifest — purging a never-installed name is a harmless no-op) and the
+    # exact dependency payload from the apt log ("Setting up" lines) so the
+    # purge removes the whole tree, not just the meta package.
+    apt_try() {
+      echo "TOOLKIT_PKG_ATTEMPTED=$1"
+      rc=0
+      timeout 900 apt-get install -y "$1" >/tmp/gpu_bench_apt.log 2>&1 || rc=$?
+      P=$(grep -oE '^Setting up [a-z0-9.+-]+' /tmp/gpu_bench_apt.log | awk '{print $3}' | paste -sd' ' -)
+      if [ -n "$P" ]; then echo "TOOLKIT_PKGS=$P"; fi
+      rm -f /tmp/gpu_bench_apt.log
+      return $rc
+    }
+    if ! command -v nvcc >/dev/null 2>&1; then
+      if [ "{{ gpu_benchmark.cublas.allow_toolkit_install | bool | lower }}" = "true" ]; then
+        timeout 300 apt-get update >/dev/null
+        if apt_try cuda-toolkit; then echo "TOOLKIT_INSTALLED=cuda-toolkit";
+        elif apt_try nvidia-cuda-toolkit; then echo "TOOLKIT_INSTALLED=nvidia-cuda-toolkit"; fi
+      else
+        echo "NVCC_MISSING"; exit 42
+      fi
+    fi
+    if [ -f {{ _bm_wd }}/cublas_sgemm.cu ]; then nvcc -O3 -lcublas -o {{ _bm_wd }}/cublas_sgemm {{ _bm_wd }}/cublas_sgemm.cu; fi
+    if [ -f {{ _bm_wd }}/pcie_bandwidth.cu ]; then nvcc -O3 -o {{ _bm_wd }}/pcie_bw {{ _bm_wd }}/pcie_bandwidth.cu; fi
+  args:
+    executable: /bin/bash
+  register: _nvcc
+  changed_when: true
+  failed_when: false
+  when: (gpu_benchmark.cublas.enabled | bool) or (gpu_benchmark.pcie_bw.enabled | bool)
+
+# Everything ATTEMPTED plus every captured dependency payload goes into the
+# manifest — a timeout mid-install leaves half-configured packages that only
+# an attempted-name purge cleans up (purging never-installed names is a
+# guarded no-op in cleanup).
+- name: Record toolkit install in the manifest (attempted + payload)
+  ansible.builtin.set_fact:
+    _bm_installed_pkgs: >-
+      {{ (_bm_installed_pkgs
+          + (_nvcc.stdout | default('') | regex_findall('TOOLKIT_PKG_ATTEMPTED=([a-z0-9.+-]+)'))
+          + ((_nvcc.stdout | default('') | regex_findall('TOOLKIT_PKGS=([^\n]+)')) | join(' ')).split())
+         | select('ne', '') | list | unique }}
+  when:
+    - _nvcc.stdout is defined
+    - "'TOOLKIT_PKG_ATTEMPTED=' in _nvcc.stdout"
+
+- name: Run cuBLAS per GPU
+  ansible.builtin.shell: >
+    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES={{ _gpu }}
+    {{ _bm_wd }}/cublas_sgemm {{ gpu_benchmark.cublas.n }} {{ gpu_benchmark.cublas.iters }}
+  register: _cublas_runs
+  changed_when: false
+  loop: "{{ range(_bm_bench_gpus | int) | list }}"
+  loop_control:
+    loop_var: _gpu
+  when:
+    - gpu_benchmark.cublas.enabled | bool
+    - _nvcc.rc | default(1) == 0
+
+- name: Parse cuBLAS results
+  ansible.builtin.include_tasks: lib/parse_cublas.yml
+  vars:
+    _cublas_results: "{{ _cublas_runs.results | json_query('[].{gpu: _gpu, stdout: stdout}') }}"
+  when:
+    - gpu_benchmark.cublas.enabled | bool
+    - _nvcc.rc | default(1) == 0
+
+- name: Run PCIe bandwidth per GPU
+  ansible.builtin.shell: >
+    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES={{ _gpu }}
+    {{ _bm_wd }}/pcie_bw {{ gpu_benchmark.pcie_bw.size_mb }} {{ gpu_benchmark.pcie_bw.iters }}
+  register: _pcie_runs
+  changed_when: false
+  loop: "{{ range(_bm_bench_gpus | int) | list }}"
+  loop_control:
+    loop_var: _gpu
+  when:
+    - gpu_benchmark.pcie_bw.enabled | bool
+    - _nvcc.rc | default(1) == 0
+
+- name: Parse PCIe bandwidth results
+  ansible.builtin.include_tasks: lib/parse_pcie_bw.yml
+  vars:
+    _pcie_bw_results: "{{ _pcie_runs.results | json_query('[].{gpu: _gpu, stdout: stdout}') }}"
+  when:
+    - gpu_benchmark.pcie_bw.enabled | bool
+    - _nvcc.rc | default(1) == 0
+
+# DCGM directly on the host. Output to a FILE, never the channel (the
+# ssh-pipe-hang class applies here too: the ansible connection is ssh, and a
+# lingering diag plugin holding stdout blocks the task forever).
+- name: Run NVIDIA DCGM diagnostics
+  ansible.builtin.shell: |
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    # ATTEMPTED marker before each install + dependency payload capture (see
+    # the toolkit apt_try rationale): half-installed rungs must reach the
+    # cleanup manifest too.
+    dcgm_try() {
+      echo "DCGM_PKG_ATTEMPTED=$1"
+      rc=0
+      timeout 600 apt-get install -y "$1" >/tmp/gpu_bench_apt.log 2>&1 || rc=$?
+      P=$(grep -oE '^Setting up [a-z0-9.+-]+' /tmp/gpu_bench_apt.log | awk '{print $3}' | paste -sd' ' -)
+      if [ -n "$P" ]; then echo "DCGM_PKGS=$P"; fi
+      rm -f /tmp/gpu_bench_apt.log
+      return $rc
+    }
+    if ! command -v dcgmi >/dev/null 2>&1; then
+      if [ "{{ gpu_benchmark.dcgm.allow_install | bool | lower }}" = "true" ]; then
+        timeout 300 apt-get update >/dev/null 2>&1 || true
+        if dcgm_try datacenter-gpu-manager-4-cuda13; then echo "DCGM_INSTALLED=datacenter-gpu-manager-4-cuda13";
+        elif dcgm_try datacenter-gpu-manager-4-cuda12; then echo "DCGM_INSTALLED=datacenter-gpu-manager-4-cuda12";
+        elif dcgm_try datacenter-gpu-manager; then echo "DCGM_INSTALLED=datacenter-gpu-manager";
+        elif dcgm_try datacenter-gpu-manager-4-core; then echo "DCGM_INSTALLED=datacenter-gpu-manager-4-core";
+        else echo "DCGM install failed (repo missing/throttled? airgap? set dcgm.enabled=false)"; exit 42; fi
+      else
+        echo "dcgmi not installed and dcgm.allow_install is false"; exit 42
+      fi
+    fi
+    systemctl start nvidia-dcgm >/dev/null 2>&1 </dev/null || (setsid nv-hostengine >/dev/null 2>&1 </dev/null &) || true
+    sleep 3
+    # `|| rc=$?` so `set -e` does NOT abort here: dcgmi exits nonzero when a
+    # diagnostic FAILS while still writing a complete JSON report — the
+    # file-has-JSON branch below must run for exactly those exits.
+    rc=0
+    timeout --kill-after=30 {{ gpu_benchmark.dcgm.timeout_s | int }} dcgmi diag -r {{ gpu_benchmark.dcgm.level | int }} -j >{{ _bm_wd }}/dcgm_result.json 2>{{ _bm_wd }}/dcgm_result.err </dev/null || rc=$?
+    if [ -s {{ _bm_wd }}/dcgm_result.json ] && head -c1 {{ _bm_wd }}/dcgm_result.json | grep -q '{'; then
+      cat {{ _bm_wd }}/dcgm_result.json
+      exit 0
+    fi
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+      echo "DCGM diag exceeded {{ gpu_benchmark.dcgm.timeout_s | int }}s timeout (raise dcgm.timeout_s or lower dcgm.level)"
+    else
+      echo "DCGM diag failed (rc=$rc): $(tail -n1 {{ _bm_wd }}/dcgm_result.err 2>/dev/null)"
+    fi
+    exit "$rc"
+  args:
+    executable: /bin/bash
+  register: _dcgm_out
+  changed_when: true
+  failed_when: false
+  when: gpu_benchmark.dcgm.enabled | bool
+
+- name: Record DCGM install in the manifest (attempted + payload)
+  ansible.builtin.set_fact:
+    _bm_installed_pkgs: >-
+      {{ (_bm_installed_pkgs
+          + (_dcgm_out.stdout | default('') | regex_findall('DCGM_PKG_ATTEMPTED=([a-z0-9.+-]+)'))
+          + ((_dcgm_out.stdout | default('') | regex_findall('DCGM_PKGS=([^\n]+)')) | join(' ')).split())
+         | select('ne', '') | list | unique }}
+  when:
+    - gpu_benchmark.dcgm.enabled | bool
+    - "'DCGM_PKG_ATTEMPTED=' in (_dcgm_out.stdout | default(''))"
+
+- name: Parse DCGM diagnostics
+  ansible.builtin.include_tasks: lib/parse_dcgm.yml
+  vars:
+    _dcgm_json: "{{ _dcgm_out.stdout | default('') | regex_search('(?s)\\{.*') | default('', true) }}"
+  when:
+    - gpu_benchmark.dcgm.enabled | bool
+    - (_dcgm_out.stdout | default('') | regex_search('(?s)\\{.*') | default('', true) | length) > 0
+
+- name: Record DCGM as unavailable when it produced no report
+  ansible.builtin.set_fact:
+    _dcgm:
+      status: skipped
+      detail: >-
+        {{ ((_dcgm_out.stderr | default('')) | trim).splitlines() | last
+           | default((_dcgm_out.stdout | default('DCGM disabled')) | trim | truncate(200, true), true) }}
+  when:
+    - gpu_benchmark.dcgm.enabled | bool
+    - (_dcgm_out.stdout | default('') | regex_search('(?s)\\{.*') | default('', true) | length) == 0
+
+- name: Record bare-metal host health result
+  ansible.builtin.set_fact:
+    _gpu_health_hosts: >-
+      {{ _gpu_health_hosts + [{
+        'host_id': 0,
+        'driver_version': ((_drv.stdout_lines | default([]))[0] | default('')) | trim,
+        'cuda_version': ((_drv.stdout_lines | default([]))[1] | default('')) | trim,
+        'nvidia_smi': _nvidia_smi,
+        'cublas': (_cublas if (gpu_benchmark.cublas.enabled | bool and (_nvcc.rc | default(1) == 0))
+                   else {'skipped': (((_nvcc.stderr | default('')) | trim).splitlines() | last
+                                     | default((_nvcc.stdout | default('cuBLAS disabled')) | trim
+                                               | truncate(200, true), true)) }),
+        'pcie_bw': (_pcie_bw if (gpu_benchmark.pcie_bw.enabled | bool and (_nvcc.rc | default(1) == 0))
+                    else ({'skipped': (((_nvcc.stderr | default('')) | trim).splitlines() | last
+                                       | default('nvcc unavailable', true) | truncate(200, true))}
+                          if (gpu_benchmark.pcie_bw.enabled | bool) else [])),
+        'dcgm': _dcgm | default({}),
+        'flagged_gpus': ((_cublas_flagged | default([])) + (_pcie_bw_flagged | default([]))) | unique,
+        'nvidia_issues': (_nvidia_issues | default([])) + _pcie_issues + _dcgm_issues,
+        'nvidia_ok': (_nvidia_ok | default(true) | bool)
+                     and (((_dcgm | default({})).status | default('pass')) != 'fail')
+      }] }}
+  vars:
+    _pcie_issues: >-
+      {{ _pcie_bw | default([]) | selectattr('gpu', 'in', _pcie_bw_flagged | default([]))
+         | map(attribute='gpu') | map('string')
+         | map('regex_replace', '^(.*)$', 'GPU \1 PCIe bandwidth below ' ~ (gpu_benchmark.pcie_bw.min_gbs) ~ ' GB/s')
+         | list }}
+    _dcgm_issues: >-
+      {{ ['DCGM diag failed: ' ~ ((_dcgm.failed | default([])) | join(', '))]
+         if (((_dcgm | default({})).status | default('pass')) == 'fail') else [] }}
