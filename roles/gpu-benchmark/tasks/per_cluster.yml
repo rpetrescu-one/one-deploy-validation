@@ -9,6 +9,8 @@
         _gpu_health: {}
         _llm: {}
         _baseline_delta: {}
+        _k8s_hw: []
+        _k8s_hw_probe_error: ""
 
     - name: Discover GPUs
       ansible.builtin.include_tasks: discover.yml
@@ -160,6 +162,7 @@
       vars:
         _post_llm: "{{ _llm | default({}) }}"
         _post_health_hosts: "{{ (_gpu_health | default({})).hosts | default([]) }}"
+        _k8s_hw_hosts: "{{ _k8s_hw | default([]) }}"
       when: (_baseline.hosts | default({}) | length) > 0
 
     - name: Aggregate cluster status

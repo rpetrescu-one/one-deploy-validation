@@ -1,0 +1,128 @@
+---
+# Full teardown of the K8s stack (user decision: nothing survives the
+# run). Runs in the always block — every step is best-effort and
+# idempotent; leftovers are reported LOUDLY instead of silently kept.
+# VM discovery is JSON-only: the onevm CLI table truncates NAME to its
+# cli.yaml column width (15 chars stock), which hides exactly the VMs
+# this file needs to see.
+- name: Delete the vLLM deployments and verify jobs (best effort)
+  become: true
+  ansible.builtin.shell: |
+    test -f /tmp/gpu_benchmark/kubeconfig_workload.yaml || exit 0
+    kubectl --kubeconfig /tmp/gpu_benchmark/kubeconfig_workload.yaml \
+      delete deploy,job -l gpu-bench --ignore-not-found --timeout=120s
+    kubectl --kubeconfig /tmp/gpu_benchmark/kubeconfig_workload.yaml \
+      delete configmap gpu-bench-hw-src --ignore-not-found --timeout=60s
+  args:
+    executable: /bin/bash
+  changed_when: true
+  failed_when: false
+
+- name: Uninstall the workload cluster (CAPONE removes its VMs)
+  become: true
+  ansible.builtin.shell: |
+    test -f {{ _k8s_mgmt_kubeconfig | default('/tmp/gpu_benchmark/kubeconfig_management.yaml') }} || exit 0
+    helm --kubeconfig {{ _k8s_mgmt_kubeconfig | default('/tmp/gpu_benchmark/kubeconfig_management.yaml') }} \
+      uninstall {{ _k8s_release | default(gpu_benchmark.k8s.release_name) }} --wait --timeout 15m \
+      > /tmp/gpu_benchmark/k8s_helm_uninstall.log 2>&1
+  args:
+    executable: /bin/bash
+  changed_when: true
+  failed_when: false
+  when: not ((gpu_benchmark.k8s.keep_stack_on_failure | default(false) | bool)
+             and (_k8s_failed | default(false) | bool))
+
+# The chart marks its CAPI objects helm.sh/resource-policy=keep and CAPONE
+# leaves the ONE images behind (both proven live) — a later reinstall
+# would collide with or silently ADOPT the stale objects/images (old node
+# image, old sizing). Delete them explicitly.
+- name: Delete the kept CAPI resources and release images
+  become: true
+  ansible.builtin.shell: |
+    MK={{ _k8s_mgmt_kubeconfig | default('/tmp/gpu_benchmark/kubeconfig_management.yaml') }}
+    REL={{ _k8s_release | default(gpu_benchmark.k8s.release_name) }}
+    if [ -f "$MK" ]; then
+      kubectl --kubeconfig "$MK" delete onecluster "$REL" --ignore-not-found --timeout=120s
+      kubectl --kubeconfig "$MK" delete machinedeployment "$REL-md-0" --ignore-not-found --timeout=60s
+      kubectl --kubeconfig "$MK" delete rke2controlplane "$REL" --ignore-not-found --timeout=60s
+      kubectl --kubeconfig "$MK" delete onemachinetemplate "$REL-cp" "$REL-md-0" --ignore-not-found --timeout=60s
+      kubectl --kubeconfig "$MK" delete rke2configtemplate "$REL-md-0" --ignore-not-found --timeout=60s
+      kubectl --kubeconfig "$MK" delete secret "$REL" --ignore-not-found --timeout=60s
+    fi
+    for IMG in $(su - oneadmin -c "oneimage list -j" | jq -r ".IMAGE_POOL.IMAGE? // [] | if type==\"array\" then . else [.] end | .[] | select(.NAME | startswith(\"$REL-\")) | .ID"); do
+      su - oneadmin -c "oneimage delete $IMG" || true
+    done
+    true
+  args:
+    executable: /bin/bash
+  changed_when: true
+  failed_when: false
+  when: not ((gpu_benchmark.k8s.keep_stack_on_failure | default(false) | bool)
+             and (_k8s_failed | default(false) | bool))
+
+- name: Wait for the workload VMs to disappear
+  become: true
+  become_user: oneadmin
+  ansible.builtin.shell: |
+    set -o pipefail
+    onevm list -j | jq -r '
+      [.VM_POOL.VM? // [] | if type=="array" then . else [.] end | .[]
+       | select((.NAME | startswith("{{ _k8s_release | default(gpu_benchmark.k8s.release_name) }}-"))
+                or (.NAME | startswith("vr-{{ _k8s_release | default(gpu_benchmark.k8s.release_name) }}")))]
+      | length'
+  args:
+    executable: /bin/bash
+  register: _k8s_left
+  until: (_k8s_left.stdout | trim) == '0'
+  retries: 60
+  delay: 15
+  changed_when: false
+  failed_when: false
+  when: not ((gpu_benchmark.k8s.keep_stack_on_failure | default(false) | bool)
+             and (_k8s_failed | default(false) | bool))
+
+- name: Terminate the capi VM
+  become: true
+  become_user: oneadmin
+  ansible.builtin.shell: |
+    onevm terminate --hard '{{ _k8s_capi_vm | default("gpu-bench-capi" ~ current_cluster.name_suffix) }}' 2>/dev/null || true
+  args:
+    executable: /bin/bash
+  changed_when: true
+  failed_when: false
+  when: not ((gpu_benchmark.k8s.keep_stack_on_failure | default(false) | bool)
+             and (_k8s_failed | default(false) | bool))
+
+# Key MUST equal the registered check name ('GPU benchmark' + suffix) —
+# the report renders comments only for keys present in verification_result.
+# Numeric-gated: a jq/CLI failure leaves stdout non-numeric — that must
+# not fabricate a leftovers comment (nor hide one: the wait above already
+# burned its retries loudly in the log).
+- name: Note leftovers loudly if the teardown was partial
+  ansible.builtin.set_fact:
+    verification_comments: >-
+      {{ verification_comments | default({}) | combine({
+        ('GPU benchmark' ~ current_cluster.report_suffix):
+          'K8s teardown left ' ~ (_k8s_left.stdout | trim) ~
+          ' workload VM(s) behind (release ' ~ (_k8s_release | default(gpu_benchmark.k8s.release_name)) ~
+          ') — remove them manually with onevm terminate.'
+      }) }}
+  when:
+    - not ((gpu_benchmark.k8s.keep_stack_on_failure | default(false) | bool)
+           and (_k8s_failed | default(false) | bool))
+    - (_k8s_left.stdout | default('0') | trim) is match('^[0-9]+$')
+    - (_k8s_left.stdout | trim) != '0'
+
+- name: Remove kubeconfigs, rendered values and manifests (contain credentials)
+  become: true
+  ansible.builtin.shell: |
+    rm -f /tmp/gpu_benchmark/kubeconfig_management.yaml \
+          /tmp/gpu_benchmark/kubeconfig_workload.yaml \
+          /tmp/gpu_benchmark/k8s_values.yaml \
+          /tmp/gpu_benchmark/kubeconfig_workload.raw \
+          /tmp/gpu_benchmark/k8s_vllm_g*.yaml \
+          /tmp/gpu_benchmark/k8s_cuda_verify_*.yaml
+  args:
+    executable: /bin/bash
+  changed_when: true
+  failed_when: false

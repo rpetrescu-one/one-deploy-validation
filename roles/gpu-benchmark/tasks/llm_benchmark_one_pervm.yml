@@ -41,6 +41,7 @@
           {{ _llm | combine({_llm_key: {
             'host_id': _llm_host.host_id,
             'model': _model,
+            'backend': 'appliance',
             'per_gpu': _model_gpu_results | sort(attribute='gpu'),
             'delta': _gpu_delta | default({}),
             'functional': _functional | default({}),
@@ -56,6 +57,7 @@
           {{ _llm | combine({_llm_key: {
             'host_id': _llm_host.host_id,
             'model': _model,
+            'backend': 'appliance',
             'per_gpu': _model_gpu_results | default([]),
             'status': 'failed',
             'error': (ansible_failed_result.msg | default('error'))

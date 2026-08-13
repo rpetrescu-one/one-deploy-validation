@@ -1,0 +1,32 @@
+---
+# One CUDA verification Job (guide-verbatim) on one worker. Failure FAILS
+# the backend — the guide treats this as the acceptance step for the GPU
+# plumbing, so no benchmark runs on an unverified node.
+- name: Render the CUDA verify job for {{ _k8s_verify_node }}
+  become: true
+  ansible.builtin.template:
+    src: k8s/cuda-verify.yaml.j2
+    dest: "/tmp/gpu_benchmark/k8s_cuda_verify_{{ _k8s_verify_idx }}.yaml"
+    mode: "0644"
+  vars:
+    _k8s_verify_name: "gpu-bench-verify-{{ _k8s_verify_idx }}"
+
+- name: Run and collect the CUDA verify job on {{ _k8s_verify_node }}
+  become: true
+  ansible.builtin.shell: |
+    set -o errexit -o pipefail
+    export KUBECONFIG={{ _k8s_kubeconfig }}
+    kubectl delete job gpu-bench-verify-{{ _k8s_verify_idx }} --ignore-not-found --timeout=60s >/dev/null
+    kubectl apply -f /tmp/gpu_benchmark/k8s_cuda_verify_{{ _k8s_verify_idx }}.yaml >/dev/null
+    kubectl wait --for=condition=complete --timeout=300s job/gpu-bench-verify-{{ _k8s_verify_idx }}
+    kubectl logs -l job-name=gpu-bench-verify-{{ _k8s_verify_idx }} --tail=40
+  args:
+    executable: /bin/bash
+  register: _k8s_verify_out
+  changed_when: true
+
+- name: Record the verification output
+  ansible.builtin.set_fact:
+    _k8s_cuda_verified: >-
+      {{ _k8s_cuda_verified | combine({_k8s_verify_node:
+           (_k8s_verify_out.stdout | trim | truncate(600, true)) }) }}

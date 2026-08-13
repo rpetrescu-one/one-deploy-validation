@@ -94,6 +94,70 @@ _gpu_benchmark_defaults:
   # On multi-SOCKET hosts an unpinned all-GPUs VM cannot be NUMA-local to
   # every card (observed: same VM, GPU node0 1568 vs node1 2052 tok/s).
   vm_per_gpu: false
+  # Which post-deploy LLM backends to benchmark against the bare-metal
+  # baseline. 'appliance' = the marketplace vLLM VM flow (default —
+  # behavior identical to before this knob existed); 'k8s' = an RKE2
+  # cluster deployed per the OpenNebula 7.4 "AI-ready Kubernetes" guide
+  # (Service Capi + capone/capone-rke2 + nvidia gpu-operator) with one
+  # vLLM pod per GPU worker. Both together = one run, 3-way report
+  # (bare-metal | appliance | k8s).
+  llm_backends: ['appliance']
+  # K8s backend settings (versions/URLs pinned to the guide,
+  # docs.opennebula.io 7.4 ai_ready_k8s). RESOURCES deliberately override
+  # the guide's examples: workers reuse vm.vcpu / vm.memory_mb — the
+  # sizing validated on the appliance flow — per the calibration rule
+  # 'best resources for correct results'. NUMA NODE_AFFINITY cannot be
+  # per-worker (one shared worker template in the chart), so K8s workers
+  # run unpinned and the report carries a caveat.
+  k8s:
+    capi_app_name: 'Service Capi'
+    release_name: gpu-bench-k8s
+    capone_chart_version: '0.1.7'
+    gpu_operator_version: 'v25.3.2'
+    router_image_url: 'https://d24fmfybwxpuhu.cloudfront.net/service_VRouter-7.0.0-0-20250528.qcow2'
+    # NOTE: the guide's pinned build ships a kernel whose headers AGE OUT
+    # of the Ubuntu archive (superseded kernels leave the index) — the
+    # gpu-operator driver container then cannot compile ("Could not
+    # resolve Linux kernel version"). When that hits, point this at a
+    # CURRENT Ubuntu 24.04 build (e.g. the public marketplace app's
+    # download URL) — the kernel must still have headers in the archive.
+    node_image_url: 'https://d24fmfybwxpuhu.cloudfront.net/ubuntu2404-7.0.0-0-20250528.qcow2'
+    worker_disk_mb: 204800
+    # XMLRPC endpoint IP the capi VM uses to reach oned; '' = auto (the
+    # benchmark vnet's bridge address on the frontend).
+    one_xmlrpc_ip: ''
+    deploy_timeout_s: 2700
+    # The capi appliance bootstrap (Rancher + Turtles + CAPI providers)
+    # pulls many images/charts; on throttled networks it varies wildly
+    # between boots (observed live: ~15 min vs >45 min on the same lab).
+    # Bounded separately from deploy_timeout_s.
+    bootstrap_timeout_s: 5400
+    # The capi VM k3s apiserver can lose its Secrets watch cache (PROVEN live
+    # 2026-08-10: cached LIST empty while quorum reads are correct) — the
+    # kubelet secret manager and cert-manager then both go blind, the CAPI core
+    # pod hangs in ContainerCreating on a secret that exists, no provider ever
+    # installs, and this backend burns its whole bootstrap budget. Restarting
+    # k3s rebuilds the cache (recovered in 15 s live). The wait loop tests the
+    # cached-vs-quorum secret LIST every ~5 min and restarts k3s ONCE. Set
+    # false to leave the appliance untouched and let the wait expire instead.
+    unwedge_apiserver_cache: true
+    # true = a FAILED k8s backend leaves the stack running for post-mortem
+    # (credential files are still removed); the next run adopts it — every
+    # deploy step is idempotent. The teardown stays full on success.
+    keep_stack_on_failure: false
+    # In-cluster hardware probe: one Job per GPU worker (CUDA devel image)
+    # compiles and runs the SAME cuBLAS SGEMM + PCIe bandwidth sources as
+    # the health flow, so the overhead table's hardware rows also get a
+    # Kubernetes value. K8s workers cannot be NUMA-pinned, so an in-pod
+    # PCIe number directly attributes (or clears) NUMA placement as the
+    # cause of an LLM-throughput gap. Honors cublas.enabled and
+    # pcie_bw.enabled individually; failures are recorded, never fatal.
+    hw_probe: true
+    # Needs nvcc: a -devel image whose CUDA is <= the gpu-operator driver
+    # ceiling (operator v25.3.2 ships the 570 branch = CUDA 12.8).
+    cuda_devel_image: 'nvcr.io/nvidia/cuda:12.8.1-devel-ubuntu24.04'
+    # Bounds pull (~2.5 GB) + compile + both benchmarks per worker.
+    hw_probe_timeout_s: 1500
   vllm_context:
     api_port: 8000
     gpu_mem_util: 0.9
@@ -172,6 +236,17 @@ _gpu_benchmark_defaults:
   # denominator), so throughput is not flagged.
   compare_min_samples: 30
   compare_min_throughput_req_s: 1.0
+  # Retry the load sweep ONCE when the ladder ends UNSATURATED (the
+  # guidellm client is bimodal — proven live 2026-08-11: in its slow mode
+  # the generator wastes ~1.4 s per request slot and the capped probe
+  # under-measures by ~15%, so the rate ladder stops below the knee and
+  # the whole run under-reports capacity by the same amount; server-side
+  # ITL is identical in both modes). Capacity is a MAX-capability metric:
+  # taking the better of two draws removes downward bias and cannot
+  # inflate the result. Cost: one extra sweep (~5 min) only on the
+  # affected GPU. The kept result is re-flagged honestly if BOTH attempts
+  # land unsaturated.
+  llm_retry_unsaturated: true
   cublas:
     enabled: true
     n: 16384            # matrix dimension (matches reference doc)

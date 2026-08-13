@@ -163,6 +163,86 @@
       vars:
         _guidellm_report: "{{ _gl_json.stdout | from_json }}"
 
+    # UNSATURATED RETRY: the guidellm client is bimodal (slow mode wastes
+    # ~1.4 s per request slot and the ladder stops below the knee — see
+    # parse_guidellm). One redraw, keep the better curve; a failed retry
+    # never discards the first attempt. Power metrics stay from attempt 1
+    # (the sampler already stopped — informational only).
+    - name: Decide on a sweep retry for GPU {{ _gpu }}
+      ansible.builtin.set_fact:
+        _llm_retry_needed: >-
+          {{ (gpu_benchmark.llm_retry_unsaturated | default(true) | bool)
+             and ((_llm_metrics.sweep_unsaturated | default(false) | string) == 'True') }}
+        _llm_metrics_first: "{{ _llm_metrics }}"
+        # Unconditional reset — facts persist across the per-GPU loop.
+        _retry_won: false
+        _retry_parse_ok: false
+
+    - name: Retry the unsaturated load sweep once on GPU {{ _gpu }}
+      ansible.builtin.shell: |
+        source {{ _bm_wd }}/venv/bin/activate
+        export HF_HOME={{ _bm_wd }}/hf XDG_CACHE_HOME={{ _bm_wd }}/cache XDG_CONFIG_HOME={{ _bm_wd }}/config
+        export TRITON_CACHE_DIR={{ _bm_wd }}/cache/triton TORCHINDUCTOR_CACHE_DIR={{ _bm_wd }}/cache/inductor
+        {{ _numa_prefix | default('') }}guidellm run --backend 'kind=openai_http,target=http://127.0.0.1:{{ gpu_benchmark.vllm_context.api_port }},model={{ _model }}' {{ gpu_benchmark.guidellm_profile }} --constraint kind=max_duration,seconds={{ gpu_benchmark.guidellm_max_duration_s | default(20) | int }} --tokenizer 'kind=huggingface_auto,model={{ _model }}' --output 'kind=json,path={{ _bm_wd }}/result_g{{ _gpu }}_r2.json' --disable-console-interactive > {{ _bm_wd }}/guidellm_g{{ _gpu }}_r2.log 2>&1 < /dev/null
+        rc=$?
+        tail -c 4000 {{ _bm_wd }}/guidellm_g{{ _gpu }}_r2.log
+        exit $rc
+      args:
+        executable: /bin/bash
+      register: _retry_bench
+      changed_when: true
+      failed_when: false
+      when: _llm_retry_needed | bool
+
+    - name: Read the retry report for GPU {{ _gpu }}
+      ansible.builtin.command: cat {{ _bm_wd }}/result_g{{ _gpu }}_r2.json
+      register: _retry_json
+      changed_when: false
+      failed_when: false
+      when: (_llm_retry_needed | bool) and ((_retry_bench.rc | default(1) | int) == 0)
+
+    # Own rescue: a retry report that begins with a brace but is
+    # truncated/malformed must NOT escape to the site rescue and discard
+    # a valid attempt 1 — the parse failure is swallowed and keep-better
+    # simply keeps the first attempt.
+    - name: Parse the retry metrics for GPU {{ _gpu }}
+      block:
+        - name: Parse the retry report for GPU {{ _gpu }}
+          ansible.builtin.include_tasks: lib/parse_guidellm.yml
+          vars:
+            _guidellm_report: "{{ _retry_json.stdout | from_json }}"
+        # Reached ONLY when the include succeeded — distinguishes a
+        # rescued parse from a real second attempt (_retry_won conjunct).
+        - name: Mark the retry parse as succeeded for GPU {{ _gpu }}
+          ansible.builtin.set_fact:
+            _retry_parse_ok: true
+      rescue:
+        - name: Note the unparseable retry report for GPU {{ _gpu }}
+          ansible.builtin.debug:
+            msg: "retry report unparseable — keeping the first attempt"
+      when:
+        - _llm_retry_needed | bool
+        - (_retry_bench.rc | default(1) | int) == 0
+        - (_retry_json.rc | default(1) | int) == 0
+        - (_retry_json.stdout | default('') | trim).startswith('{')
+
+    - name: Keep the better sweep attempt for GPU {{ _gpu }}
+      ansible.builtin.set_fact:
+        _llm_metrics: >-
+          {{ _llm_metrics_first
+             if ((_llm_metrics_first.output_tok_s_saturated | default('') | string | length > 0)
+                 and ((_llm_metrics_first.output_tok_s_saturated | default(0) | float)
+                      > (_llm_metrics.output_tok_s_saturated | default(0) | float)))
+             else _llm_metrics }}
+        _retry_won: >-
+          {{ (_retry_parse_ok | default(false) | bool)
+             and ((_retry_json.rc | default(1) | int) == 0)
+             and ((_retry_json.stdout | default('') | trim).startswith('{'))
+             and (not ((_llm_metrics_first.output_tok_s_saturated | default('') | string | length > 0)
+                       and ((_llm_metrics_first.output_tok_s_saturated | default(0) | float)
+                            > (_llm_metrics.output_tok_s_saturated | default(0) | float)))) }}
+      when: _llm_retry_needed | bool
+
     - name: Resolve SLO thresholds for GPU {{ _gpu }}
       ansible.builtin.include_tasks: lib/resolve_thresholds.yml
       vars:
@@ -194,10 +274,14 @@
       vars:
         _otps: "{{ _llm_metrics.output_tok_s_saturated | default('') }}"
         _pavg: "{{ (_power | default({})).power_avg_w | default('') }}"
+        # Power was sampled around ATTEMPT 1 only — when the retry won,
+        # kept tok/s belongs to attempt 2 and the ratio would be inflated
+        # (the slow-mode attempt draws LESS power). Blank it instead.
         _tpw: >-
           {{ (((_otps | float) / (_pavg | float)) | round(2))
              if ((_otps | string | length > 0) and (_pavg | string | length > 0)
-                 and ((_pavg | float) > 0))
+                 and ((_pavg | float) > 0)
+                 and (not (_retry_won | default(false) | bool)))
              else '' }}
 
   rescue:

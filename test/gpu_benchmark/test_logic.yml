@@ -299,6 +299,426 @@
           # (2118 -> 14563) — correctly labeled a truncated sweep
           - (_llm_metrics.sweep_truncated | string) == 'True'
         fail_msg: "parse_guidellm produced {{ _llm_metrics }}"
+    # DETECTOR CALIBRATION — real shapes from the 2026-08-11 live data.
+    # (A) run-23 shape: capped probe in the slow client mode; the constant
+    # ladder still climbs linearly into the top (last delta = mean delta)
+    # and the probe sits just above it -> UNSATURATED (lower bound).
+    - name: parse_guidellm — unsaturated ladder detected (slow-mode probe)
+      vars:
+        gpu_benchmark:
+          guidellm_status: successful
+          guidellm_profile: "--profile 'kind=sweep' --data 'kind=synthetic_text,prompt_tokens=512,output_tokens=256,max_concurrency=128'"
+        _guidellm_report:
+          benchmarks:
+          - config: {strategy: {type_: synchronous, }}
+            metrics:
+              requests_per_second: {successful: {mean: 0.9}}
+              output_tokens_per_second: {successful: {mean: 230.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 12, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 1, }}
+            metrics:
+              requests_per_second: {successful: {mean: 1.5}}
+              output_tokens_per_second: {successful: {mean: 400.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 2, }}
+            metrics:
+              requests_per_second: {successful: {mean: 3.0}}
+              output_tokens_per_second: {successful: {mean: 800.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 3, }}
+            metrics:
+              requests_per_second: {successful: {mean: 4.5}}
+              output_tokens_per_second: {successful: {mean: 1200.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 4, }}
+            metrics:
+              requests_per_second: {successful: {mean: 6.0}}
+              output_tokens_per_second: {successful: {mean: 1600.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 5, }}
+            metrics:
+              requests_per_second: {successful: {mean: 7.5}}
+              output_tokens_per_second: {successful: {mean: 2000.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 6, }}
+            metrics:
+              requests_per_second: {successful: {mean: 9.0}}
+              output_tokens_per_second: {successful: {mean: 2400.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: throughput, }}
+            metrics:
+              requests_per_second: {successful: {mean: 10.546875}}
+              output_tokens_per_second: {successful: {mean: 2700.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 500, errored: 0, incomplete: 0}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_guidellm.yml
+    - name: assert the unsaturated ladder is detected
+      ansible.builtin.assert:
+        that:
+          - (_llm_metrics.sweep_unsaturated | string) == 'True'
+          - (_llm_metrics.sweep_truncated | string) == 'False'
+          - (_llm_metrics.output_tok_s_saturated | float) == 2700.0
+        fail_msg: "parse_guidellm unsaturated case produced {{ _llm_metrics }}"
+
+    # (B) baseline-gpu0 shape: the ladder BENDS at the top (delta collapses
+    # 375 -> 50) — the knee was reached, headline credible -> NOT unsaturated.
+    - name: parse_guidellm — saturated knee is not flagged
+      vars:
+        gpu_benchmark:
+          guidellm_status: successful
+          guidellm_profile: "--profile 'kind=sweep' --data 'kind=synthetic_text,prompt_tokens=512,output_tokens=256,max_concurrency=128'"
+        _guidellm_report:
+          benchmarks:
+          - config: {strategy: {type_: synchronous, }}
+            metrics:
+              requests_per_second: {successful: {mean: 0.9}}
+              output_tokens_per_second: {successful: {mean: 230.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 12, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 1, }}
+            metrics:
+              requests_per_second: {successful: {mean: 1.5}}
+              output_tokens_per_second: {successful: {mean: 400.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 2, }}
+            metrics:
+              requests_per_second: {successful: {mean: 3.0}}
+              output_tokens_per_second: {successful: {mean: 800.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 3, }}
+            metrics:
+              requests_per_second: {successful: {mean: 4.5}}
+              output_tokens_per_second: {successful: {mean: 1200.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 4, }}
+            metrics:
+              requests_per_second: {successful: {mean: 6.0}}
+              output_tokens_per_second: {successful: {mean: 1600.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 5, }}
+            metrics:
+              requests_per_second: {successful: {mean: 7.5}}
+              output_tokens_per_second: {successful: {mean: 1900.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 6, }}
+            metrics:
+              requests_per_second: {successful: {mean: 9.0}}
+              output_tokens_per_second: {successful: {mean: 1950.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: throughput, }}
+            metrics:
+              requests_per_second: {successful: {mean: 8.203125}}
+              output_tokens_per_second: {successful: {mean: 2100.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 500, errored: 0, incomplete: 0}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_guidellm.yml
+    - name: assert the bent ladder is not flagged
+      ansible.builtin.assert:
+        that:
+          - (_llm_metrics.sweep_unsaturated | string) == 'False'
+        fail_msg: "parse_guidellm saturated-knee case produced {{ _llm_metrics }}"
+
+    # (C) healthy probe far above a still-climbing ladder (>25% headroom):
+    # the probe escaped the slow mode, the headline is credible -> NOT
+    # unsaturated even though the constant rungs never bent.
+    - name: parse_guidellm — fast probe above the ladder is not flagged
+      vars:
+        gpu_benchmark:
+          guidellm_status: successful
+          guidellm_profile: "--profile 'kind=sweep' --data 'kind=synthetic_text,prompt_tokens=512,output_tokens=256,max_concurrency=128'"
+        _guidellm_report:
+          benchmarks:
+          - config: {strategy: {type_: synchronous, }}
+            metrics:
+              requests_per_second: {successful: {mean: 0.9}}
+              output_tokens_per_second: {successful: {mean: 230.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 12, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 1, }}
+            metrics:
+              requests_per_second: {successful: {mean: 1.5}}
+              output_tokens_per_second: {successful: {mean: 400.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 2, }}
+            metrics:
+              requests_per_second: {successful: {mean: 3.0}}
+              output_tokens_per_second: {successful: {mean: 800.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 3, }}
+            metrics:
+              requests_per_second: {successful: {mean: 4.5}}
+              output_tokens_per_second: {successful: {mean: 1200.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 4, }}
+            metrics:
+              requests_per_second: {successful: {mean: 6.0}}
+              output_tokens_per_second: {successful: {mean: 1600.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 5, }}
+            metrics:
+              requests_per_second: {successful: {mean: 7.5}}
+              output_tokens_per_second: {successful: {mean: 2000.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 6, }}
+            metrics:
+              requests_per_second: {successful: {mean: 9.0}}
+              output_tokens_per_second: {successful: {mean: 2400.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: throughput, }}
+            metrics:
+              requests_per_second: {successful: {mean: 12.5}}
+              output_tokens_per_second: {successful: {mean: 3200.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 500, errored: 0, incomplete: 0}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_guidellm.yml
+    - name: assert the fast-probe run is not flagged
+      ansible.builtin.assert:
+        that:
+          - (_llm_metrics.sweep_unsaturated | string) == 'False'
+        fail_msg: "parse_guidellm fast-probe case produced {{ _llm_metrics }}"
+
+    # (D) FLAT ladder from the first rung (the sync rate already saturates
+    # the server): rung deltas are pure noise — without the material-rise
+    # guard the noise ratio can exceed 0.6 and false-fire. A below-gate GPU
+    # must stay a DEFINITIVE flag here, not become inconclusive.
+    - name: parse_guidellm — flat noise ladder is not flagged unsaturated
+      vars:
+        gpu_benchmark:
+          guidellm_status: successful
+          guidellm_profile: "--profile 'kind=sweep' --data 'kind=synthetic_text,prompt_tokens=512,output_tokens=256,max_concurrency=128'"
+        _guidellm_report:
+          benchmarks:
+          - config: {strategy: {type_: synchronous, }}
+            metrics:
+              requests_per_second: {successful: {mean: 0.9}}
+              output_tokens_per_second: {successful: {mean: 230.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 12, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 1, }}
+            metrics:
+              requests_per_second: {successful: {mean: 1.5}}
+              output_tokens_per_second: {successful: {mean: 2000.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 2, }}
+            metrics:
+              requests_per_second: {successful: {mean: 3.0}}
+              output_tokens_per_second: {successful: {mean: 2005.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 3, }}
+            metrics:
+              requests_per_second: {successful: {mean: 4.5}}
+              output_tokens_per_second: {successful: {mean: 2003.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 4, }}
+            metrics:
+              requests_per_second: {successful: {mean: 6.0}}
+              output_tokens_per_second: {successful: {mean: 2004.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: constant, rate: 5, }}
+            metrics:
+              requests_per_second: {successful: {mean: 7.5}}
+              output_tokens_per_second: {successful: {mean: 2006.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 40, errored: 0, incomplete: 0}
+          - config: {strategy: {type_: throughput, }}
+            metrics:
+              requests_per_second: {successful: {mean: 8.203125}}
+              output_tokens_per_second: {successful: {mean: 2100.0}}
+              output_token_count: {successful: {mean: 256}}
+              request_concurrency: {successful: {mean: 100}}
+              time_to_first_token_ms: {successful: {percentiles: {p95: 40.0}}}
+              inter_token_latency_ms: {successful: {percentiles: {p95: 9.7}}}
+              time_per_output_token_ms: {successful: {percentiles: {p95: 9.8}}}
+              request_latency: {successful: {percentiles: {p95: 2.5}}}
+              request_totals: {successful: 500, errored: 0, incomplete: 0}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/parse_guidellm.yml
+    - name: assert the flat ladder is not flagged
+      ansible.builtin.assert:
+        that:
+          - (_llm_metrics.sweep_unsaturated | string) == 'False'
+        fail_msg: "parse_guidellm flat-ladder case produced {{ _llm_metrics }}"
+
     - name: parse_guidellm — synchronous phase selected by TYPE, not min-RPS (slow-GPU case)
       vars:
         # throughput probe FAILED (0 successful, rps 0) so it sorts BEFORE the
@@ -693,6 +1113,113 @@
           - (_baseline_delta.rows | selectattr('metric', 'search', 'sustained') | first).baremetal | float == 10.96
         fail_msg: "compare_baseline sweep-lift case produced {{ _baseline_delta }}"
 
+    # The in-cluster hardware probe adds '[k8s]' hardware rows sharing the
+    # bare side with the health-VM rows; they carry NO measurement guards
+    # (a breach flags), and a probe that produced nothing adds no rows.
+    - name: compare_baseline — k8s hardware probe rows
+      vars:
+        gpu_benchmark:
+          compare_min_samples: 30
+          compare_min_throughput_req_s: 1.0
+          baremetal: {baseline_tolerance_pct: 10}
+        _baseline:
+          hosts:
+            n1:
+              gpus:
+                - {gpu: 0, cublas_gflops: "57000.0", pcie_h2d_gbs: "26.0", pcie_d2h_gbs: "27.0"}
+        _post_llm: {}
+        _post_health_hosts:
+          - cublas: [{gpu: 0, gflops: 56500.0}]
+            pcie_bw: [{gpu: 0, h2d_gbs: 25.8, d2h_gbs: 26.9}]
+        _k8s_hw_hosts:
+          - node: w0
+            cublas: [{gpu: 0, gflops: 55000.0}]
+            pcie_bw: [{gpu: 0, h2d_gbs: 20.8, d2h_gbs: 26.5}]
+        _k8s_hw_probe_error: ''
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_baseline.yml
+    - name: assert the k8s hardware rows
+      ansible.builtin.assert:
+        that:
+          # both environments' hardware rows coexist
+          - _baseline_delta.rows | selectattr('metric', 'eq', 'cuBLAS GFLOP/s') | list | length == 1
+          - _baseline_delta.rows | selectattr('metric', 'eq', 'cuBLAS GFLOP/s [k8s]') | list | length == 1
+          - (_baseline_delta.rows | selectattr('metric', 'eq', 'cuBLAS GFLOP/s [k8s]') | first).virtualized | float == 55000.0
+          # (57000-55000)/57000 = 3.5% — within tolerance
+          - (_baseline_delta.rows | selectattr('metric', 'eq', 'cuBLAS GFLOP/s [k8s]') | first).overhead_pct | float == 3.5
+          - (_baseline_delta.rows | selectattr('metric', 'eq', 'cuBLAS GFLOP/s [k8s]') | first).ok
+          # (26.0-20.8)/26.0 = 20.0% — hardware rows have no guards: FLAG
+          - not (_baseline_delta.rows | selectattr('metric', 'eq', 'PCIe H2D GB/s [k8s]') | first).ok
+          - _baseline_delta.status == 'flag'
+          # empty probe error -> no probe caveat
+          - _baseline_delta.caveats | select('search', 'hardware probe failed') | list | length == 0
+          # hw-only [k8s] rows (no k8s LLM entries) still get the NUMA caveat
+          - _baseline_delta.caveats | select('search', 'NUMA') | list | length == 1
+        fail_msg: "compare_baseline k8s-hw case produced {{ _baseline_delta }}"
+
+    - name: compare_baseline — failed probe adds no rows and a caveat
+      vars:
+        gpu_benchmark:
+          compare_min_samples: 30
+          compare_min_throughput_req_s: 1.0
+          baremetal: {baseline_tolerance_pct: 10}
+        _baseline:
+          hosts:
+            n1:
+              gpus:
+                - {gpu: 0, cublas_gflops: "57000.0", pcie_h2d_gbs: "26.0", pcie_d2h_gbs: "27.0"}
+        _post_llm: {}
+        _post_health_hosts:
+          - cublas: [{gpu: 0, gflops: 56500.0}]
+            pcie_bw: [{gpu: 0, h2d_gbs: 25.8, d2h_gbs: 26.9}]
+        _k8s_hw_hosts: []
+        _k8s_hw_probe_error: 'w0: ImagePullBackOff'
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_baseline.yml
+    - name: assert the failed-probe behavior
+      ansible.builtin.assert:
+        that:
+          - _baseline_delta.rows | selectattr('metric', 'search', '\[k8s\]') | list | length == 0
+          - _baseline_delta.caveats | select('search', 'hardware probe failed') | list | length == 1
+          - _baseline_delta.caveats | select('search', 'ImagePullBackOff') | list | length == 1
+          # total wipeout -> the caveat states there are NO k8s values
+          - _baseline_delta.caveats | select('search', 'no Kubernetes value') | list | length == 1
+        fail_msg: "compare_baseline failed-probe case produced {{ _baseline_delta }}"
+
+    # PARTIAL probe failure: some workers succeeded (rows exist) while
+    # others errored — the caveat must say the values cover only the
+    # surviving workers, not that they are absent.
+    - name: compare_baseline — partial probe failure keeps rows, adjusts caveat
+      vars:
+        gpu_benchmark:
+          compare_min_samples: 30
+          compare_min_throughput_req_s: 1.0
+          baremetal: {baseline_tolerance_pct: 10}
+        _baseline:
+          hosts:
+            n1:
+              gpus:
+                - {gpu: 0, cublas_gflops: "57000.0", pcie_h2d_gbs: "26.0", pcie_d2h_gbs: "27.0"}
+        _post_llm: {}
+        _post_health_hosts: []
+        _k8s_hw_hosts:
+          - node: w0
+            cublas: [{gpu: 0, gflops: 55000.0}]
+            pcie_bw: [{gpu: 0, h2d_gbs: 25.0, d2h_gbs: 26.5}]
+        _k8s_hw_probe_error: 'w1: probe job FAILED'
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_baseline.yml
+    - name: assert the partial-failure behavior
+      ansible.builtin.assert:
+        that:
+          - _baseline_delta.rows | selectattr('metric', 'eq', 'cuBLAS GFLOP/s [k8s]') | list | length == 1
+          - _baseline_delta.caveats | select('search', 'workers that succeeded') | list | length == 1
+          - _baseline_delta.caveats | select('search', 'no Kubernetes value') | list | length == 0
+        fail_msg: "compare_baseline partial-probe case produced {{ _baseline_delta }}"
+
     # The sweep-lift divisor is DERIVED, not hardcoded 256: per-side stored
     # tokens_per_request wins; a side without it falls back to the
     # output_tokens= value from the shared profile (512 here).
@@ -803,6 +1330,61 @@
           - (_baseline_delta.rows | selectattr('metric', 'search', 'TTFT') | first).ok
           - _baseline_delta.status == 'ok'
         fail_msg: "compare_baseline truncated-virt case produced {{ _baseline_delta }}"
+
+    # UNSATURATED, baseline edition — the run-23 live case: every post-side
+    # probe landed in the slow client mode (~12.8 req/s vs the 15.31
+    # baseline), a ~16% apparent overhead that is a measurement artifact.
+    # The unsaturated flag must make the breach inconclusive AND surface
+    # the run-level caveat naming the side.
+    - name: compare_baseline — unsaturated virt side makes a breach inconclusive
+      vars:
+        gpu_benchmark:
+          compare_min_samples: 30
+          compare_min_throughput_req_s: 1.0
+          baremetal: {baseline_tolerance_pct: 10}
+        _baseline:
+          hosts:
+            n1:
+              gpus: []
+              llm:
+                "m1":
+                  per_gpu:
+                    - gpu: 0
+                      metrics:
+                        output_tok_s_saturated: "3918.22"
+                        throughput_req_s_mean: "15.31"
+                        ttft_p95_ms: "35.88"
+                        requests_successful: "3290"
+        _post_llm:
+          "m1":
+            model: "m1"
+            per_gpu:
+              - gpu: 0
+                metrics:
+                  output_tok_s_saturated: "3276.82"
+                  throughput_req_s_mean: "12.8"
+                  ttft_p95_ms: "38.22"
+                  requests_successful: "2648"
+                  sweep_unsaturated: true
+        _post_health_hosts: []
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_baseline.yml
+    - name: assert the unsaturated-virt breach is inconclusive with a caveat
+      ansible.builtin.assert:
+        that:
+          # 16.4% apparent overhead, yet ok with the lower-bound note
+          - (_baseline_delta.rows | selectattr('metric', 'search', 'output tok/s') | first).ok
+          - "'lower bound' in (_baseline_delta.rows | selectattr('metric', 'search', 'output tok/s') | first).note"
+          - (_baseline_delta.rows | selectattr('metric', 'search', 'sustained') | first).ok
+          # TTFT 38.22 vs 35.88 = 6.5% -> ok on merit
+          - (_baseline_delta.rows | selectattr('metric', 'search', 'TTFT') | first).ok
+          - _baseline_delta.status == 'ok'
+          # run-level caveat names the side and the lower-bound semantics
+          - _baseline_delta.caveats | select('search', 'UNSATURATED') | list | length == 1
+          - _baseline_delta.caveats | select('search', 'UNSATURATED') | first is search('this run')
+          - not (_baseline_delta.caveats | select('search', 'UNSATURATED') | first is search('baseline'))
+        fail_msg: "compare_baseline unsaturated-virt case produced {{ _baseline_delta }}"
 
     # Control: the SAME numbers WITHOUT truncation must still flag — the
     # guard must not blanket-suppress real overhead.
@@ -934,6 +1516,71 @@
           - _baseline_delta.caveats | select('search', 'LOAD PROFILE') | list | length == 0
         fail_msg: "compare_baseline profile-match case produced {{ _baseline_delta.caveats }}"
 
+    # BACKEND dimension: appliance and k8s entries for the SAME model are
+    # compared independently against the SAME bare-metal baseline; k8s rows
+    # carry the [k8s] label, appliance rows stay unlabeled (old-report
+    # compatible). Entries without a backend field count as appliance.
+    - name: compare_baseline — two backends compare independently against one baseline
+      vars:
+        gpu_benchmark:
+          compare_min_samples: 30
+          compare_min_throughput_req_s: 1.0
+          baremetal: {baseline_tolerance_pct: 10}
+        _baseline:
+          hosts:
+            n1:
+              gpus: []
+              llm:
+                "m1":
+                  per_gpu:
+                    - gpu: 0
+                      metrics:
+                        output_tok_s_saturated: "3918.0"
+                        throughput_req_s_mean: "15.31"
+                        ttft_p95_ms: "35.9"
+                        requests_successful: "3599"
+        _post_llm:
+          "m1":
+            model: "m1"
+            backend: appliance
+            per_gpu:
+              - gpu: 0
+                metrics:
+                  output_tok_s_saturated: "3771.0"
+                  throughput_req_s_mean: "14.73"
+                  ttft_p95_ms: "39.0"
+                  requests_successful: "3300"
+          "m1 · k8s":
+            model: "m1"
+            backend: k8s
+            per_gpu:
+              - gpu: 0
+                metrics:
+                  output_tok_s_saturated: "3600.0"
+                  throughput_req_s_mean: "14.06"
+                  ttft_p95_ms: "38.5"
+                  requests_successful: "3200"
+        _post_health_hosts: []
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_baseline.yml
+    - name: assert per-backend rows against the shared baseline
+      ansible.builtin.assert:
+        that:
+          # 3 LLM rows per backend = 6 total
+          - _baseline_delta.rows | selectattr('metric', 'search', 'm1') | list | length == 6
+          # k8s rows labeled, appliance rows not
+          - _baseline_delta.rows | selectattr('metric', 'search', '\\[k8s\\]') | list | length == 3
+          # both tok/s rows compare against the SAME bare value 3918
+          - (_baseline_delta.rows | selectattr('metric', 'eq', 'm1 — output tok/s (peak)') | first).baremetal | float == 3918.0
+          - (_baseline_delta.rows | selectattr('metric', 'eq', 'm1 [k8s] — output tok/s (peak)') | first).baremetal | float == 3918.0
+          # per-backend virt values kept apart
+          - (_baseline_delta.rows | selectattr('metric', 'eq', 'm1 — output tok/s (peak)') | first).virtualized | float == 3771.0
+          - (_baseline_delta.rows | selectattr('metric', 'eq', 'm1 [k8s] — output tok/s (peak)') | first).virtualized | float == 3600.0
+          # both within the 10% tolerance here
+          - _baseline_delta.status == 'ok'
+        fail_msg: "compare_baseline backend-pair case produced {{ _baseline_delta.rows }}"
+
     - name: parse_guidellm — minimal report (no config/otps/concurrency/totals) degrades gracefully
       vars:
         _guidellm_report:
@@ -1009,6 +1656,31 @@
           - _llm_eval.throughput_inconclusive | bool
           - _llm_eval.status == 'ok'
         fail_msg: "evaluate_llm truncated-below-floor produced {{ _llm_eval }}"
+
+    # UNSATURATED gets the identical gate treatment — the run-23 live case:
+    # 12.8 req/s (slow-mode client, lower bound) against a 13.0 gate must
+    # be inconclusive, not a flag.
+    - name: evaluate_llm — unsaturated sweep below the throughput floor is inconclusive
+      vars:
+        gpu_benchmark:
+          thresholds: {profile: chat, ttft_p95_ms: 200, itl_p95_ms: 50, min_throughput_req_s: 13.0}
+        _llm_metrics:
+          throughput_req_s_mean: 12.8
+          req_latency_p95_s: 2.5
+          ttft_p95_ms: 38.22
+          itl_p95_ms: 9.69
+          tpot_p95_ms: 9.8
+          sweep_unsaturated: true
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/evaluate_llm.yml
+    - name: assert unsaturated-below-floor is inconclusive
+      ansible.builtin.assert:
+        that:
+          - _llm_eval.throughput_ok | bool
+          - _llm_eval.throughput_inconclusive | bool
+          - _llm_eval.status == 'ok'
+        fail_msg: "evaluate_llm unsaturated-below-floor produced {{ _llm_eval }}"
 
     # A truncated lower bound ABOVE the gate is a definitive pass — no
     # inconclusive marker; and an UNtruncated value below the gate still flags.
@@ -1223,10 +1895,30 @@
           # 47.8% spread would flag, but the sweep is truncated -> suppressed with note
           - (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).flagged_gpus | length == 0
           - (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).ok
-          - "'sweep truncated on GPU 1' in (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).note"
+          - "'sweep truncated/unsaturated on GPU 1' in (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).note"
           # ttft (sync run, ladder-independent): 100 > 40*1.2 -> still flagged
           - (_gpu_delta.metrics | selectattr('metric', 'eq', 'ttft_p95_ms') | first).flagged_gpus == [1]
         fail_msg: "compare_gpus truncated case produced {{ _gpu_delta }}"
+
+    # UNSATURATED sweeps get the identical directional treatment: the
+    # slow-mode guidellm client under-measures the probe, the ladder stops
+    # below the knee, and a throughput gap against that GPU (10.0 vs
+    # 14.69 = 32%, past the 20% bound) is a measurement artifact.
+    - name: compare_gpus — unsaturated sweep suppresses throughput like truncated
+      vars:
+        gpu_benchmark: {llm_variance_pct: 20}
+        _model_gpu_results:
+          - {gpu: 0, metrics: {throughput_req_s_mean: "14.69", req_latency_p95_s: "2.5", ttft_p95_ms: "40", itl_p95_ms: "9.7", tpot_p95_ms: "9.8", requests_successful: "120", sweep_unsaturated: false}}
+          - {gpu: 1, metrics: {throughput_req_s_mean: "10.0", req_latency_p95_s: "2.5", ttft_p95_ms: "40", itl_p95_ms: "9.7", tpot_p95_ms: "9.8", requests_successful: "120", sweep_unsaturated: true}}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_gpus.yml
+    - name: assert unsaturated suppression mirrors truncated
+      ansible.builtin.assert:
+        that:
+          - (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).flagged_gpus | length == 0
+          - "'sweep truncated/unsaturated on GPU 1' in (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).note"
+        fail_msg: "compare_gpus unsaturated case produced {{ _gpu_delta }}"
 
     # DIRECTIONAL: a truncated BEST only understates the spread — an
     # untruncated sibling below the variance bound has a GENUINE deficit
@@ -1247,7 +1939,7 @@
           # 5.0 < 10.97*0.8 and GPU 1's own sweep is complete -> real deficit
           - (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).flagged_gpus == [1]
           - not (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).ok
-          - "'sweep truncated on GPU 0' in (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).note"
+          - "'sweep truncated/unsaturated on GPU 0' in (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).note"
         fail_msg: "compare_gpus truncated-best case produced {{ _gpu_delta }}"
 
     - name: compare_gpus — 3 GPUs, only the outlier flagged; best is never flagged
@@ -1762,3 +2454,17 @@
       ansible.builtin.assert:
         that: _cluster_status == 'flag'
         fail_msg: "aggregate_status produced {{ _cluster_status }}"
+
+    # --- K8s backend: defaults contract ---
+    - name: k8s backend — load role defaults
+      ansible.builtin.include_vars:
+        file: ../../roles/gpu-benchmark/defaults/main.yml
+        name: _gb_defaults
+    - name: assert backend defaults keep appliance-only semantics and guide pins
+      ansible.builtin.assert:
+        that:
+          - _gb_defaults._gpu_benchmark_defaults.llm_backends == ['appliance']
+          - _gb_defaults._gpu_benchmark_defaults.k8s.capi_app_name == 'Service Capi'
+          - _gb_defaults._gpu_benchmark_defaults.k8s.capone_chart_version == '0.1.7'
+          - _gb_defaults._gpu_benchmark_defaults.k8s.gpu_operator_version == 'v25.3.2'
+        fail_msg: "k8s defaults produced {{ _gb_defaults._gpu_benchmark_defaults.llm_backends | default('?') }} / {{ _gb_defaults._gpu_benchmark_defaults.k8s | default({}) }}"

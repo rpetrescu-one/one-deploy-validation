@@ -1,0 +1,54 @@
+---
+# In-cluster hardware probe: the health flow's cuBLAS SGEMM + PCIe
+# bandwidth sources run in a CUDA-devel Job pinned to each GPU worker
+# (hw-probe.yaml.j2), so the overhead table's hardware rows also get a
+# Kubernetes value. K8s workers cannot be NUMA-pinned — the in-pod PCIe
+# number is what attributes (or clears) NUMA placement when the [k8s]
+# LLM rows breach tolerance. Best-effort by design: any failure records
+# _k8s_hw_probe_error (surfaced as a report caveat) and the LLM
+# benchmark still runs.
+- name: Reset the hardware-probe accumulators
+  ansible.builtin.set_fact:
+    _k8s_hw: []
+    _k8s_hw_probe_error: ''
+
+- name: In-cluster hardware probe
+  block:
+    - name: Stage the benchmark sources on the frontend
+      become: true
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "/tmp/gpu_benchmark/{{ item }}"
+        mode: "0644"
+      loop:
+        - cublas_sgemm.cu
+        - pcie_bandwidth.cu
+
+    - name: Create or refresh the benchmark-source ConfigMap
+      become: true
+      ansible.builtin.shell: |
+        set -o errexit -o pipefail
+        export KUBECONFIG={{ _k8s_kubeconfig }}
+        kubectl create configmap gpu-bench-hw-src \
+          --from-file=cublas_sgemm.cu=/tmp/gpu_benchmark/cublas_sgemm.cu \
+          --from-file=pcie_bandwidth.cu=/tmp/gpu_benchmark/pcie_bandwidth.cu \
+          --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Probe each GPU worker
+      ansible.builtin.include_tasks: hw_probe_node.yml
+      loop: "{{ _k8s_nodes }}"
+      loop_control:
+        loop_var: _k8s_hw_node
+        index_var: _k8s_hw_idx
+        label: "worker {{ _k8s_hw_idx }} ({{ _k8s_hw_node }})"
+
+  rescue:
+    - name: Record the probe failure (non-fatal)
+      ansible.builtin.set_fact:
+        _k8s_hw_probe_error: >-
+          {{ ((_k8s_hw_probe_error | default('') ~ ' ') | trim ~ ' '
+              ~ (ansible_failed_result.msg | default('error') | string | truncate(200, true))) | trim }}
+      no_log: true

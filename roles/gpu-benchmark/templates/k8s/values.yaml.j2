@@ -1,0 +1,131 @@
+{# capone-rke2 values — the AI-ready K8s guide's values.yaml VERBATIM,
+   parametrized ONLY where declared in the design: XMLRPC endpoint/auth,
+   image URLs (knobs, same defaults as the guide), the benchmark vnet in
+   place of $ONE_VNET, worker sizing (vm.vcpu / vm.memory_mb /
+   k8s.worker_disk_mb — the deliberate resources deviation), the PCI
+   DEVICE id auto-filled from the host inventory when uniform, and the
+   worker count = benchmarked GPU count. `{{ '{{' }} .Release.Name {{ '}}' }}`
+   is HELM templating and must reach helm literally. #}
+ONE_XMLRPC: "http://{{ _k8s_frontend_ip }}:2633/RPC2"
+ONE_AUTH: "{{ _k8s_one_auth }}"
+
+ROUTER_TEMPLATE_NAME: "{% raw %}{{ .Release.Name }}{% endraw %}-router"
+MASTER_TEMPLATE_NAME: "{% raw %}{{ .Release.Name }}{% endraw %}-master"
+WORKER_TEMPLATE_NAME: "{% raw %}{{ .Release.Name }}{% endraw %}-worker"
+
+CLUSTER_IMAGES:
+- imageName: "{% raw %}{{ .Release.Name }}{% endraw %}-router"
+  imageContent: |
+    PATH = "{{ gpu_benchmark.k8s.router_image_url }}"
+    DEV_PREFIX = "vd"
+- imageName: "{% raw %}{{ .Release.Name }}{% endraw %}-node"
+  imageContent: |
+    PATH = "{{ gpu_benchmark.k8s.node_image_url }}"
+    DEV_PREFIX = "vd"
+
+CLUSTER_TEMPLATES:
+- templateName: "{% raw %}{{ .Release.Name }}{% endraw %}-router"
+  templateContent: |
+    CONTEXT = [
+        NETWORK = "YES",
+        ONEAPP_VNF_DNS_ENABLED = "YES",
+        ONEAPP_VNF_DNS_NAMESERVERS = "1.1.1.1,8.8.8.8",
+        ONEAPP_VNF_DNS_USE_ROOTSERVERS = "NO",
+        ONEAPP_VNF_NAT4_ENABLED = "YES",
+        ONEAPP_VNF_NAT4_INTERFACES_OUT = "eth0",
+        ONEAPP_VNF_ROUTER4_ENABLED = "YES",
+        SSH_PUBLIC_KEY = "$USER[SSH_PUBLIC_KEY]",
+        TOKEN = "YES" ]
+    CPU = "1"
+    CPU_MODEL=[
+        MODEL="host-passthrough" ]
+    DISK = [
+        IMAGE = "{% raw %}{{ .Release.Name }}{% endraw %}-router" ]
+    GRAPHICS = [
+        LISTEN = "0.0.0.0",
+        TYPE = "vnc" ]
+    LXD_SECURITY_PRIVILEGED = "true"
+    MEMORY = "4096"
+    NIC_DEFAULT = [
+        MODEL = "virtio" ]
+    SCHED_REQUIREMENTS="HYPERVISOR=kvm"
+    OS = [
+        ARCH = "x86_64",
+        FIRMWARE_SECURE = "YES" ]
+    VCPU = "2"
+    VROUTER = "YES"
+- templateName: "{% raw %}{{ .Release.Name }}{% endraw %}-master"
+  templateContent: |
+    CONTEXT = [
+        BACKEND = "YES",
+        NETWORK = "YES",
+        GROW_FS = "/",
+        SET_HOSTNAME = "$NAME",
+        SSH_PUBLIC_KEY = "$USER[SSH_PUBLIC_KEY]",
+        TOKEN = "YES" ]
+    CPU = "12"
+    CPU_MODEL=[
+        MODEL="host-passthrough" ]
+    DISK = [
+        IMAGE = "{% raw %}{{ .Release.Name }}{% endraw %}-node",
+        SIZE = "41920" ]
+    FEATURES=[
+        ACPI="yes",
+        APIC="yes",
+        PAE="yes" ]
+    GRAPHICS = [
+        LISTEN = "0.0.0.0",
+        TYPE = "vnc" ]
+    HYPERVISOR = "kvm"
+    LXD_SECURITY_PRIVILEGED = "true"
+    MEMORY = "32768"
+    NIC=[
+        NETWORK="{{ _k8s_vnet }}" ]
+    OS = [
+        ARCH = "x86_64",
+        FIRMWARE="UEFI",
+        MACHINE="pc-q35-noble" ]
+    SCHED_REQUIREMENTS = "HYPERVISOR=kvm"
+    VCPU = "16"
+- templateName: "{% raw %}{{ .Release.Name }}{% endraw %}-worker"
+  templateContent: |
+    CONTEXT = [
+        BACKEND = "YES",
+        NETWORK = "YES",
+        GROW_FS = "/",
+        SET_HOSTNAME = "$NAME",
+        SSH_PUBLIC_KEY = "$USER[SSH_PUBLIC_KEY]",
+        TOKEN = "YES" ]
+    CPU = "{{ gpu_benchmark.vm.vcpu }}"
+    CPU_MODEL=[
+        MODEL="host-passthrough" ]
+    DISK = [
+        IMAGE = "{% raw %}{{ .Release.Name }}{% endraw %}-node",
+        SIZE = "{{ gpu_benchmark.k8s.worker_disk_mb }}" ]
+    FEATURES=[
+        ACPI="yes",
+        APIC="yes",
+        PAE="yes" ]
+    GRAPHICS = [
+        LISTEN = "0.0.0.0",
+        TYPE = "vnc" ]
+    HYPERVISOR = "kvm"
+    LXD_SECURITY_PRIVILEGED = "true"
+    MEMORY = "{{ gpu_benchmark.vm.memory_mb }}"
+    NIC=[
+        NETWORK="{{ _k8s_vnet }}" ]
+    OS=[
+        ARCH="x86_64",
+        FIRMWARE="UEFI",
+        MACHINE="pc-q35-noble" ]
+    PCI=[
+        CLASS="0302",
+        {% if _k8s_pci_device | default('') | length > 0 %}DEVICE="{{ _k8s_pci_device }}",
+        {% endif %}VENDOR="10de" ]
+    SCHED_REQUIREMENTS="HYPERVISOR=kvm & ID=\"{{ _k8s_host_id }}\""
+    VCPU = "{{ gpu_benchmark.vm.vcpu }}"
+
+CONTROL_PLANE_MACHINE_COUNT: 1
+WORKER_MACHINE_COUNT: {{ _k8s_worker_count }}
+PUBLIC_NETWORK_NAME: {{ _k8s_vnet }}
+PRIVATE_NETWORK_NAME: {{ _k8s_vnet }}

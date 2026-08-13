@@ -51,7 +51,39 @@
          | reject('mapping') | flatten | map(attribute=item.vkey) | map('string')
          | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list }}
 
-# --- LLM specs, per model present on BOTH sides ---
+# --- K8s hardware specs (bare side unchanged, k8s side from the in-cluster
+#     probe). Rows appear ONLY when the probe produced a value: an absent /
+#     failed probe keeps the report's Kubernetes cell at '—' instead of
+#     emitting a spurious 'missing on one side' row. ---
+- name: Build K8s hardware comparison specs
+  ansible.builtin.set_fact:
+    _cb_specs: >-
+      {{ _cb_specs + ([{
+        'metric': item.label ~ ' [k8s]', 'better': item.better,
+        'bare': (_bare_vals | max) if (_bare_vals | length > 0) else '',
+        'virt': (_virt_vals | max) if (_virt_vals | length > 0) else '',
+        'samples_guard': true, 'floor_guard': true
+      }] if (_virt_vals | length > 0) else []) }}
+  loop:
+    - {label: 'cuBLAS GFLOP/s', better: higher, bkey: cublas_gflops, vlist: cublas, vkey: gflops}
+    - {label: 'PCIe H2D GB/s', better: higher, bkey: pcie_h2d_gbs, vlist: pcie_bw, vkey: h2d_gbs}
+    - {label: 'PCIe D2H GB/s', better: higher, bkey: pcie_d2h_gbs, vlist: pcie_bw, vkey: d2h_gbs}
+  loop_control:
+    label: "{{ item.label }} [k8s]"
+  vars:
+    _bare_vals: >-
+      {{ _cb_bm_gpus | map(attribute=item.bkey) | map('string')
+         | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list }}
+    _virt_vals: >-
+      {{ _k8s_hw_hosts | default([]) | map(attribute=item.vlist) | select('defined')
+         | reject('mapping') | flatten | map(attribute=item.vkey) | map('string')
+         | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list }}
+
+# --- LLM specs, per (model, backend) pair present in the post run ---
+# Every backend ('appliance', 'k8s') is compared against the SAME
+# bare-metal baseline entry for its model; non-appliance rows carry the
+# backend in the metric label so the report distinguishes them. Entries
+# without a backend field (old data) count as 'appliance'.
 - name: Build LLM comparison specs
   ansible.builtin.set_fact:
     _cb_specs: >-
@@ -59,24 +91,39 @@
          + ([_spec_otps] if ((_b_otps | length > 0) or (_v_otps | length > 0)) else [])
          + ([_spec_thr] if ((_b_thr | length > 0) or (_v_thr | length > 0)) else [])
          + ([_spec_ttft] if ((_b_ttft | length > 0) or (_v_ttft | length > 0)) else []) }}
-  loop: "{{ _cb_models }}"
+  loop: "{{ _cb_pairs }}"
   loop_control:
-    loop_var: _cb_model
-    label: "{{ _cb_model }}"
+    loop_var: _cb_pair
+    label: "{{ _cb_pair.0 }} ({{ _cb_pair.1 }})"
   vars:
-    _cb_models: >-
-      {{ _post_llm | default({}) | dict2items | map(attribute='value')
-         | selectattr('model', 'defined') | map(attribute='model') | unique | list }}
+    _cb_model: "{{ _cb_pair.0 }}"
+    _cb_backend: "{{ _cb_pair.1 }}"
+    _cb_blabel: "{{ '' if (_cb_backend == 'appliance') else ' [' ~ _cb_backend ~ ']' }}"
+    _cb_pairs: >-
+      {%- set out = [] -%}
+      {%- for v in (_post_llm | default({})).values() -%}
+        {%- if v.model is defined -%}
+          {%- set pair = [v.model, v.backend | default('appliance')] -%}
+          {%- if pair not in out -%}{{- out.append(pair) -}}{%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{- out -}}
     _bare_pg: >-
       {{ _baseline.hosts | default({}) | dict2items | map(attribute='value.llm') | select('defined')
          | map('dict2items') | flatten | selectattr('key', 'eq', _cb_model)
          | map(attribute='value.per_gpu') | select('defined') | flatten
          | selectattr('metrics', 'defined') | map(attribute='metrics') | list }}
     _virt_pg: >-
-      {{ _post_llm | default({}) | dict2items | map(attribute='value')
-         | selectattr('model', 'defined') | selectattr('model', 'eq', _cb_model)
-         | map(attribute='per_gpu') | select('defined') | flatten
-         | selectattr('metrics', 'defined') | map(attribute='metrics') | list }}
+      {%- set out = [] -%}
+      {%- for v in (_post_llm | default({})).values() -%}
+        {%- if (v.model is defined) and (v.model == _cb_model)
+              and ((v.backend | default('appliance')) == _cb_backend) -%}
+          {%- for pg in v.per_gpu | default([]) -%}
+            {%- if pg.metrics is defined -%}{{- out.append(pg.metrics) -}}{%- endif -%}
+          {%- endfor -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{- out -}}
     # tok/s from the stored headline AND the stored sweep maxima: the peak of
     # the load curve is the stable capacity number (headline semantics changed
     # to it in parse_guidellm), and reading the sweep here keeps OLD baselines
@@ -111,15 +158,20 @@
     _b_ttft: "{{ _bare_pg | map(attribute='ttft_p95_ms') | map('string') | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list }}"
     _v_ttft: "{{ _virt_pg | map(attribute='ttft_p95_ms') | map('string') | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list }}"
     # Untruncated-only virt candidates: when the virt-side BEST comes from a
-    # TRUNCATED sweep it is a lower bound, so an apparent overhead breach is
-    # INCONCLUSIVE (the true value may be within tolerance) — mirrored from
-    # the compare_gpus directional rule. A truncated BARE side needs no
-    # guard: it understates the baseline, so a breach against it is real.
+    # TRUNCATED or UNSATURATED sweep it is a lower bound, so an apparent
+    # overhead breach is INCONCLUSIVE (the true value may be within
+    # tolerance) — mirrored from the compare_gpus directional rule. A
+    # truncated BARE side needs no guard: it understates the baseline, so a
+    # breach against it is real.
     # 'in [true,"True"]': ansible 2.18 stringifies stored bools.
     _virt_pg_ut: >-
-      {{ (_virt_pg | rejectattr('sweep_truncated', 'defined') | list)
-         + (_virt_pg | selectattr('sweep_truncated', 'defined')
-            | rejectattr('sweep_truncated', 'in', [true, 'True']) | list) }}
+      {%- set out = [] -%}
+      {%- for pg in _virt_pg -%}
+        {%- set tr = pg.sweep_truncated | default(false) in [true, 'True'] -%}
+        {%- set un = pg.sweep_unsaturated | default(false) in [true, 'True'] -%}
+        {%- if (not tr) and (not un) -%}{{- out.append(pg) -}}{%- endif -%}
+      {%- endfor -%}
+      {{- out -}}
     _v_sw_ut: "{{ _virt_pg_ut | map(attribute='sweep') | select('defined') | flatten | map(attribute='output_tok_s') | map('string') | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list }}"
     _v_otps_ut: >-
       {{ (_virt_pg_ut | map(attribute='output_tok_s_saturated') | map('string') | select('match', '^[0-9.]+$') | map('float') | select('gt', 0.0) | list)
@@ -142,7 +194,7 @@
       {{ ((_b_thr | max) if (_b_thr | length > 0) else 0.0) | float
          >= (gpu_benchmark.compare_min_throughput_req_s | default(1.0) | float) }}
     _spec_otps:
-      metric: "{{ _cb_model }} — output tok/s (peak)"
+      metric: "{{ _cb_model }}{{ _cb_blabel }} — output tok/s (peak)"
       better: higher
       bare: "{{ (_b_otps | max) if (_b_otps | length > 0) else '' }}"
       virt: "{{ (_v_otps | max) if (_v_otps | length > 0) else '' }}"
@@ -150,7 +202,7 @@
       floor_guard: true
       virt_lower_bound: "{{ _v_otps_lb }}"
     _spec_thr:
-      metric: "{{ _cb_model }} — sustained req/s"
+      metric: "{{ _cb_model }}{{ _cb_blabel }} — sustained req/s"
       better: higher
       bare: "{{ (_b_thr | max) if (_b_thr | length > 0) else '' }}"
       virt: "{{ (_v_thr | max) if (_v_thr | length > 0) else '' }}"
@@ -158,7 +210,7 @@
       floor_guard: "{{ _thr_floor_ok }}"
       virt_lower_bound: "{{ _v_thr_lb }}"
     _spec_ttft:
-      metric: "{{ _cb_model }} — TTFT p95 ms (sync)"
+      metric: "{{ _cb_model }}{{ _cb_blabel }} — TTFT p95 ms (sync)"
       better: lower
       bare: "{{ (_b_ttft | min) if (_b_ttft | length > 0) else '' }}"
       virt: "{{ (_v_ttft | min) if (_v_ttft | length > 0) else '' }}"
@@ -205,7 +257,7 @@
     _ok: "{{ (not (_breach | bool)) or (not (_guards_ok | bool)) or (_virt_lb | bool) }}"
     _note: >-
       {{ ('missing on one side' if (not (_have_both | bool))
-          else (('virtualized side is a lower bound (sweep truncated) — overhead inconclusive') if ((_breach | bool) and (_virt_lb | bool))
+          else (('virtualized side is a lower bound (sweep truncated/unsaturated) — overhead inconclusive') if ((_breach | bool) and (_virt_lb | bool))
                 else ('insufficient sample' if ((_breach | bool) and (not (item.samples_guard | bool)))
                       else ('below measurement floor' if ((_breach | bool) and (not (item.floor_guard | bool)))
                             else '')))) }}
@@ -224,9 +276,31 @@
              ~ (['baseline'] if (_bm_trunc | length > 0) else []) | union(['this run'] if (_post_trunc | length > 0) else []) | join(' and ')
              ~ ') — the affected side may understate its true throughput.']
             if ((_bm_trunc | length > 0) or (_post_trunc | length > 0)) else [])
+         + (['Some load sweeps ended UNSATURATED (the guidellm client landed in its slow mode and the rate ladder stopped below the knee: '
+             ~ (['baseline'] if (_bm_unsat | length > 0) else []) | union(['this run'] if (_post_unsat | length > 0) else []) | join(' and ')
+             ~ ') — the affected side reports a LOWER BOUND, not capacity; re-run to redraw the probe.']
+            if ((_bm_unsat | length > 0) or (_post_unsat | length > 0)) else [])
          + (['LOAD PROFILE differs between runs (window/concurrency/data changed since the baseline was recorded) — throughput deltas include that difference; re-run the pre phase to refresh the baseline under the current profile.']
-            if ((_bm_profile | length > 0) and (_bm_profile != _cur_profile)) else []) }}
+            if ((_bm_profile | length > 0) and (_bm_profile != _cur_profile)) else [])
+         + (['Kubernetes workers are NOT NUMA-pinned (the capone-rke2 chart shares one worker template), unlike the numactl-pinned bare-metal baseline — part of any [k8s] row delta can come from NUMA placement luck.']
+            if (_post_has_k8s | bool) else [])
+         + ([('In-cluster hardware probe failed (' ~ (_k8s_hw_err | truncate(200, true)) ~ ') — '
+             ~ ('Kubernetes hardware values cover only the workers that succeeded.'
+                if ((_k8s_hw_hosts | default([]) | length) > 0)
+                else 'hardware rows have no Kubernetes value.'))]
+            if (_k8s_hw_err | length > 0) else []) }}
   vars:
+    _k8s_hw_err: "{{ _k8s_hw_probe_error | default('') | string | trim }}"
+    # [k8s] rows come from TWO sources — LLM entries with metrics AND the
+    # in-cluster hardware probe (which runs before the model loop and
+    # survives an LLM failure) — either one puts rows in the table that
+    # the NUMA caveat must explain.
+    _post_has_k8s: >-
+      {{ (_post_llm | default({}) | dict2items | map(attribute='value')
+          | selectattr('backend', 'defined') | selectattr('backend', 'eq', 'k8s')
+          | map(attribute='per_gpu') | select('defined') | flatten
+          | selectattr('metrics', 'defined') | list | length > 0)
+         or ((_k8s_hw_hosts | default([]) | length) > 0) }}
     _bm_profile: >-
       {{ _baseline.hosts | default({}) | dict2items | map(attribute='value.load_profile')
          | select('defined') | select('string') | select('ne', '') | first | default('') | trim }}
@@ -267,6 +341,18 @@
          | selectattr('metrics', 'defined') | map(attribute='metrics')
          | selectattr('sweep_truncated', 'defined')
          | selectattr('sweep_truncated', 'in', [true, 'True']) | list }}
+    _bm_unsat: >-
+      {{ _baseline.hosts | default({}) | dict2items | map(attribute='value.llm') | select('defined')
+         | map('dict2items') | flatten | map(attribute='value.per_gpu') | select('defined') | flatten
+         | selectattr('metrics', 'defined') | map(attribute='metrics')
+         | selectattr('sweep_unsaturated', 'defined')
+         | selectattr('sweep_unsaturated', 'in', [true, 'True']) | list }}
+    _post_unsat: >-
+      {{ _post_llm | default({}) | dict2items | map(attribute='value')
+         | map(attribute='per_gpu') | select('defined') | flatten
+         | selectattr('metrics', 'defined') | map(attribute='metrics')
+         | selectattr('sweep_unsaturated', 'defined')
+         | selectattr('sweep_unsaturated', 'in', [true, 'True']) | list }}
 
 - name: Assemble baseline delta
   ansible.builtin.set_fact:

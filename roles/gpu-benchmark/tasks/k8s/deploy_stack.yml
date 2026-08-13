@@ -1,0 +1,301 @@
+---
+# Step 1 of the AI-ready K8s guide: the Service Capi appliance (k3s
+# management cluster with the CAPONE provider), plus helm/kubectl on the
+# frontend and the management kubeconfig. Everything is idempotent so a
+# re-run after a failure reuses what already exists.
+- name: Resolve the XMLRPC endpoint IP (capi VM -> oned)
+  become: true
+  ansible.builtin.shell: |
+    set -o errexit -o pipefail
+    CFG="{{ gpu_benchmark.k8s.one_xmlrpc_ip | default('', true) }}"
+    if [ -n "$CFG" ]; then echo "$CFG"; exit 0; fi
+    BR="$(su - oneadmin -c "onevnet show '{{ _gpu_vnet_name | default(gpu_benchmark.vnet_name) }}' -j" | jq -r '.VNET.BRIDGE')"
+    ip -4 -o addr show dev "$BR" | awk '{print $4}' | cut -d/ -f1 | head -n1
+  args:
+    executable: /bin/bash
+  register: _k8s_xmlrpc_ip
+  changed_when: false
+
+- name: Assert the XMLRPC IP was resolved
+  ansible.builtin.assert:
+    that: _k8s_xmlrpc_ip.stdout | trim | length > 0
+    fail_msg: >-
+      Could not resolve an IP for oned reachable from the benchmark vnet
+      '{{ _gpu_vnet_name | default(gpu_benchmark.vnet_name) }}' — set
+      gpu_benchmark.k8s.one_xmlrpc_ip explicitly.
+
+- name: Export Service Capi from the marketplace (once per cluster)
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: export_marketapp.yml
+  vars:
+    _export_app_name: "{{ gpu_benchmark.k8s.capi_app_name }}"
+    _export_name: "service_Capi{{ current_cluster.name_suffix }}"
+    _export_ds_id: "{{ current_cluster.image_ds_id }}"
+
+- name: Remember the Capi template and names
+  ansible.builtin.set_fact:
+    _k8s_capi_template_id: "{{ _export_template_id }}"
+    _k8s_capi_vm: "gpu-bench-capi{{ current_cluster.name_suffix }}"
+    _k8s_frontend_ip: "{{ _k8s_xmlrpc_ip.stdout | trim }}"
+    # Helm release name, PER CLUSTER (name_suffix) and DNS-sanitized — it
+    # names the ONE images/templates and every workload VM, so a fixed name
+    # would collide across clusters and adopt stale releases.
+    # truncate leeway=0 (jinja default 5 lets 41-45 chars through, blowing
+    # the 63-char hostname budget for CAPI machine names) + trailing-dash
+    # strip (helm rejects a non-DNS-1123 release).
+    _k8s_release: >-
+      {{ (gpu_benchmark.k8s.release_name ~ current_cluster.name_suffix)
+         | lower | regex_replace('[^a-z0-9-]', '-')
+         | truncate(40, true, '', 0) | regex_replace('-+$', '') }}
+
+# The export returns while the marketplace download may still be running
+# (image LOCKED); bounded by deploy_timeout_s — a throttled CDN can exceed
+# any fixed budget — with ERROR (5) exiting the wait immediately.
+- name: Wait for the Capi image to leave LOCKED
+  become: true
+  become_user: oneadmin
+  ansible.builtin.shell: oneimage show {{ _export_image_id }} -j | jq -r '.IMAGE.STATE'
+  register: _capi_img
+  until: (_capi_img.stdout | trim) in ['1', '2', '5', '8']   # READY/USED/ERROR/USED_PERS
+  retries: "{{ ((gpu_benchmark.k8s.deploy_timeout_s | int) / 20) | round(0, 'ceil') | int }}"
+  delay: 20
+  changed_when: false
+
+- name: Assert the Capi image is usable
+  ansible.builtin.assert:
+    that: (_capi_img.stdout | trim) != '5'
+    fail_msg: "Capi image {{ _export_image_id }} is in ERROR — the marketplace download failed."
+
+# Guide: the capi template needs a NIC on the vnet and host-passthrough.
+# USER_INPUTS is STRIPPED (empty vector replaces it): the CLI prompts for
+# every input on /dev/tty (EOF under ansible), and answering them as EMPTY
+# via --user-inputs injects garbage into the appliance context (proven
+# live: helm got '--version ,ONEAPP_CAPI_RANCHER_HOSTNAME=' and the whole
+# CAPI bootstrap crash-looped). ABSENT variables are the healthy path —
+# the appliance then uses its own defaults, exactly like the guide
+# operator pressing enter.
+- name: Align the Capi template with the guide (NIC + CPU_MODEL, no prompts)
+  become: true
+  become_user: oneadmin
+  ansible.builtin.shell: |
+    set -o errexit -o pipefail
+    cat > /tmp/gpu_bench_capi_update.tmpl <<'EOT'
+    NIC=[ NETWORK="{{ _gpu_vnet_name | default(gpu_benchmark.vnet_name) }}" ]
+    CPU_MODEL=[ MODEL="host-passthrough" ]
+    USER_INPUTS = []
+    EOT
+    onetemplate update {{ _k8s_capi_template_id }} -a /tmp/gpu_bench_capi_update.tmpl
+    rm -f /tmp/gpu_bench_capi_update.tmpl
+  args:
+    executable: /bin/bash
+  changed_when: true
+
+- name: Instantiate the capi VM (reuse a running one)
+  become: true
+  become_user: oneadmin
+  ansible.builtin.shell: |
+    set -o errexit -o pipefail
+    if onevm show '{{ _k8s_capi_vm }}' >/dev/null 2>&1; then echo REUSED; exit 0; fi
+    onetemplate instantiate {{ _k8s_capi_template_id }} --name '{{ _k8s_capi_vm }}' < /dev/null
+    echo CREATED
+  args:
+    executable: /bin/bash
+  register: _k8s_capi_inst
+  changed_when: "'CREATED' in _k8s_capi_inst.stdout"
+
+# ERR column: a scheduler/driver error recorded in USER_TEMPLATE.ERROR
+# exits the wait immediately (dead states must not burn the clock).
+- name: Wait for the capi VM to run with an IP
+  become: true
+  become_user: oneadmin
+  ansible.builtin.shell: >
+    onevm show '{{ _k8s_capi_vm }}' -j
+    | jq -r '[(.VM.LCM_STATE // "0"),
+              (.VM.TEMPLATE.NIC | if type=="array" then .[0].IP else .IP end // ""),
+              (if (.VM.USER_TEMPLATE.ERROR? // false) then "ERR" else "OK" end)] | @tsv'
+  args:
+    executable: /bin/bash
+  register: _k8s_capi_state
+  until: (_k8s_capi_state.stdout is match('^3\t[0-9]+\.')) or ('ERR' in _k8s_capi_state.stdout)
+  retries: "{{ ((gpu_benchmark.k8s.deploy_timeout_s | int) / 10) | round(0, 'ceil') | int }}"
+  delay: 10
+  changed_when: false
+
+- name: Assert the capi VM is healthy
+  ansible.builtin.assert:
+    that: "'ERR' not in _k8s_capi_state.stdout"
+    fail_msg: >-
+      The capi VM reported an error (onevm show {{ _k8s_capi_vm }}):
+      check USER_TEMPLATE/ERROR — typically a scheduler or driver failure.
+
+- name: Remember the capi IP
+  ansible.builtin.set_fact:
+    _k8s_capi_ip: "{{ (_k8s_capi_state.stdout.split('\t')[1]) | trim }}"
+
+# Guide's install commands, run only when the tool is missing; both stay
+# installed afterwards (documented in the role README).
+# timeout 300 around each install: the get-helm-3 script fetches its own
+# tarball with an unbounded curl — a stalled TCP session (seen on this
+# lab's throttled CDN paths) must fail, not hang the play.
+- name: Install helm and kubectl on the frontend if missing
+  become: true
+  ansible.builtin.shell: |
+    set -o errexit -o pipefail
+    install -d -m 0755 /usr/local/bin
+    command -v helm >/dev/null 2>&1 || timeout 300 bash -c \
+      'curl -fsSL --connect-timeout 15 --max-time 120 https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash'
+    command -v kubectl >/dev/null 2>&1 || timeout 300 bash -c \
+      'curl -fsSL --connect-timeout 15 --max-time 240 "https://dl.k8s.io/release/$(curl -fsSL --connect-timeout 15 --max-time 30 https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" | install -o root -g root -m 0755 -D /dev/fd/0 /usr/local/bin/kubectl'
+    helm version --short
+    kubectl version --client
+  args:
+    executable: /bin/bash
+  register: _k8s_tools
+  changed_when: false
+
+# The k3s API inside the capi VM takes a while on first boot; the fetch is
+# retried as a whole (ssh + sed + kubectl smoke test). Runs as ROOT (the
+# /tmp/gpu_benchmark artifacts dir is root-owned) with oneadmin's key —
+# the appliance context authorizes that key in the VM.
+- name: Fetch the management kubeconfig from the capi VM
+  become: true
+  ansible.builtin.shell: |
+    set -o errexit -o pipefail
+    ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oConnectTimeout=10 root@{{ _k8s_capi_ip }} \
+      cat /etc/rancher/k3s/k3s.yaml \
+      | sed "s|server: https://127.0.0.1:6443|server: https://{{ _k8s_capi_ip }}:6443|" \
+      > /tmp/gpu_benchmark/kubeconfig_management.yaml
+    kubectl --kubeconfig /tmp/gpu_benchmark/kubeconfig_management.yaml get nodes
+  args:
+    executable: /bin/bash
+  register: _k8s_mgmt
+  until: _k8s_mgmt.rc == 0
+  retries: 30
+  delay: 15
+  changed_when: false
+
+- name: Remember the management kubeconfig path
+  ansible.builtin.set_fact:
+    _k8s_mgmt_kubeconfig: /tmp/gpu_benchmark/kubeconfig_management.yaml
+
+# The k3s API answers long before the appliance bootstrap (Rancher +
+# Turtles + CAPONE controllers) finishes installing the Cluster API CRDs —
+# a helm install fired too early dies with "no matches for kind Cluster"
+# (hit live). Wait on the DIRECT precondition: the CRDs the chart needs.
+# Internal loop (full control): image pulls on this lab's network stall
+# for HOURS on unlucky CDN routes (observed live: capi-controller-manager
+# in ContainerCreating for 90 min on one boot, fine in 2 min on another) —
+# every ~10 min, pods wedged in ContainerCreating/ImagePull states get
+# DELETED so kubelet retries the pull on a fresh connection.
+- name: Wait for the CAPI/CAPONE CRDs (appliance bootstrap is asynchronous)
+  become: true
+  ansible.builtin.shell: |
+    export KUBECONFIG={{ _k8s_mgmt_kubeconfig }}
+    TRIES={{ ((gpu_benchmark.k8s.bootstrap_timeout_s | default(5400) | int) / 15) | round(0, 'ceil') | int }}
+    CAPI_SSH="ssh -n -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oConnectTimeout=10 root@{{ _k8s_capi_ip }}"
+    K3S_KICKED=0
+    LAST_MSG=""
+    # PROVEN LIVE (2026-08-10, 91-minute burn): the capi VM k3s apiserver can
+    # lose its Secrets WATCH CACHE while quorum reads stay correct. Every
+    # watch-based consumer then goes blind: the kubelet secret manager reports
+    # "secret capi-webhook-service-cert not found" and pins the CAPI core pod in
+    # ContainerCreating forever, while cert-manager loops on
+    # "secrets ... already exists" for a secret it just created and never gets
+    # to a CertificateRequest. Result: core provider never Ready, all other
+    # providers stay WaitingForCoreProviderReady, CAPONE/RKE2 CRDs never
+    # register, and this wait is unsatisfiable. In-cluster remedies do NOT
+    # help (verified: temp-secret delete, pod kick, cert-manager restart x2,
+    # Certificate recreate, status reset, manual cert mint) — restarting k3s
+    # rebuilds the cache and the stack recovered in 15 s.
+    # The test is exact, not heuristic: the cached LIST (resourceVersion=0,
+    # what watchers read) versus the quorum LIST (what kubectl reads).
+    cache_stale() {
+      CACHED=$(kubectl get --raw "/api/v1/namespaces/capi-system/secrets?resourceVersion=0&limit=500" 2>/dev/null \
+        | grep -oE '"name":"[^"]*"' | wc -l) || CACHED=0
+      QUORUM=$(kubectl get --raw "/api/v1/namespaces/capi-system/secrets?limit=500" 2>/dev/null \
+        | grep -oE '"name":"[^"]*"' | wc -l) || QUORUM=0
+      [ "${QUORUM:-0}" -gt 0 ] && [ "${CACHED:-0}" -lt "${QUORUM:-0}" ]
+    }
+    # Progress lines are deduplicated: the reason must survive in the tail that
+    # the report captures, not be pushed out by 300 identical waiting lines.
+    say() {
+      if [ "$1" != "$LAST_MSG" ]; then echo "$1"; LAST_MSG="$1"; fi
+    }
+    for i in $(seq 1 $TRIES); do
+      if kubectl get crd \
+           clusters.cluster.x-k8s.io \
+           machinedeployments.cluster.x-k8s.io \
+           oneclusters.infrastructure.cluster.x-k8s.io \
+           rke2controlplanes.controlplane.cluster.x-k8s.io >/dev/null 2>&1; then
+        # CRDs land BEFORE the provider controllers serve their webhooks
+        # (helm then dies with "no endpoints available for service
+        # rke2-control-plane-webhook-service", hit live) — also require
+        # every provider deployment to be fully ready.
+        PENDING="$(kubectl get deploy -A --no-headers 2>/dev/null \
+          | awk '$1 ~ /capi|capone|rke2|turtles|cert-manager/ {split($3, a, "/"); if (a[1] < a[2]) print $1"/"$2}' \
+          | paste -sd, -)"
+        if [ -z "$PENDING" ]; then
+          echo "READY after $((i*15))s"
+          exit 0
+        fi
+        say "crds up, waiting for provider deployments: $PENDING"
+      fi
+      # Watch-cache staleness check every ~5 min (two cheap API reads). Once
+      # only: a second restart would just re-break a cluster that is merely
+      # slow, and the verdict records whether the kick was already spent.
+      if [ $((i % 20)) -eq 0 ] && [ "$K3S_KICKED" -eq 0 ] \
+         && [ "{{ gpu_benchmark.k8s.unwedge_apiserver_cache | default(true) | bool | lower }}" = "true" ]; then
+        if cache_stale; then
+          echo "apiserver Secrets watch cache is STALE (cached=$CACHED quorum=$QUORUM) — restarting k3s on the capi VM"
+          $CAPI_SSH systemctl restart k3s >/dev/null 2>&1 || true
+          K3S_KICKED=1
+          for j in $(seq 1 24); do
+            kubectl get --raw /readyz >/dev/null 2>&1 && break
+            sleep 5
+          done
+          echo "k3s restarted, apiserver reachable again — continuing to wait"
+        fi
+      fi
+      if [ $((i % 40)) -eq 0 ]; then
+        kubectl get pods -A --no-headers 2>/dev/null \
+          | awk '$4 == "ContainerCreating" || $4 == "ImagePullBackOff" || $4 == "ErrImagePull" {print $1" "$2}' \
+          | while read -r NS POD; do
+              echo "kicking wedged pod $NS/$POD (stalled image pull)"
+              kubectl delete pod -n "$NS" "$POD" --wait=false 2>/dev/null
+            done
+        # Turtles install/uninstall deadlock (seen live, ~50% of capi
+        # boots): the first chart install gets interrupted, the release
+        # sticks in failed/uninstalling, and every retry runs a pre-delete
+        # capiprovider-cleanup hook that errors (its CRD never installed)
+        # — looping forever. Uninstalling WITHOUT hooks lets the k3s
+        # retry job reinstall cleanly.
+        TSTAT="$(helm -n rancher-turtles-system status rancher-turtles -o json 2>/dev/null | jq -r '.info.status // ""')"
+        if [ "$TSTAT" = "failed" ] || [ "$TSTAT" = "uninstalling" ] || [ "$TSTAT" = "pending-install" ]; then
+          echo "unwedging rancher-turtles (release status: $TSTAT) via uninstall --no-hooks"
+          helm -n rancher-turtles-system uninstall rancher-turtles --no-hooks --wait --timeout 120s 2>/dev/null || true
+          kubectl delete job -n rancher-turtles-system --all --ignore-not-found --timeout=60s 2>/dev/null || true
+        fi
+      fi
+      sleep 15
+    done
+    echo "CRDs never appeared within {{ gpu_benchmark.k8s.bootstrap_timeout_s | default(5400) }}s — diagnostics:"
+    $CAPI_SSH cat /etc/one-appliance/status 2>/dev/null
+    kubectl get pods -A --no-headers 2>/dev/null | grep -vE 'Running|Completed' | head -8
+    kubectl get events -A --field-selector type=Warning --sort-by=.lastTimestamp 2>/dev/null | tail -8
+    kubectl get capiproviders -A --no-headers 2>/dev/null | head -8
+    MISSING="$(for c in clusters.cluster.x-k8s.io machinedeployments.cluster.x-k8s.io \
+                        oneclusters.infrastructure.cluster.x-k8s.io rke2controlplanes.controlplane.cluster.x-k8s.io; do
+                 kubectl get crd "$c" >/dev/null 2>&1 || printf "%s " "$c"
+               done)" || MISSING=""
+    # The REASON, machine-greppable and printed LAST: the rescue captures the
+    # stdout TAIL, so anything after this line would push it out of view.
+    REASON=crds_missing
+    [ -z "$MISSING" ] && REASON=provider_deployments_pending
+    if cache_stale; then REASON=stale_apiserver_watch_cache; fi
+    echo "K8S_STACK_VERDICT rc=1 reason=$REASON k3s_restart_attempted=$K3S_KICKED missing_crds=${MISSING:-none} pending_deploys=${PENDING:-none}"
+    exit 1
+  args:
+    executable: /bin/bash
+  register: _k8s_crds
+  changed_when: false

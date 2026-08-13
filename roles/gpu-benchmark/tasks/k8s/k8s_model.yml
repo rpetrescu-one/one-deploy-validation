@@ -1,0 +1,78 @@
+---
+# One model on the K8s backend: a vLLM pod per GPU worker, the SHARED
+# benchmark battery per GPU, GPU-to-GPU comparison, then one _llm entry
+# keyed '<model> · k8s'. Mirrors llm_benchmark_one_pervm.yml.
+# v1 scope notes (README): the functional API suite and power sampling are
+# appliance/bare-metal-only — the K8s entry reports the same performance
+# metrics without those two extras.
+- name: Reset per-model accumulators (k8s backend)
+  ansible.builtin.set_fact:
+    _model_gpu_results: []
+    _gpu_delta: {}
+    _functional: {}
+    _tool_versions: {}
+    _provision_s: "{{ _k8s_stack_ready_s | default('') }}"
+    _llm_key: "{{ _model }} · k8s"
+
+- name: Benchmark model {{ _model }} on the K8s backend
+  block:
+    - name: Benchmark each GPU worker
+      ansible.builtin.include_tasks: k8s_gpu.yml
+      loop: "{{ _k8s_nodes }}"
+      loop_control:
+        loop_var: _k8s_node_name
+        index_var: _k8s_gpu_idx
+        label: "gpu {{ _k8s_gpu_idx }} ({{ _k8s_node_name }})"
+
+    - name: Compute GPU-to-GPU delta for {{ _model }} (k8s)
+      ansible.builtin.include_tasks: lib/compare_gpus.yml
+      when: (_model_gpu_results | selectattr('metrics', 'defined') | list | length | int) > 1
+
+    - name: Derive model status (k8s)
+      ansible.builtin.include_tasks: lib/model_status.yml
+
+    - name: Record model result (k8s)
+      ansible.builtin.set_fact:
+        _llm: >-
+          {{ _llm | combine({_llm_key: {
+            'host_id': (_k8s_host | default({})).host_id | default(0),
+            'model': _model,
+            'backend': 'k8s',
+            'per_gpu': _model_gpu_results | sort(attribute='gpu'),
+            'delta': _gpu_delta | default({}),
+            'functional': {},
+            'provisioning_s': _provision_s | default(''),
+            'versions': (_tool_versions.stdout | default('') | trim),
+            'status': _model_status
+          }}) }}
+
+  rescue:
+    - name: Record model failure (k8s backend)
+      ansible.builtin.set_fact:
+        _llm: >-
+          {{ _llm | combine({_llm_key: {
+            'host_id': (_k8s_host | default({})).host_id | default(0),
+            'model': _model,
+            'backend': 'k8s',
+            'per_gpu': _model_gpu_results | default([]),
+            'status': 'failed',
+            'error': (ansible_failed_result.msg | default('error'))
+          }}) }}
+      no_log: true
+
+  always:
+    # Foreground cascade + explicit pod-gone wait: a background delete
+    # returns while the pod is still Terminating and HOLDING ITS GPU — the
+    # next model would then race it for the device and could even select
+    # the stale pod by label.
+    - name: Delete the model's vLLM deployments and wait for the pods to go
+      become: true
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ _k8s_kubeconfig }}
+        kubectl delete deploy -l gpu-bench=vllm --ignore-not-found --cascade=foreground --timeout=180s
+        kubectl wait --for=delete pod -l gpu-bench=vllm --timeout=180s 2>/dev/null
+        true
+      args:
+        executable: /bin/bash
+      changed_when: true
+      failed_when: false

@@ -1,0 +1,28 @@
+{# The guide's CUDA verification Job VERBATIM, plus a nodeSelector and a
+   per-node name so every worker's GPU is verified independently. #}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ _k8s_verify_name }}
+  labels:
+    gpu-bench: verify
+spec:
+  template:
+    spec:
+      # Maps the pod to the NVIDIA Container Toolkit
+      runtimeClassName: nvidia
+      nodeSelector:
+        kubernetes.io/hostname: "{{ _k8s_verify_node }}"
+      containers:
+      - name: cuda-test
+        image: nvidia/cuda:12.4.1-base-ubuntu22.04
+        command: ["nvidia-smi"]
+        resources:
+          limits:
+            # Requests exactly 1 physical GPU
+            nvidia.com/gpu: 1
+          requests:
+            nvidia.com/gpu: 1
+      # Ensures the pod doesn't loop if it fails
+      restartPolicy: Never
+  backoffLimit: 0

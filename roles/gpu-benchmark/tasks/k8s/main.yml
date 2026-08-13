@@ -1,0 +1,123 @@
+---
+# Kubernetes LLM backend — deploys an RKE2 cluster on OpenNebula EXACTLY
+# per the 7.4 "AI-ready Kubernetes" guide (Service Capi appliance →
+# capone/capone-rke2 workload cluster → nvidia gpu-operator → the guide's
+# CUDA verification job as a gate), then serves the same model with the
+# same vLLM version in one pod per GPU worker and runs the IDENTICAL
+# benchmark battery (shared guidellm profile + shared lib chain). Full
+# teardown in always. A failure here records per-model errors and never
+# discards the appliance backend's results.
+- name: Kubernetes backend
+  block:
+    - name: Note the provisioning start
+      ansible.builtin.set_fact:
+        _k8s_prov_start: "{{ lookup('pipe', 'date +%s') }}"
+
+    - name: Deploy the K8s stack (per the AI-ready K8s guide)
+      ansible.builtin.include_tasks: deploy_stack.yml
+
+    - name: Provision the workload cluster
+      ansible.builtin.include_tasks: workload.yml
+
+    - name: Install the GPU operator and verify CUDA
+      ansible.builtin.include_tasks: gpu_operator.yml
+
+    # Measured ONCE, at stack-ready (capi + RKE2 + gpu-operator + CUDA
+    # verified): the shared-stack provisioning time every model reports.
+    # A per-model figure would double-count earlier models' benchmark time.
+    - name: Record the stack provisioning duration
+      ansible.builtin.set_fact:
+        _k8s_stack_ready_s: "{{ (lookup('pipe', 'date +%s') | int) - (_k8s_prov_start | int) }}"
+
+    # Best-effort: gives the overhead table a Kubernetes value on the
+    # hardware rows; its failure never blocks the LLM benchmark. The
+    # probe's ONLY consumer is the bare-metal comparison — without a
+    # recorded baseline (the opt-in pre phase) its numbers would be
+    # discarded, so skip the ~2.5 GB/worker devel-image pull instead of
+    # paying for data nobody reads (same path expression as the
+    # baseline load in per_cluster.yml; the file lives on the controller).
+    - name: Probe worker hardware in-cluster (cuBLAS + PCIe)
+      ansible.builtin.include_tasks: hw_probe.yml
+      when:
+        - gpu_benchmark.k8s.hw_probe | default(true) | bool
+        - (gpu_benchmark.cublas.enabled | bool) or (gpu_benchmark.pcie_bw.enabled | bool)
+        - >-
+          {{ (lookup('ansible.builtin.file',
+                     (gpu_benchmark.baremetal.baseline_file | default('', true))
+                     if (gpu_benchmark.baremetal.baseline_file | default('', true) | length > 0)
+                     else ((inventory_dir | default('', true)) ~ '/gpu_baseline.json'),
+                     errors='ignore') | default('', true) | length) > 0 }}
+
+    - name: Benchmark each model on the K8s backend
+      ansible.builtin.include_tasks: k8s_model.yml
+      loop: "{{ gpu_benchmark.models }}"
+      loop_control:
+        loop_var: _model
+        label: "{{ _model }}"
+
+  rescue:
+    - name: Mark the backend as failed (teardown may keep the stack)
+      ansible.builtin.set_fact:
+        _k8s_failed: true
+
+    # A failed shell task reports msg='non-zero return code' — USELESS on its
+    # own (a 91-minute stack failure reported exactly that, live). The reason
+    # lives in the stdout TAIL: the waits print a greppable K8S_STACK_VERDICT
+    # line LAST. Non-shell failures (include_tasks/template/assert) carry no
+    # stdout, so every field is read through default(). Credential-bearing
+    # lines are dropped here, not in the report, because this fact also lands
+    # in summary.json.
+    - name: Extract the real failure reason (redacted)
+      ansible.builtin.set_fact:
+        _k8s_fail_lines: >-
+          {{ (ansible_failed_result.stdout_lines | default([]) | list)
+             + (ansible_failed_result.stderr_lines | default([]) | list)
+             | reject('search', _k8s_secret_pat) | list }}
+      vars:
+        _k8s_secret_pat: >-
+          (client-certificate-data|client-key-data|certificate-authority-data|PRIVATE KEY|ONE_AUTH|hf_token|HF_TOKEN|Authorization|password)
+      no_log: true
+
+    - name: Compose the failure headline
+      ansible.builtin.set_fact:
+        _k8s_fail_head: >-
+          {{ (_k8s_verdicts | last) if (_k8s_verdicts | length > 0)
+             else ((ansible_failed_result.msg | default('error') | string | truncate(200, true))
+                   ~ (' rc=' ~ (ansible_failed_result.rc | string)
+                      if (ansible_failed_result.rc is defined) else '')) }}
+        _k8s_fail_tail: "{{ _k8s_fail_lines[-24:] }}"
+      vars:
+        _k8s_verdicts: "{{ _k8s_fail_lines | select('search', '^K8S_[A-Z_]*VERDICT') | list }}"
+      no_log: true
+
+    # Full evidence next to summary.json (cluster-suffixed: a multi-cluster run
+    # must not overwrite another cluster's post-mortem). The report points here.
+    - name: Persist the stack failure log for post-mortem
+      become: true
+      ansible.builtin.copy:
+        content: |
+          {% for _l in _k8s_fail_lines %}{{ _l }}
+          {% endfor %}
+        dest: "/tmp/gpu_benchmark/k8s_failure{{ current_cluster.name_suffix | default('') }}.log"
+        mode: "0644"
+      failed_when: false
+      no_log: true
+
+    - name: Record K8s backend failure for every model without a result
+      ansible.builtin.set_fact:
+        _llm: >-
+          {{ _llm | combine({(item ~ ' · k8s'): {
+            'model': item, 'backend': 'k8s', 'status': 'failed', 'per_gpu': [],
+            'error': ('K8s backend: ' ~ (_k8s_fail_head | default('error') | string | trim | truncate(300, true))),
+            'error_detail': (_k8s_fail_tail | default([])),
+            'error_log': ('/tmp/gpu_benchmark/k8s_failure' ~ (current_cluster.name_suffix | default('')) ~ '.log')
+          }}) }}
+      loop: "{{ gpu_benchmark.models }}"
+      loop_control:
+        label: "{{ item }}"
+      when: (item ~ ' · k8s') not in _llm
+      no_log: true
+
+  always:
+    - name: Tear down the K8s stack
+      ansible.builtin.include_tasks: teardown.yml

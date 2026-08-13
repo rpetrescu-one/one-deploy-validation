@@ -1,0 +1,99 @@
+---
+# One hardware-probe Job on one worker: run bounded, read the logs, parse
+# through the SHARED cublas/pcie libs (identical markers, identical
+# regexes). Per-node block/rescue: a failed worker records its error and
+# the remaining workers still get probed.
+- name: Hardware probe on {{ _k8s_hw_node }}
+  block:
+    - name: Render the probe job for {{ _k8s_hw_node }}
+      become: true
+      ansible.builtin.template:
+        src: k8s/hw-probe.yaml.j2
+        dest: "/tmp/gpu_benchmark/k8s_hw_probe_{{ _k8s_hw_idx }}.yaml"
+        mode: "0644"
+      vars:
+        _k8s_hw_name: "gpu-bench-hw-{{ _k8s_hw_idx }}"
+
+    # Internal poll instead of kubectl wait: on a Failed job kubectl wait
+    # burns its whole timeout — this exits on the FIRST terminal state
+    # with the log tail (same discipline as the vLLM serve wait).
+    - name: Run the probe job on {{ _k8s_hw_node }} (bounded)
+      become: true
+      ansible.builtin.shell: |
+        set -o errexit -o pipefail
+        export KUBECONFIG={{ _k8s_kubeconfig }}
+        kubectl delete job gpu-bench-hw-{{ _k8s_hw_idx }} --ignore-not-found --timeout=60s >/dev/null
+        kubectl apply -f /tmp/gpu_benchmark/k8s_hw_probe_{{ _k8s_hw_idx }}.yaml >/dev/null
+        for i in $(seq 1 {{ ((gpu_benchmark.k8s.hw_probe_timeout_s | int) / 15) | round(0, 'ceil') | int }}); do
+          C="$(kubectl get job gpu-bench-hw-{{ _k8s_hw_idx }} -o jsonpath='{.status.succeeded} {.status.failed}' 2>/dev/null)" || true
+          OK="${C%% *}"; BAD="${C##* }"
+          if [ "${OK:-0}" -ge 1 ] 2>/dev/null; then
+            kubectl logs -l job-name=gpu-bench-hw-{{ _k8s_hw_idx }} --tail=20
+            exit 0
+          fi
+          if [ "${BAD:-0}" -ge 1 ] 2>/dev/null; then
+            echo "hardware probe job FAILED on {{ _k8s_hw_node }} — log tail:"
+            kubectl logs -l job-name=gpu-bench-hw-{{ _k8s_hw_idx }} --tail=20 2>/dev/null || true
+            exit 2
+          fi
+          sleep 15
+        done
+        echo "hardware probe did not finish within {{ gpu_benchmark.k8s.hw_probe_timeout_s }} s — pod state:"
+        kubectl get pod -l job-name=gpu-bench-hw-{{ _k8s_hw_idx }} 2>/dev/null || true
+        exit 1
+      args:
+        executable: /bin/bash
+      register: _k8s_hw_out
+      changed_when: true
+
+    - name: Reset the shared parse accumulators
+      ansible.builtin.set_fact:
+        _cublas: []
+        _pcie_bw: []
+
+    - name: Parse cuBLAS output ({{ _k8s_hw_node }})
+      ansible.builtin.include_tasks: lib/parse_cublas.yml
+      vars:
+        _cublas_results: [{'gpu': "{{ _k8s_hw_idx | int }}", 'stdout': "{{ _k8s_hw_out.stdout }}"}]
+      when: gpu_benchmark.cublas.enabled | bool
+
+    - name: Parse PCIe bandwidth output ({{ _k8s_hw_node }})
+      ansible.builtin.include_tasks: lib/parse_pcie_bw.yml
+      vars:
+        _pcie_bw_results: [{'gpu': "{{ _k8s_hw_idx | int }}", 'stdout': "{{ _k8s_hw_out.stdout }}"}]
+      when: gpu_benchmark.pcie_bw.enabled | bool
+
+    - name: Record the probe result for {{ _k8s_hw_node }}
+      ansible.builtin.set_fact:
+        _k8s_hw: >-
+          {{ _k8s_hw + [{
+            'node': _k8s_hw_node,
+            'cublas': _cublas | default([]),
+            'pcie_bw': _pcie_bw | default([])
+          }] }}
+
+  rescue:
+    - name: Record the probe failure for {{ _k8s_hw_node }} (non-fatal)
+      ansible.builtin.set_fact:
+        _k8s_hw_probe_error: >-
+          {{ ((_k8s_hw_probe_error | default('')) ~ ' ' ~ _k8s_hw_node ~ ': '
+              ~ (ansible_failed_result.msg | default('error') | string | truncate(200, true))) | trim }}
+      no_log: true
+
+  always:
+    # Foreground cascade + explicit pod-gone wait (same rule as the vLLM
+    # delete in k8s_model.yml): on the timeout path a still-Running probe
+    # container holds the node's single GPU — a background delete would
+    # let the model loop race it for the device.
+    - name: Clean up the probe job for {{ _k8s_hw_node }}
+      become: true
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ _k8s_kubeconfig }}
+        kubectl delete job gpu-bench-hw-{{ _k8s_hw_idx }} --ignore-not-found --cascade=foreground --timeout=180s
+        kubectl wait --for=delete pod -l job-name=gpu-bench-hw-{{ _k8s_hw_idx }} --timeout=120s 2>/dev/null
+        rm -f /tmp/gpu_benchmark/k8s_hw_probe_{{ _k8s_hw_idx }}.yaml
+        true
+      args:
+        executable: /bin/bash
+      changed_when: true
+      failed_when: false

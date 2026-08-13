@@ -1,0 +1,274 @@
+---
+# Steps 5-8 of the guide: render values.yaml, deploy the RKE2 workload
+# cluster via the capone-rke2 chart, then fetch the workload kubeconfig
+# through the vRouter jump.
+- name: Resolve worker count and PCI device id
+  ansible.builtin.set_fact:
+    _k8s_vnet: "{{ _gpu_vnet_name | default(gpu_benchmark.vnet_name) }}"
+    # One worker per benchmarked GPU on the first (or only) GPU host —
+    # mirror of vm_per_gpu. The worker template pins scheduling to this
+    # host (SCHED_REQUIREMENTS ID), so results honestly carry its host_id.
+    _k8s_host: "{{ _gpu_inventory.hosts | first }}"
+    _k8s_host_id: "{{ (_gpu_inventory.hosts | first).host_id }}"
+    _k8s_worker_count: >-
+      {{ ((_gpu_inventory.hosts | first).gpu_count | int)
+         if (gpu_benchmark.gpu_count == 'all')
+         else ([gpu_benchmark.gpu_count | int, (_gpu_inventory.hosts | first).gpu_count | int] | min) }}
+    # The guide pins the PCI section to the card's device id; auto-fill it
+    # when every benchmarked GPU reports the same id, else match any
+    # NVIDIA 3D controller (vendor+class).
+    _k8s_pci_device: >-
+      {{ (_devs | first) if (_devs | length == 1) else '' }}
+  vars:
+    _devs: >-
+      {{ (_gpu_inventory.hosts | first).devices | default([])
+         | map(attribute='device') | select('defined') | map('lower') | unique | list }}
+
+- name: Read oneadmin auth for the chart (ONE_AUTH per the guide)
+  become: true
+  ansible.builtin.shell: cat /var/lib/one/.one/one_auth
+  register: _k8s_auth_raw
+  changed_when: false
+  no_log: true
+
+- name: Render the capone-rke2 values
+  become: true
+  ansible.builtin.template:
+    src: k8s/values.yaml.j2
+    dest: /tmp/gpu_benchmark/k8s_values.yaml
+    mode: "0600"
+  vars:
+    _k8s_one_auth: "{{ _k8s_auth_raw.stdout | trim }}"
+  no_log: true
+
+- name: Add the capone helm repo
+  become: true
+  ansible.builtin.shell: |
+    set -o errexit -o pipefail
+    helm repo add capone https://opennebula.github.io/cluster-api-provider-opennebula/charts/ >/dev/null 2>&1 || true
+    helm repo update >/dev/null
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+# ADOPT-OR-CLEAN (learned live 2026-08-12): a Ctrl-C mid-run skips the
+# always-teardown, leaving a release record and/or resource-policy:keep
+# CAPI objects behind. Reusing them wedges the next run — capone sat for
+# 47 min refusing an orphaned ONECluster ("ControlPlaneEndpoint.Host must
+# not be empty") while the VM wait burned its whole budget. REUSE only a
+# release that is BOTH deployed AND still has its Cluster object; anything
+# else (failed/uninstalling/zombie record, or kept orphans without a
+# release) is wiped with the teardown's own deletion list, then installed
+# fresh.
+- name: Deploy the workload cluster (capone-rke2 {{ gpu_benchmark.k8s.capone_chart_version }})
+  become: true
+  ansible.builtin.shell: |
+    set -o errexit -o pipefail
+    export KUBECONFIG={{ _k8s_mgmt_kubeconfig }}
+    REL={{ _k8s_release }}
+    STATUS="$(helm status "$REL" -o json 2>/dev/null | jq -r '.info.status // ""')" || STATUS=""
+    if [ "$STATUS" = "deployed" ] && kubectl get cluster "$REL" >/dev/null 2>&1; then
+      echo REUSED
+      exit 0
+    fi
+    if [ -n "$STATUS" ] \
+       || kubectl get cluster "$REL" >/dev/null 2>&1 \
+       || kubectl get onecluster "$REL" >/dev/null 2>&1 \
+       || kubectl get machinedeployment "$REL-md-0" >/dev/null 2>&1; then
+      echo "stale release/objects (status: ${STATUS:-none}) — cleaning before a fresh install"
+      helm uninstall "$REL" --no-hooks --wait --timeout 5m >/dev/null 2>&1 || true
+      kubectl delete cluster "$REL" --ignore-not-found --timeout=180s || true
+      kubectl delete onecluster "$REL" --ignore-not-found --timeout=120s || true
+      kubectl delete machinedeployment "$REL-md-0" --ignore-not-found --timeout=60s || true
+      kubectl delete rke2controlplane "$REL" --ignore-not-found --timeout=60s || true
+      kubectl delete onemachinetemplate "$REL-cp" "$REL-md-0" --ignore-not-found --timeout=60s || true
+      kubectl delete rke2configtemplate "$REL-md-0" --ignore-not-found --timeout=60s || true
+      kubectl delete secret "$REL" "$REL-ccm" --ignore-not-found --timeout=60s || true
+      # no-match grep under errexit+pipefail must not kill the script
+      ZOMBIES="$(kubectl get secret -o name 2>/dev/null | grep -F "sh.helm.release.v1.$REL." || true)"
+      for S in $ZOMBIES; do
+        kubectl delete "$S" --ignore-not-found --timeout=30s || true
+      done
+    fi
+    helm install "$REL" capone/capone-rke2 \
+      --version {{ gpu_benchmark.k8s.capone_chart_version }} \
+      --values /tmp/gpu_benchmark/k8s_values.yaml \
+      --wait --timeout 10m > /tmp/gpu_benchmark/k8s_helm_install.log 2>&1
+    echo INSTALLED
+  args:
+    executable: /bin/bash
+  register: _k8s_helm_install
+  changed_when: "'INSTALLED' in _k8s_helm_install.stdout"
+
+# CAPONE provisions VMs asynchronously after the chart lands: vRouter,
+# control-plane, then workers (each waits for image downloads on first
+# run — the node image is ~2.5 GB, plus RKE2 bootstrap). JSON, never the
+# CLI table: `onevm list` truncates NAME to its cli.yaml column width
+# (15 chars on stock ONE 7.4), which silently breaks name matching.
+# Output: "RUN <n> BAD <m>" — any VM with USER_TEMPLATE.ERROR exits the
+# wait immediately (dead states must not burn deploy_timeout_s).
+# Internal loop (not until+retries): it must FAIL FAST in two states an
+# until-loop cannot distinguish from slowness — a VM in ERROR, and CAPONE
+# creating ZERO VMs at all (seen live 2026-08-12: an orphaned ONECluster
+# from a Ctrl-C-killed run kept capone erroring for 47 min while this wait
+# burned its whole budget). The verdict line prints LAST so the rescue's
+# diagnostics capture gets the reason.
+- name: Wait for the workload VMs to run (vRouter + control-plane + workers)
+  become: true
+  become_user: oneadmin
+  ansible.builtin.shell: |
+    set -o pipefail
+    NEED=$((2 + {{ _k8s_worker_count | int }}))
+    TRIES={{ ((gpu_benchmark.k8s.deploy_timeout_s | int) / 15) | round(0, 'ceil') | int }}
+    # zero-VM grace: ~10 min normally, but never more than a quarter of the
+    # budget (a shrunken deploy_timeout_s must keep its fail-fast).
+    ZERO_GRACE=$(( TRIES / 4 < 40 ? TRIES / 4 : 40 ))
+    CAPI_SSH="ssh -n -i ~/.ssh/id_rsa -q -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oConnectTimeout=10 root@{{ _k8s_capi_ip }}"
+    LAST_MSG=""
+    RUN=0
+    for i in $(seq 1 $TRIES); do
+      OUT="$(onevm list -j | jq -r '
+        [.VM_POOL.VM? // [] | if type=="array" then . else [.] end | .[]
+         | select((.NAME | startswith("{{ _k8s_release }}-")) or (.NAME | startswith("vr-{{ _k8s_release }}")))]
+        | ([.[] | select((.LCM_STATE // "0") == "3")] | length | tostring)
+          + " " + ([.[] | select(.USER_TEMPLATE.ERROR? // false)] | length | tostring)
+          + " " + (length | tostring)')" || OUT="0 0 0"
+      RUN="$(echo "$OUT" | awk '{print $1}')"
+      BAD="$(echo "$OUT" | awk '{print $2}')"
+      TOT="$(echo "$OUT" | awk '{print $3}')"
+      if [ "${BAD:-0}" -gt 0 ] 2>/dev/null; then
+        echo "a workload VM entered ERROR state:"
+        onevm list -j | jq -r '
+          .VM_POOL.VM? // [] | if type=="array" then . else [.] end | .[]
+          | select((.NAME | startswith("{{ _k8s_release }}-")) or (.NAME | startswith("vr-{{ _k8s_release }}")))
+          | select(.USER_TEMPLATE.ERROR? // false)
+          | .NAME + ": " + (.USER_TEMPLATE.ERROR | tostring)' 2>/dev/null | head -5
+        echo "K8S_WORKLOAD_VERDICT rc=1 reason=vm_error running=${RUN:-0} needed=$NEED"
+        exit 1
+      fi
+      if [ "${RUN:-0}" -ge "$NEED" ] 2>/dev/null; then
+        echo "all $NEED workload VMs RUNNING after $((i*15))s"
+        exit 0
+      fi
+      MSG="running ${RUN:-0}/$NEED (objects so far: ${TOT:-0})"
+      if [ "$MSG" != "$LAST_MSG" ]; then echo "$MSG"; LAST_MSG="$MSG"; fi
+      # ~10 min with ZERO VMs = the provisioner is wedged, not slow (a
+      # healthy capone creates the vRouter within 1-2 min of the install).
+      if [ "$i" -ge "$ZERO_GRACE" ] && [ "${TOT:-0}" -eq 0 ] 2>/dev/null; then
+        echo "CAPONE created ZERO VMs in $((i*15))s — provisioner wedged, not slow. Diagnostics:"
+        $CAPI_SSH 'export KUBECONFIG=/etc/rancher/k3s/k3s.yaml; k3s kubectl get cluster,onecluster,machinedeployment -A --no-headers 2>&1 | head -6; k3s kubectl -n capone-system logs -l control-plane=controller-manager --tail=200 2>/dev/null | grep -iE "error|failed" | tail -5' 2>/dev/null || true
+        echo "K8S_WORKLOAD_VERDICT rc=1 reason=capone_not_provisioning zero_vms_after_s=$((i*15))"
+        exit 1
+      fi
+      sleep 15
+    done
+    echo "workload VMs did not all reach RUNNING within {{ gpu_benchmark.k8s.deploy_timeout_s }}s"
+    echo "K8S_WORKLOAD_VERDICT rc=1 reason=vm_wait_timeout running=${RUN:-0} needed=$NEED"
+    exit 1
+  args:
+    executable: /bin/bash
+  register: _k8s_vms
+  changed_when: false
+
+- name: Assert no workload VM failed to deploy
+  become: true
+  become_user: oneadmin
+  ansible.builtin.shell: |
+    onevm list -j | jq -r '
+      .VM_POOL.VM? // [] | if type=="array" then . else [.] end | .[]
+      | select((.NAME | startswith("{{ _k8s_release }}-")) or (.NAME | startswith("vr-{{ _k8s_release }}")))
+      | select(.USER_TEMPLATE.ERROR? // false)
+      | .NAME + ": " + (.USER_TEMPLATE.ERROR | tostring)' | head -5
+  args:
+    executable: /bin/bash
+  register: _k8s_vm_errors
+  changed_when: false
+  failed_when: (_k8s_vm_errors.stdout | trim | length) > 0
+
+# Guide step: workload kubeconfig via ssh through the vRouter. VM names
+# are CAPONE-generated and LONGER than the CLI table column — resolved
+# from JSON (full names). Control-plane = release-prefixed, not a worker
+# (-md-), not the vRouter.
+- name: Fetch the workload kubeconfig through the vRouter
+  become: true
+  ansible.builtin.shell: |
+    set -o errexit -o pipefail
+    POOL="$(su - oneadmin -c "onevm list -j")"
+    VR_NAME="$(echo "$POOL" | jq -r '[.VM_POOL.VM? // [] | if type=="array" then . else [.] end | .[] | select(.NAME | startswith("vr-{{ _k8s_release }}"))] | first | .NAME // ""')"
+    CP_NAME="$(echo "$POOL" | jq -r '[.VM_POOL.VM? // [] | if type=="array" then . else [.] end | .[] | select((.NAME | startswith("{{ _k8s_release }}-")) and ((.NAME | contains("-md-")) | not))] | first | .NAME // ""')"
+    # First non-empty address across ALL NICs (VROUTER_IP preferred), CR/LF
+    # scrubbed — a malformed value fed to ssh -J dies undebuggably.
+    VR_IP="$(echo "$POOL" | jq -r --arg n "$VR_NAME" '.VM_POOL.VM? // [] | if type=="array" then . else [.] end | .[] | select(.NAME == $n) | [.TEMPLATE.NIC] | flatten | map(.VROUTER_IP // .IP // empty) | map(select(. != "")) | first // ""' | tr -d '\r' | head -n1)"
+    CP_IP="$(echo "$POOL" | jq -r --arg n "$CP_NAME" '.VM_POOL.VM? // [] | if type=="array" then . else [.] end | .[] | select(.NAME == $n) | [.TEMPLATE.NIC] | flatten | map(.IP // empty) | map(select(. != "")) | first // ""' | tr -d '\r' | head -n1)"
+    echo "diag: VR=${VR_NAME}[${VR_IP}] CP=${CP_NAME}[${CP_IP}]"
+    test -n "$VR_NAME" && test -n "$CP_NAME"
+    echo "$VR_IP" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+    echo "$CP_IP" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+    # Explicit ProxyCommand, NOT -J: the jump hop spawned by -J does not
+    # inherit command-line options, so it host-key-checks strictly and dies
+    # non-interactively ("Host key verification failed", hit live). VM IPs
+    # are recycled across runs -> /dev/null known_hosts on BOTH hops.
+    KEY="$(echo ~oneadmin/.ssh/id_rsa)"
+    ssh -i "$KEY" -q -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oConnectTimeout=10 \
+        -o ProxyCommand="ssh -i $KEY -q -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oConnectTimeout=10 -W %h:%p root@$VR_IP" \
+        root@"$CP_IP" cat /etc/rancher/rke2/rke2.yaml \
+      > /tmp/gpu_benchmark/kubeconfig_workload.raw
+    # Guide endpoint = the vRouter; seen live refusing 6443 while the CP
+    # answers directly (RKE2 certs carry the node IP SAN) — try both.
+    for EP in "$VR_IP" "$CP_IP"; do
+      sed "s|server: https://127.0.0.1:6443|server: https://$EP:6443|" \
+        /tmp/gpu_benchmark/kubeconfig_workload.raw > /tmp/gpu_benchmark/kubeconfig_workload.yaml
+      if kubectl --kubeconfig /tmp/gpu_benchmark/kubeconfig_workload.yaml get nodes; then
+        echo "API endpoint: $EP"
+        rm -f /tmp/gpu_benchmark/kubeconfig_workload.raw
+        exit 0
+      fi
+    done
+    echo "no API endpoint reachable (tried $VR_IP and $CP_IP)"
+    exit 1
+  args:
+    executable: /bin/bash
+  register: _k8s_wl_kc
+  until: _k8s_wl_kc.rc == 0
+  retries: "{{ ((gpu_benchmark.k8s.deploy_timeout_s | int) / 15) | round(0, 'ceil') | int }}"
+  delay: 15
+  changed_when: false
+
+- name: Remember the workload kubeconfig
+  ansible.builtin.set_fact:
+    _k8s_kubeconfig: /tmp/gpu_benchmark/kubeconfig_workload.yaml
+
+- name: Wait until every node is Ready
+  become: true
+  ansible.builtin.shell: |
+    set -o errexit -o pipefail
+    kubectl --kubeconfig {{ _k8s_kubeconfig }} get nodes --no-headers | awk '$2=="Ready"' | wc -l
+  args:
+    executable: /bin/bash
+  register: _k8s_ready
+  until: (_k8s_ready.stdout | trim | int) >= (1 + (_k8s_worker_count | int))
+  retries: 40
+  delay: 15
+  changed_when: false
+
+- name: Record the worker node names
+  become: true
+  ansible.builtin.shell: |
+    set -o errexit -o pipefail
+    kubectl --kubeconfig {{ _k8s_kubeconfig }} get nodes -o json \
+      | jq -r '.items[] | select(.metadata.labels["node-role.kubernetes.io/control-plane"] == null) | .metadata.name'
+  args:
+    executable: /bin/bash
+  register: _k8s_workers_out
+  changed_when: false
+
+- name: Remember the worker nodes
+  ansible.builtin.set_fact:
+    _k8s_nodes: "{{ _k8s_workers_out.stdout_lines | select | list }}"
+
+- name: Assert one worker per benchmarked GPU
+  ansible.builtin.assert:
+    that: (_k8s_nodes | length | int) == (_k8s_worker_count | int)
+    fail_msg: >-
+      Expected {{ _k8s_worker_count }} worker nodes, found
+      {{ _k8s_nodes | length }} ({{ _k8s_nodes | join(', ') }}).

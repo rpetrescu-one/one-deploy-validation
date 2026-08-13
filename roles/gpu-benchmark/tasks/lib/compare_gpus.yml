@@ -34,15 +34,21 @@
       {{ (_gpu_num | map(attribute='requests_successful') | map('int') | min)
          >= (gpu_benchmark.compare_min_samples | default(30) | int) }}
     # GPUs whose load sweep was truncated (rate ladder capped by a chaotic
-    # probe — see parse_guidellm): their throughput is a lower bound, so a
-    # throughput gap against them is a measurement artifact, not hardware.
+    # probe) OR unsaturated (ladder ended below the knee — the slow-mode
+    # guidellm client, see parse_guidellm): their throughput is a lower
+    # bound, so a throughput gap against them is a measurement artifact,
+    # not hardware.
     # 'in [true, "True"]' instead of 'truthy': ansible 2.18 stringifies the
     # stored bool, and the string 'False' would pass a truthy test.
     _cmp_truncated_gpus: >-
-      {{ _model_gpu_results | selectattr('metrics', 'defined')
-         | selectattr('metrics.sweep_truncated', 'defined')
-         | selectattr('metrics.sweep_truncated', 'in', [true, 'True'])
-         | map(attribute='gpu') | list }}
+      {{ ((_model_gpu_results | selectattr('metrics', 'defined')
+           | selectattr('metrics.sweep_truncated', 'defined')
+           | selectattr('metrics.sweep_truncated', 'in', [true, 'True'])
+           | map(attribute='gpu') | list)
+          + (_model_gpu_results | selectattr('metrics', 'defined')
+             | selectattr('metrics.sweep_unsaturated', 'defined')
+             | selectattr('metrics.sweep_unsaturated', 'in', [true, 'True'])
+             | map(attribute='gpu') | list)) | unique | list }}
 
 - name: Build one delta row per metric
   ansible.builtin.set_fact:
@@ -89,7 +95,8 @@
     _note: >-
       {{ ('insufficient sample (' ~ _cmp_min_samples ~ ' successful requests)') if (not (_cmp_sufficient | bool))
          else ('below measurement floor (< ' ~ (gpu_benchmark.compare_min_throughput_req_s | default(1.0)) ~ ' req/s)' if (_floored | bool)
-               else (('sweep truncated on GPU ' ~ (_cmp_truncated_gpus | join(', GPU ')) ~ ' — its throughput is a lower bound; gaps against it are not flagged')
+               else (('sweep truncated/unsaturated on GPU ' ~ (_cmp_truncated_gpus | join(', GPU '))
+                      ~ ' — its throughput is a lower bound; gaps against it are not flagged')
                      if ((item.key == 'throughput_req_s_mean') and (_cmp_truncated_gpus | length > 0))
                      else '')) }}
 

@@ -1,0 +1,103 @@
+---
+# Step 9 of the guide: the NVIDIA GPU operator (exact version and the four
+# containerd env vars for RKE2), then the guide's CUDA verification Job on
+# EVERY worker as a hard gate before any benchmark runs.
+# vm_apt_https also covers the DRIVER CONTAINER: its entrypoint apt-gets
+# linux-headers from the baked http:// Ubuntu sources, which this lab's
+# middlebox RSTs for VM-originated traffic ("Could not resolve Linux
+# kernel version", 22 crashloops, hit live). driver.repoConfig mounts an
+# https mirror list into the container — the operator-native analog of
+# the appliance flow's sed.
+- name: Install the NVIDIA GPU operator ({{ gpu_benchmark.k8s.gpu_operator_version }})
+  become: true
+  ansible.builtin.shell: |
+    set -o errexit -o pipefail
+    export KUBECONFIG={{ _k8s_kubeconfig }}
+    kubectl create ns gpu-operator 2>/dev/null || true
+    kubectl label --overwrite ns gpu-operator pod-security.kubernetes.io/enforce=privileged
+    EXTRA=""
+    if [ "{{ gpu_benchmark.vm_apt_https | default(false) | bool | lower }}" = "true" ]; then
+      cat > /tmp/gpu_benchmark/k8s_apt_https.list <<'EOT'
+    deb https://archive.ubuntu.com/ubuntu noble main universe
+    deb https://archive.ubuntu.com/ubuntu noble-updates main universe
+    deb https://security.ubuntu.com/ubuntu noble-security main universe
+    EOT
+      sed -i 's/^    //' /tmp/gpu_benchmark/k8s_apt_https.list
+      kubectl create configmap gpu-bench-apt-https -n gpu-operator \
+        --from-file=custom-repo.list=/tmp/gpu_benchmark/k8s_apt_https.list \
+        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+      EXTRA="--set driver.repoConfig.configMapName=gpu-bench-apt-https"
+    fi
+    EXISTING="$(helm list -n gpu-operator -q 2>/dev/null | grep gpu-operator | head -n1 || true)"
+    if [ -n "$EXISTING" ]; then
+      helm upgrade --wait --timeout 20m -n gpu-operator "$EXISTING" nvidia/gpu-operator \
+        --version={{ gpu_benchmark.k8s.gpu_operator_version }} --reuse-values $EXTRA \
+        > /tmp/gpu_benchmark/k8s_gpu_operator.log 2>&1
+      echo UPGRADED
+      exit 0
+    fi
+    helm repo add nvidia https://helm.ngc.nvidia.com/nvidia >/dev/null 2>&1 || true
+    helm repo update >/dev/null
+    helm install --wait --timeout 20m --generate-name -n gpu-operator nvidia/gpu-operator \
+      --version={{ gpu_benchmark.k8s.gpu_operator_version }} \
+      --set "toolkit.env[0].name=CONTAINERD_CONFIG" \
+      --set "toolkit.env[0].value=/var/lib/rancher/rke2/agent/etc/containerd/config.toml" \
+      --set "toolkit.env[1].name=CONTAINERD_SOCKET" \
+      --set "toolkit.env[1].value=/run/k3s/containerd/containerd.sock" \
+      --set "toolkit.env[2].name=CONTAINERD_RUNTIME_CLASS" \
+      --set "toolkit.env[2].value=nvidia" \
+      --set "toolkit.env[3].name=CONTAINERD_SET_AS_DEFAULT" \
+      --set-string "toolkit.env[3].value=true" \
+      $EXTRA \
+      > /tmp/gpu_benchmark/k8s_gpu_operator.log 2>&1
+    echo INSTALLED
+  args:
+    executable: /bin/bash
+  register: _k8s_gpuop
+  changed_when: "'INSTALLED' in _k8s_gpuop.stdout or 'UPGRADED' in _k8s_gpuop.stdout"
+
+# The operator pulls MULTI-GB driver/toolkit images from nvcr.io — the
+# CDN this lab throttles to KB/s on unlucky routes. Internal loop bounded
+# by bootstrap_timeout_s, kicking wedged pulls every ~10 min (fresh
+# connection often lands on a healthy edge), full diagnostics on expiry.
+- name: Wait until every worker advertises an allocatable GPU
+  become: true
+  ansible.builtin.shell: |
+    export KUBECONFIG={{ _k8s_kubeconfig }}
+    TRIES={{ ((gpu_benchmark.k8s.bootstrap_timeout_s | default(5400) | int) / 15) | round(0, 'ceil') | int }}
+    for i in $(seq 1 $TRIES); do
+      N="$(kubectl get nodes -o json 2>/dev/null | jq '[.items[] | select((.status.allocatable["nvidia.com/gpu"] // "0") | tonumber >= 1)] | length')"
+      if [ "${N:-0}" -ge {{ _k8s_worker_count }} ]; then
+        echo "GPUs allocatable on $N node(s) after $((i*15))s"
+        exit 0
+      fi
+      if [ $((i % 40)) -eq 0 ]; then
+        kubectl get pods -n gpu-operator --no-headers 2>/dev/null \
+          | awk '$3 == "ContainerCreating" || $3 == "ImagePullBackOff" || $3 == "ErrImagePull" || $3 == "Init:0/1" {print $1}' \
+          | while read -r POD; do
+              echo "kicking wedged gpu-operator pod $POD (stalled image pull)"
+              kubectl delete pod -n gpu-operator "$POD" --wait=false 2>/dev/null
+            done
+      fi
+      sleep 15
+    done
+    echo "no allocatable GPUs within {{ gpu_benchmark.k8s.bootstrap_timeout_s | default(5400) }}s — diagnostics:"
+    kubectl get pods -n gpu-operator --no-headers 2>/dev/null | grep -vE 'Running|Completed' | head -8
+    kubectl get events -n gpu-operator --field-selector type=Warning --sort-by=.lastTimestamp 2>/dev/null | tail -8
+    exit 1
+  args:
+    executable: /bin/bash
+  register: _k8s_gpu_alloc
+  changed_when: false
+
+- name: Reset the CUDA verification record
+  ansible.builtin.set_fact:
+    _k8s_cuda_verified: {}
+
+- name: Verify CUDA on every worker (the guide's Job, per node)
+  ansible.builtin.include_tasks: cuda_verify_node.yml
+  loop: "{{ _k8s_nodes }}"
+  loop_control:
+    loop_var: _k8s_verify_node
+    index_var: _k8s_verify_idx
+    label: "{{ _k8s_verify_node }}"

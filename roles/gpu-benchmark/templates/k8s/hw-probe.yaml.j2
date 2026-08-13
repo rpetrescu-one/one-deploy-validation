@@ -1,0 +1,47 @@
+{# One-shot hardware probe on one GPU worker: compiles and runs the SAME
+   cuBLAS SGEMM + PCIe bandwidth sources as the health flow (mounted from
+   the gpu-bench-hw-src ConfigMap), printing the same GFLOP/s= / H2D= /
+   D2H= markers so the shared parse libs read the logs unchanged. #}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ _k8s_hw_name }}
+  labels:
+    gpu-bench: hw-probe
+spec:
+  template:
+    spec:
+      runtimeClassName: nvidia
+      nodeSelector:
+        kubernetes.io/hostname: "{{ _k8s_hw_node }}"
+      containers:
+      - name: hw-probe
+        image: {{ gpu_benchmark.k8s.cuda_devel_image }}
+        command: ["bash", "-c"]
+        args:
+          - |
+            set -e
+            export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0
+{% if gpu_benchmark.cublas.enabled | bool %}
+            nvcc -O3 -lcublas -o /tmp/cublas_sgemm /bench/cublas_sgemm.cu
+            /tmp/cublas_sgemm {{ gpu_benchmark.cublas.n | int }} {{ gpu_benchmark.cublas.iters | int }}
+{% endif %}
+{% if gpu_benchmark.pcie_bw.enabled | bool %}
+            nvcc -O3 -o /tmp/pcie_bw /bench/pcie_bandwidth.cu
+            /tmp/pcie_bw {{ gpu_benchmark.pcie_bw.size_mb | int }} {{ gpu_benchmark.pcie_bw.iters | int }}
+{% endif %}
+        volumeMounts:
+        - name: bench-src
+          mountPath: /bench
+          readOnly: true
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+          requests:
+            nvidia.com/gpu: 1
+      volumes:
+      - name: bench-src
+        configMap:
+          name: gpu-bench-hw-src
+      restartPolicy: Never
+  backoffLimit: 0

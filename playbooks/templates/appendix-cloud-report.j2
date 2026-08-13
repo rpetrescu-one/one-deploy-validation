@@ -521,7 +521,10 @@
   {% endif %}
   {% endmacro %}
   {% macro bar_chart(title, bars, unit='') %}
-  {% set W = 560 %}{% set rh = 26 %}{% set pl = 64 %}{% set pr = 100 %}
+  {# Label gutter sized to the LONGEST label (11px monospace ~ 7px/char):
+     a fixed gutter clips long labels off the viewBox left edge. #}
+  {% set W = 560 %}{% set rh = 26 %}{% set pr = 100 %}
+  {% set pl = [64, ((bars | map(attribute='label') | map('length') | max) * 7 + 12)] | max %}
   {% set H = bars | length * rh + 10 %}
   {% set vmax = bars | map(attribute='value') | max | float %}
   {% if vmax > 0 %}
@@ -581,6 +584,11 @@
   {% if _unsat | length > 0 %}<div class="mini-pre"><strong>Saturation not achieved:</strong> the concurrent throughput probe completed 0 requests within each rate window on {{ _unsat | length }} of {{ _okg | length }} GPU(s) — this GPU class is too slow for that load. The figures below are the PEAK single-stream rate reached, not a sustained ceiling the GPU can hold under concurrency.</div>
   {% elif _okg | length > 0 %}<div class="mini-pre">Sustained req/s = saturated token rate &divide; tokens-per-request (the steady-state request rate the GPU holds){% set _pk = (_okg | map(attribute='metrics.throughput_req_s_peak') | select('defined') | map('float') | list) %}{% if _pk | length > 0 %}; guidellm's short-window peak rate was up to {{ _pk | max | round(1) }} req/s (a drain burst, not sustainable){% endif %}. Headline throughput is output tokens/s, which is stable run-to-run.</div>{% endif %}
   {% set _tgpu = [] %}{% for g in _okg %}{% if (g.metrics.sweep_truncated | default(false) | string) == 'True' %}{% if _tgpu.append(g.gpu) %}{% endif %}{% endif %}{% endfor %}
+  {# UNSATURATED = the slow-mode guidellm client under-measured the probe
+     and the ladder stopped below the knee (server-side ITL identical in
+     both modes) — same lower-bound treatment as a truncated sweep. #}
+  {% set _ugpu = [] %}{% for g in _okg %}{% if ((g.metrics.sweep_unsaturated | default(false) | string) == 'True') and ((g.metrics.sweep_truncated | default(false) | string) != 'True') %}{% if _ugpu.append(g.gpu) %}{% endif %}{% endif %}{% endfor %}
+  {% if _ugpu | length > 0 %}<div class="mini-pre"><strong>Sweep unsaturated on GPU {{ _ugpu | join(', GPU ') }}:</strong> the load generator landed in its slow client mode (a known bimodal behavior — the server-side token speed is identical in both modes) and under-measured the throughput probe, so the tested rate ladder stopped while the curve was still climbing — the peak/sustained figures for {{ 'this GPU are' if _ugpu | length == 1 else 'these GPUs are' }} a LOWER BOUND on capacity, not a measurement of it. Throughput gaps against {{ 'this GPU' if _ugpu | length == 1 else 'these GPUs' }} are treated as a measurement artifact, not flagged; an SLO verdict marked '*' means the throughput gate was inconclusive. Re-running redraws the probe and usually restores the full curve.</div>{% endif %}
   {% if _tgpu | length > 0 %}<div class="mini-pre"><strong>Sweep truncated on GPU {{ _tgpu | join(', GPU ') }}:</strong> guidellm derives its constant-rate ladder from a short throughput probe, and the probe under-measured (the overload region is chaotic) — the tested rates never reached the throughput knee, so the peak/sustained figures for {{ 'this GPU are' if _tgpu | length == 1 else 'these GPUs are' }} a LOWER BOUND on capacity, not a measurement of it. Throughput gaps against {{ 'this GPU' if _tgpu | length == 1 else 'these GPUs' }} are treated as a measurement artifact, not flagged; an SLO verdict marked '*' means the throughput gate was inconclusive (lower bound below the gate). Re-running the benchmark usually restores a full curve.</div>{% endif %}
   {% endif %}
   {% set _tok_series = [] %}{% set _ttft_series = [] %}
@@ -627,7 +635,13 @@
   {% for r in m.delta.metrics %}<tr><td>{{ _dlabels[r.metric] | default(r.metric) }}</td><td class="num">{{ r.best }}</td><td class="num">{{ r.worst }}</td><td class="num">{{ r.spread_pct }}</td><td>{% if (r.flagged_gpus | default([]) | length > 0) %}{{ r.flagged_gpus | map('regex_replace', '^', 'GPU ') | join(', ') }}{% elif r.note | default('') %}{{ r.note }}{% else %}—{% endif %}</td><td>{{ 'ok' if r.ok else 'FLAG' }}</td></tr>{% endfor %}
   </tbody></table></div>
   {% endif %}
-  {% if (m.status | default('')) == 'failed' and (_okg | length == 0) and (m.error is defined) %}<div class="mini-pre">Failed: {{ m.error | default('unknown error') | e }}</div>{% endif %}
+  {# A failed backend prints its headline PLUS the captured evidence tail (the
+     stack waits print a greppable verdict line last) and where the full log
+     lives — a bare "non-zero return code" is not a diagnosis. #}
+  {% if (m.status | default('')) == 'failed' and (_okg | length == 0) and (m.error is defined) %}<div class="mini-pre">Failed: {{ m.error | default('unknown error') | e }}{% if m.error_detail | default([]) | length > 0 %}
+<strong>Evidence (tail):</strong>
+{% for _el in m.error_detail %}{{ _el | e }}
+{% endfor %}{% endif %}{% if m.error_log | default('') %}Full log on the frontend: {{ m.error_log | e }}{% endif %}</div>{% endif %}
   {% endfor %}
   {% set _bd = data.baseline_delta | default({}) %}
   {% if _bd and (_bd.rows | default([]) | length > 0) %}
@@ -638,8 +652,9 @@
   {% for r in _bd.rows %}{% if (r.baremetal | string | length > 0) and (r.virtualized | string | length > 0) and ((r.baremetal | float) > 0) and ((r.virtualized | float) > 0) %}{% if _bdn.append(r) %}{% endif %}{% endif %}{% endfor %}
   {% if _bdn | length > 0 %}
   {% set _tol = _bd.tolerance_pct | default(10) | float %}
-  {% set _hwnames = ['cuBLAS GFLOP/s', 'PCIe H2D GB/s', 'PCIe D2H GB/s'] %}
-  {% set _hwrows = _bdn | selectattr('metric', 'in', _hwnames) | list %}
+  {# ' [k8s]' variants (the in-cluster probe) count as hardware rows too,
+     so the within-N% summary covers the worst of both environments. #}
+  {% set _hwrows = _bdn | selectattr('metric', 'search', '^(cuBLAS GFLOP/s|PCIe (H2D|D2H) GB/s)( \\[k8s\\])?$') | list %}
   {% set _thr_rows = _bdn | selectattr('metric', 'search', 'tok/s|sustained') | list %}
   {% set _ttft_rows = _bdn | selectattr('metric', 'search', 'TTFT') | list %}
   {# Within-tolerance is judged STRICTLY on overhead_pct — rows kept 'ok' only
@@ -650,30 +665,74 @@
   <div class="mini-pre"><strong>Summary:</strong>
   {%- if _hwrows | length > 0 %}{% set _hww = _hwrows | map(attribute='overhead_pct') | map('float') | map('abs') | max %} Raw GPU compute and PCIe bandwidth run within {{ _hww | round(1) }}% of bare metal{{ ' (virtualization overhead is negligible at the hardware level)' if (_hww | float) <= 3 else '' }}.{% endif %}
   {%- for r in _thr_rows %} {{ 'LLM throughput (' ~ r.metric ~ ') is ' ~ (r.overhead_pct | float | abs | round(1)) ~ '% ' ~ ('BELOW' if (r.overhead_pct | float) > 0 else 'above') ~ ' the bare-metal baseline.' }}{% endfor %}
-  {%- for r in _ttft_rows %} {{ 'Time to first token is ' ~ (r.overhead_pct | float | abs | round(1)) ~ '% ' ~ ('higher' if (r.overhead_pct | float) > 0 else 'lower') ~ ' than bare metal.' }}{% endfor %}
+  {%- for r in _ttft_rows %} {{ 'Time to first token' ~ ((' (' ~ (r.metric.split(' — ') | first) ~ ')') if (_ttft_rows | length > 1) else '') ~ ' is ' ~ (r.overhead_pct | float | abs | round(1)) ~ '% ' ~ ('higher' if (r.overhead_pct | float) > 0 else 'lower') ~ ' than bare metal.' }}{% endfor %}
   {{ _okc | length }}/{{ _bdn | length }} compared metrics fall within the &plusmn;{{ _tol | round(0) | int }}% tolerance{% if _guarded | length > 0 %}; {{ _guarded | length }} exceed it but are not flagged because a measurement guard applies ({{ _guarded | map(attribute='metric') | join(', ') }} — see the notes in the table){% endif %}{{ ' — see the caveats above before reading these as pure virtualization cost' if (_bd.caveats | default([]) | length > 1) else '' }}.</div>
   {# One chart, both runs: bare-metal is the 100% reference bar, each metric bar
      is the virtualized result relative to it (higher-better inverted for
      latencies so MORE is always BETTER). Colors follow the table verdict. #}
   {% set _cmp_bars = [] %}
   {% if _cmp_bars.append({'label': 'Baseline', 'value': 100.0, 'color': '#94a3b8'}) %}{% endif %}
-  {% set _multi = (_thr_rows | selectattr('metric', 'search', 'output tok/s') | list | length) > 1 %}
+  {# Two separate label dimensions: BACKEND ('vm '/'k8s ' prefixes, only
+     when a [k8s] row exists — otherwise appliance/k8s rows would render
+     identical labels told apart only by color) and MODEL (short tail,
+     only when several models really ran). #}
+  {% set _has_k8s_rows = (_bdn | selectattr('metric', 'search', '\\[k8s\\]') | list | length) > 0 %}
+  {% set _model_names = [] %}
+  {% for r0 in _bdn %}{% if ' — ' in r0.metric %}{% set _mn = (r0.metric.split(' — ') | first).replace(' [k8s]', '') %}{% if _mn not in _model_names %}{% if _model_names.append(_mn) %}{% endif %}{% endif %}{% endif %}{% endfor %}
+  {% set _multi = (_model_names | length) > 1 %}
   {% for r in _bdn %}
   {% set _bmv = r.baremetal | float %}{% set _vv = r.virtualized | float %}
   {% set _rel = (_vv / _bmv * 100) if (r.better | default('higher')) == 'higher' else (_bmv / _vv * 100) %}
   {% set _col = '#15803d' if _rel >= 100 else ('#1a7ba4' if r.ok else '#b91c1c') %}
-  {# LLM metric names are '<model> — <kind>'; with several models the bar
-     label keeps the metric KIND plus the model tail (last path segment) —
-     a blind truncate would render N identical 'Qwen/Qwen…' bars. #}
-  {% set _kind = ('cuBLAS' if r.metric == 'cuBLAS GFLOP/s' else ('PCIe H2D' if r.metric == 'PCIe H2D GB/s' else ('PCIe D2H' if r.metric == 'PCIe D2H GB/s' else ('tok/s' if 'output tok/s' in r.metric else ('req/s' if 'sustained' in r.metric else ('TTFT' if 'TTFT' in r.metric else (r.metric | truncate(9, true, '')))))))) %}
-  {% set _lbl = ((((r.metric.split(' — ') | first).split('/') | last) | truncate(10, true, '…')) ~ ' ' ~ _kind) if (_multi and (' — ' in r.metric)) else _kind %}
+  {# Kind detection on the metric BASE so ' [k8s]' hardware variants keep
+     their short names; the backend tag then applies to every row (with a
+     k8s hw probe, 'cuBLAS' would otherwise label two different bars). #}
+  {% set _mbase = r.metric.replace(' [k8s]', '') %}
+  {% set _kind = ('cuBLAS' if _mbase == 'cuBLAS GFLOP/s' else ('PCIe H2D' if _mbase == 'PCIe H2D GB/s' else ('PCIe D2H' if _mbase == 'PCIe D2H GB/s' else ('tok/s' if 'output tok/s' in r.metric else ('req/s' if 'sustained' in r.metric else ('TTFT' if 'TTFT' in r.metric else (r.metric | truncate(9, true, '')))))))) %}
+  {% set _btag = ('k8s ' if ('[k8s]' in r.metric) else ('vm ' if _has_k8s_rows else '')) %}
+  {% set _mtail = ((((r.metric.split(' — ') | first).replace(' [k8s]', '').split('/') | last) | truncate(8, true, '…')) ~ ' ') if (_multi and (' — ' in r.metric)) else '' %}
+  {% set _lbl = _mtail ~ _btag ~ _kind %}
   {% if _cmp_bars.append({'label': _lbl, 'value': _rel | round(1), 'color': _col}) %}{% endif %}
   {% endfor %}
   {{ bar_chart('Virtualized performance relative to bare-metal (100% = baseline; more is better)', _cmp_bars, '%') }}
   {% endif %}
-  <div class="table-scroll"><table class="gtable"><thead><tr><th>Metric</th><th class="num">Bare-metal</th><th class="num">Virtualized</th><th class="num">Overhead %</th><th>Status</th></tr></thead><tbody>
-  {% for r in _bd.rows %}<tr><td>{{ r.metric }}</td><td class="num">{{ (r.baremetal | float | round(2)) if (r.baremetal | string | length > 0) else '—' }}</td><td class="num">{{ (r.virtualized | float | round(2)) if (r.virtualized | string | length > 0) else '—' }}</td><td class="num">{{ r.overhead_pct if (r.overhead_pct | string | length > 0) else '—' }}</td><td>{{ ('ok' if r.ok else 'FLAG') }}{% if r.note | default('') %} ({{ r.note }}){% endif %}</td></tr>{% endfor %}
+  {# ENVIRONMENT-COLUMN table: one row per metric, one value column per
+     backend that ran ('[k8s]' row variants merge into their base row),
+     PLUS the dedicated Overhead % and Status columns of the original
+     table ('vm / k8s' pairs when both backends ran). Guard notes are
+     numbered footnotes anchored on the overhead value they apply to.
+     Hardware rows come from the appliance-side health VM (vm column) and
+     from the in-cluster hw probe ('<metric> [k8s]' rows) — a Kubernetes
+     cell stays '—' only when the probe did not produce that value. This
+     table replaces the former separate three-way summary (the NUMA caveat
+     lives in the caveats paragraph above, emitted by compare_baseline). #}
+  {% set _has_k8s_col = (_bd.rows | selectattr('metric', 'search', '\\[k8s\\]') | list | length) > 0 %}
+  {% set _obase = [] %}
+  {% for r in _bd.rows %}{% set _b0 = r.metric.replace(' [k8s]', '') %}{% if _b0 not in _obase %}{% if _obase.append(_b0) %}{% endif %}{% endif %}{% endfor %}
+  {# Footnotes collected in the OUTER scope (a list mutated inside a macro
+     is not reliably visible outside across jinja/ansible versions — the
+     macros only LOOK UP the index). #}
+  {% set _fnotes = [] %}
+  {% for r in _bd.rows %}{% if (r.note | default('') | length > 0) and (r.note not in _fnotes) %}{% if _fnotes.append(r.note) %}{% endif %}{% endif %}{% endfor %}
+  {% macro _vcell(r) %}{{ (r.virtualized | float | round(2)) if (r and (r.virtualized | default('') | string | length > 0)) else '—' }}{% endmacro %}
+  {% macro _opct(r, fnotes) %}{% if r and (r.overhead_pct | default('') | string | length > 0) %}{{ r.overhead_pct }}%{% else %}—{% endif %}{% if r and (r.note | default('') | length > 0) %}<sup>{{ fnotes.index(r.note) + 1 }}</sup>{% endif %}{% endmacro %}
+  <div class="table-scroll"><table class="gtable"><thead><tr><th>Metric</th><th class="num">Bare-metal</th><th class="num">{{ 'vLLM appliance' if _has_k8s_col else 'Virtualized' }}</th>{% if _has_k8s_col %}<th class="num">Kubernetes</th>{% endif %}<th class="num">Overhead %{{ ' (vm / k8s)' if _has_k8s_col else '' }}</th><th>Status</th></tr></thead><tbody>
+  {% for _b0 in _obase %}
+  {# LLM metrics carry the backend inside the name ('<model> [k8s] — <kind>'),
+     hardware metrics append it ('cuBLAS GFLOP/s [k8s]' from the in-cluster
+     probe) — both resolve to the base row's Kubernetes cell. #}
+  {% set _kname = _b0.replace(' — ', ' [k8s] — ', 1) if (' — ' in _b0) else (_b0 ~ ' [k8s]') %}
+  {% set _vmr = _bd.rows | selectattr('metric', 'eq', _b0) | list | first | default(none) %}
+  {% set _k8r = (_bd.rows | selectattr('metric', 'eq', _kname) | list | first | default(none)) if (_kname | length > 0) else none %}
+  {% set _bare = (_vmr.baremetal if (_vmr and (_vmr.baremetal | string | length > 0)) else ((_k8r.baremetal | default('')) if _k8r else '')) %}
+  {% set _flags = [] %}
+  {% if _vmr and not _vmr.ok %}{% if _flags.append('vm') %}{% endif %}{% endif %}
+  {% if _k8r and not _k8r.ok %}{% if _flags.append('k8s') %}{% endif %}{% endif %}
+  {% set _status = '—' if (not _vmr and not _k8r) else ('ok' if _flags | length == 0 else ('FLAG' if not _has_k8s_col else 'FLAG (' ~ _flags | join(', ') ~ ')')) %}
+  <tr><td>{{ _b0 }}</td><td class="num">{{ (_bare | float | round(2)) if (_bare | string | length > 0) else '—' }}</td><td class="num">{{ _vcell(_vmr) }}</td>{% if _has_k8s_col %}<td class="num">{{ _vcell(_k8r) }}</td>{% endif %}<td class="num">{{ _opct(_vmr, _fnotes) }}{% if _has_k8s_col %} / {{ _opct(_k8r, _fnotes) }}{% endif %}</td><td>{{ _status }}</td></tr>
+  {% endfor %}
   </tbody></table></div>
+  <div class="mini-pre">Overhead % is signed so POSITIVE always means worse than bare metal (throughput lower / latency higher).{% if _fnotes | length > 0 %} Notes: {% for n in _fnotes %}{{ loop.index }}. {{ n }}{{ ' · ' if not loop.last else '' }}{% endfor %}{% endif %}</div>
   {% endif %}
   {% endfor %}
   <div class="section-title" style="margin-top:16px">Legend — terms and abbreviations</div>
@@ -705,6 +764,7 @@
   <tr><td>FLAG / WARN</td><td>a check outside tolerance — informational; the validation continues and reports it</td></tr>
   <tr><td>not evaluated</td><td>no numeric gate configured for this GPU/model (calibration run) — the metric was measured but not judged</td></tr>
   <tr><td>Sweep truncated</td><td>the tested load ladder never reached the throughput knee (guidellm derives it from a chaotic probe) — the reported throughput is a lower bound, and throughput gaps against the affected GPU are not flagged; '*' on an SLO verdict = the throughput gate was inconclusive (lower bound below the gate)</td></tr>
+  <tr><td>Sweep unsaturated</td><td>the load generator landed in its slow client mode and under-measured the probe, so the rate ladder stopped below the knee — same lower-bound treatment as a truncated sweep; the benchmark retries once automatically when this is detected</td></tr>
   <tr><td>TP</td><td>tensor parallelism — splitting one model across N GPUs; TP=1 means each GPU serves the whole model alone</td></tr>
   <tr><td>vLLM / GuideLLM</td><td>the inference server, respectively the load-generator tool driving the benchmark</td></tr>
   <tr><td>Tokens per watt</td><td>energy efficiency — output tokens/s &divide; average GPU power draw during the run</td></tr>

@@ -97,6 +97,30 @@
                  and (_c_prev | string | length > 0) and ((_c_prev | float) > 0)
                  and ((_c_last | float) >= (_sat_otps | float))
                  and ((_c_last | float) > ((_c_prev | float) * 1.05)))) }}
+      # UNSATURATED LADDER: the complementary failure to sweep_truncated,
+      # PROVEN live 2026-08-11. The guidellm CLIENT is bimodal: in its slow
+      # mode the load generator wastes ~1.4 s per request slot (server-side
+      # ITL identical in both modes — 26.5 vs 26.9 ms at saturation on the
+      # same GPU), so the capped throughput probe under-measures by ~15%
+      # and the rate ladder built from it ENDS BEFORE THE KNEE: the last
+      # constant rungs still climb linearly (delta ratio 0.89 on the slow
+      # run vs 0.10/0.35 on saturated ones) and the reported peak is a
+      # LOWER BOUND, not capacity. Both modes appear on the SAME hardware
+      # minutes apart (bare-metal baseline: GPU0 slow probe, GPU1 fast).
+      # Detector: peak sits on the ladder tail (probe within 25% above the
+      # top constant rung) while the last rung-to-rung delta is still
+      # >= 60% of the mean earlier delta (the curve never flattened).
+      # Consumers treat it exactly like sweep_truncated: lower bound.
+      sweep_unsaturated: >-
+        {{ (_sat_ok | bool)
+           and (_sat_otps | string | length > 0)
+           and (_c_outs | length >= 5)
+           and ((_sat_otps | float) >= (_c_outs | last | float))
+           and ((_sat_otps | float) <= ((_c_outs | last | float) * 1.25))
+           and ((_c_last_delta | float) > 0)
+           and ((_c_mean_delta | float) > 0)
+           and ((_c_last_delta | float) >= ((_c_mean_delta | float) * 0.6))
+           and ((_c_outs | last | float) > ((_c_outs | first | float) * 1.05)) }}
       sweep: "{{ _llm_sweep }}"
   vars:
     _tp_by_type: >-
@@ -150,3 +174,18 @@
     _c_prev: >-
       {{ (((_c_rows[-2].metrics.output_tokens_per_second | default({}))[_s] | default({})).mean | default(''))
          if (_c_rows | length >= 2) else '' }}
+    # Constant-rung outputs as a NATIVE float list (filter-built — a jinja
+    # {% for %} block would stringify on ansible 2.18 and break indexing).
+    _c_outs: >-
+      {{ _c_rows | map(attribute='metrics.output_tokens_per_second')
+         | map(attribute=_s) | map(attribute='mean')
+         | map('float') | select('gt', 0.0) | list }}
+    # Knee test without a deltas list: last rung-to-rung delta vs the MEAN
+    # of the earlier deltas ((outs[-2]-outs[0])/(n-2)) — below the knee the
+    # ladder is near-linear, so the mean is a faithful reference.
+    _c_last_delta: >-
+      {{ ((_c_outs | last | float) - (_c_outs[-2] | float))
+         if (_c_outs | length >= 2) else 0.0 }}
+    _c_mean_delta: >-
+      {{ (((_c_outs[-2] | float) - (_c_outs | first | float)) / ((_c_outs | length) - 2))
+         if (_c_outs | length >= 3) else 0.0 }}

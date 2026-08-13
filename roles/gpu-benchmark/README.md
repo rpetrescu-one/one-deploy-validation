@@ -105,6 +105,97 @@ relative to its socket. Two knobs make both phases NUMA-deterministic:
   Default (`vm_per_gpu: false`) keeps the original all-GPUs-in-one-VM flow —
   note that flow cannot be NUMA-local to GPUs on different sockets.
 
+Kubernetes backend (bare-metal vs vLLM appliance vs K8s)
+--------------------------------------------------------
+
+`gpu_benchmark.llm_backends` selects which post-deploy backends run the
+benchmark (default `['appliance']` — behavior identical to before the knob
+existed). With `['k8s']` or `['appliance', 'k8s']` the role deploys an
+RKE2 cluster **exactly per the OpenNebula 7.4 "AI-ready Kubernetes"
+guide**: the `Service Capi` appliance (k3s management cluster with the
+CAPONE provider), the `capone/capone-rke2` chart (0.1.7) with 1
+control-plane + **one GPU worker per benchmarked GPU** (PCI passthrough by
+vendor/class, device id auto-filled when uniform), the NVIDIA
+`gpu-operator` (v25.3.2, the guide's containerd env for RKE2), and the
+guide's CUDA verification Job on every worker as a hard gate. helm and
+kubectl are installed on the frontend if missing (the guide's install
+commands) and stay installed.
+
+The one piece the guide stops short of — LLM serving — is a vLLM pod per
+worker pinned to the SAME vLLM version as the baseline
+(`vllm/vllm-openai:v<baremetal.vllm_version>`), with guidellm running
+INSIDE the container against localhost using the shared profile: the same
+tests, the same metrics, the same SLO gates, the same bare-metal
+comparison. K8s results are keyed `<model> · k8s` and their overhead rows
+are labeled `[k8s]`; with both backends in one run the report's overhead
+table grows an environment column per backend (bare-metal | vLLM
+appliance | Kubernetes), with a combined `Overhead % (vm / k8s)` column
+and a Status column naming the breaching environment.
+
+The hardware micro-benchmarks also run in-cluster (`k8s.hw_probe`,
+default `true`): a one-shot Job per GPU worker with a CUDA **devel**
+image (`k8s.cuda_devel_image`) compiles and runs the SAME
+`cublas_sgemm.cu` + `pcie_bandwidth.cu` sources used by the health flow
+and the results fill the Kubernetes cells of the cuBLAS / PCIe H2D /
+PCIe D2H rows. Since K8s workers cannot be NUMA-pinned, the in-pod PCIe
+number is the signal that attributes (or clears) NUMA placement when a
+`[k8s]` LLM row breaches tolerance. The probe honors `cublas.enabled` /
+`pcie_bw.enabled`, is bounded by `k8s.hw_probe_timeout_s`, and is
+best-effort: a failure becomes a report caveat, never a lost benchmark.
+
+Bootstrap wedges and how they are reported: the `Service Capi` appliance boot
+is bimodal on throttled labs, and two deadlocks have been observed live. The
+rancher-turtles helm install can stick (`failed`/`uninstalling`/`pending-install`
+→ the wait uninstalls it `--no-hooks` so the k3s retry job reinstalls cleanly),
+and the appliance's k3s apiserver can lose its **Secrets watch cache** while
+quorum reads stay correct — kubelet then reports `secret ... not found` for a
+secret that exists, the CAPI core pod never starts, no provider installs, and
+the wait can never succeed. The wait detects the second one exactly (it compares
+the cached `resourceVersion=0` secret LIST against the quorum LIST every ~5 min)
+and restarts k3s **once** on the capi VM, which recovered the stack in 15 s
+live; `k8s.unwedge_apiserver_cache: false` disables it. No in-cluster remedy
+works for that fault — deleting the stale cert-manager temp secret, kicking the
+pod, restarting cert-manager, recreating the `Certificate` and minting the cert
+by hand were all verified useless.
+
+When the stack does fail, the report no longer says "non-zero return code": the
+waits print a greppable `K8S_STACK_VERDICT rc=… reason=…` line **last**, the
+rescue captures the redacted stdout/stderr tail into the failed model entry
+(`error`, `error_detail`) and writes the full evidence to
+`/tmp/gpu_benchmark/k8s_failure<cluster suffix>.log`, which survives teardown.
+
+Deviations, all deliberate and documented in-line: worker resources use
+`vm.vcpu`/`vm.memory_mb` (role defaults 8 vCPU/16 GiB; the validated
+vgpu2 sizing raises them to 32 vCPU/64 GiB in its inventory), NOT the
+guide's 12–16/32 examples; K8s workers are **not NUMA-pinned** (the chart
+shares one worker template — the report states this caveat); the
+functional API suite and power sampling are appliance/bare-metal-only in
+v1. Everything is torn down afterwards (vLLM pods, workload cluster via
+`helm uninstall`, the capi VM); the exported Service Capi template/image
+stay for cheap re-runs. Budget ~30–45 min extra for the K8s stack.
+
+Measurement honesty — the guidellm client is bimodal
+----------------------------------------------------
+
+The load generator itself (guidellm, pip-installed fresh in every VM/pod)
+has two stable modes, proven live on identical hardware minutes apart: in
+the slow mode the client wastes ~1.4 s per request slot, the capped
+throughput probe under-measures by ~15%, and the rate ladder derived from
+it stops BELOW the throughput knee — the whole run then under-reports
+capacity by the same ~15% while the server-side token speed (ITL) is
+byte-identical in both modes. The role defends in two layers:
+
+* `parse_guidellm` detects the **unsaturated ladder** (the last constant
+  rungs still climb linearly while the peak sits on the ladder tail) and
+  marks the result `sweep_unsaturated` — treated everywhere exactly like
+  a truncated sweep: a LOWER BOUND. SLO breaches become `inconclusive`
+  (`*` in the report), GPU-to-GPU and bare-vs-virt gaps against the
+  affected side are not flagged, and the report carries a caveat.
+* `llm_retry_unsaturated` (default `true`) re-runs the sweep ONCE on the
+  affected GPU and keeps the better curve. Capacity is a max-capability
+  metric, so best-of-two removes the downward bias and cannot inflate
+  the result; a failed retry never discards the first attempt.
+
 How results are judged
 ----------------------
 

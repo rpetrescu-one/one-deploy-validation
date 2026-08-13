@@ -1,0 +1,51 @@
+{# One vLLM server per GPU worker — the piece the guide stops short of.
+   Image pinned to the SAME vLLM version as the baseline/appliance
+   (comparability); args mirror the appliance context; exactly one GPU via
+   the device plugin; pinned to its worker so GPU<->result mapping is
+   stable. #}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-g{{ _k8s_gpu_idx }}
+  labels:
+    app: vllm-g{{ _k8s_gpu_idx }}
+    gpu-bench: vllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-g{{ _k8s_gpu_idx }}
+  template:
+    metadata:
+      labels:
+        app: vllm-g{{ _k8s_gpu_idx }}
+        gpu-bench: vllm
+    spec:
+      runtimeClassName: nvidia
+      nodeSelector:
+        kubernetes.io/hostname: "{{ _k8s_node_name }}"
+      containers:
+      - name: vllm
+        image: vllm/vllm-openai:v{{ gpu_benchmark.baremetal.vllm_version }}
+        args:
+          - "{{ _model }}"
+          - "--host"
+          - "127.0.0.1"
+          - "--port"
+          - "{{ gpu_benchmark.vllm_context.api_port }}"
+          - "--gpu-memory-utilization"
+          - "{{ gpu_benchmark.vllm_context.gpu_mem_util }}"
+          - "--max-model-len"
+          - "{{ gpu_benchmark.vllm_context.model_max_length }}"
+          - "--tensor-parallel-size"
+          - "1"
+{% if gpu_benchmark.hf_token %}
+        env:
+        - name: HF_TOKEN
+          value: "{{ gpu_benchmark.hf_token }}"
+{% endif %}
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+          requests:
+            nvidia.com/gpu: 1

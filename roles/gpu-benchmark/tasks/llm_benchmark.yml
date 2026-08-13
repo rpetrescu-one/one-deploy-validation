@@ -9,9 +9,17 @@
     state: directory
     mode: "0755"
 
-- name: Benchmark each GPU host
+- name: Benchmark each GPU host (appliance backend)
   ansible.builtin.include_tasks: llm_benchmark_host.yml
   loop: "{{ _gpu_inventory.hosts }}"
   loop_control:
     loop_var: _llm_host
     label: "host {{ _llm_host.host_id }}"
+  when: "'appliance' in (gpu_benchmark.llm_backends | default(['appliance']))"
+
+# RKE2 per the AI-ready K8s guide — same tests, same baseline, results
+# keyed '<model> · k8s'. Runs after the appliance backend so a K8s failure
+# (isolated in k8s/main.yml's rescue) never costs the appliance results.
+- name: Benchmark the Kubernetes backend
+  ansible.builtin.include_tasks: k8s/main.yml
+  when: "'k8s' in (gpu_benchmark.llm_backends | default(['appliance']))"

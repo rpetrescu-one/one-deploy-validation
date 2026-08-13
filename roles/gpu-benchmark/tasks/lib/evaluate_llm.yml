@@ -32,8 +32,12 @@
   vars:
     _t: "{{ _eval_thresholds | default(gpu_benchmark.thresholds) }}"
     # string-compare: ansible 2.18 stringifies the stored bool and the
-    # string 'False' would pass a truthy test
-    _trunc: "{{ (_llm_metrics.sweep_truncated | default(false) | string) == 'True' }}"
+    # string 'False' would pass a truthy test. TRUNCATED and UNSATURATED
+    # sweeps are both throughput LOWER BOUNDS (chaotic probe vs slow-mode
+    # client — see parse_guidellm) and get the same directional treatment.
+    _trunc: >-
+      {{ ((_llm_metrics.sweep_truncated | default(false) | string) == 'True')
+         or ((_llm_metrics.sweep_unsaturated | default(false) | string) == 'True') }}
 
 - name: Derive overall status
   ansible.builtin.set_fact:

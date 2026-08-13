@@ -1,0 +1,269 @@
+---
+# One GPU (= one worker node) on the K8s backend: deploy the vLLM pod,
+# wait fail-fast, warm up, run guidellm INSIDE the container on localhost
+# (the exact analogue of the appliance/bare-metal flows — no network hop),
+# then the SHARED parse/threshold/evaluate chain. The kubectl-exec channel
+# follows the ssh-pipe discipline: forking programs write to files in the
+# pod, never to the channel.
+- name: Benchmark GPU {{ _k8s_gpu_idx }} on {{ _k8s_node_name }} (k8s)
+  block:
+    - name: Deploy the vLLM pod for GPU {{ _k8s_gpu_idx }}
+      become: true
+      ansible.builtin.template:
+        src: k8s/vllm-deploy.yaml.j2
+        dest: "/tmp/gpu_benchmark/k8s_vllm_g{{ _k8s_gpu_idx }}.yaml"
+        mode: "0600"
+      no_log: "{{ (gpu_benchmark.hf_token | length > 0) | bool }}"
+
+    # rm in the same compound WITHOUT errexit short-circuiting it: the
+    # manifest may carry the HF token, so it must not survive a failed
+    # apply (rc preserved and re-raised after the cleanup).
+    - name: Apply the vLLM deployment (GPU {{ _k8s_gpu_idx }})
+      become: true
+      ansible.builtin.shell: |
+        kubectl --kubeconfig {{ _k8s_kubeconfig }} apply -f /tmp/gpu_benchmark/k8s_vllm_g{{ _k8s_gpu_idx }}.yaml
+        rc=$?
+        rm -f /tmp/gpu_benchmark/k8s_vllm_g{{ _k8s_gpu_idx }}.yaml
+        exit $rc
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    # Server binds 127.0.0.1 (like bare-metal: nothing else needs the
+    # port), so readiness = pod Running AND an in-container curl. The poll
+    # loop lives INSIDE one bounded task — an ansible until+failed_when
+    # pair cannot break a retry loop early, an internal loop can: a wedged
+    # pod (CrashLoop/ImagePull) exits 2 IMMEDIATELY with the log tail.
+    - name: Wait until vLLM serves on GPU {{ _k8s_gpu_idx }} (fail fast)
+      become: true
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ _k8s_kubeconfig }}
+        for i in $(seq 1 {{ ((gpu_benchmark.serve_timeout_s | int) / 15) | round(0, 'ceil') | int }}); do
+          POD="$(kubectl get pod -l app=vllm-g{{ _k8s_gpu_idx }} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
+          if [ -n "$POD" ]; then
+            WAITREASON="$(kubectl get pod "$POD" -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null)"
+            if [ "$WAITREASON" = "CrashLoopBackOff" ] || [ "$WAITREASON" = "ImagePullBackOff" ] || [ "$WAITREASON" = "ErrImagePull" ]; then
+              echo "vLLM pod $POD wedged: $WAITREASON — log tail:"
+              kubectl logs "$POD" --tail=15 2>/dev/null
+              exit 2
+            fi
+            PHASE="$(kubectl get pod "$POD" -o jsonpath='{.status.phase}')"
+            if [ "$PHASE" = "Running" ] && kubectl exec "$POD" -- curl -sf -m 5 http://127.0.0.1:{{ gpu_benchmark.vllm_context.api_port }}/v1/models >/dev/null 2>&1; then
+              echo "serving on $POD"
+              exit 0
+            fi
+          fi
+          sleep 15
+        done
+        echo "vLLM did not start serving within {{ gpu_benchmark.serve_timeout_s }} s — pod state:"
+        kubectl get pod -l app=vllm-g{{ _k8s_gpu_idx }} 2>/dev/null
+        exit 1
+      args:
+        executable: /bin/bash
+      register: _k8s_serve
+      changed_when: false
+
+    - name: Remember the pod name (GPU {{ _k8s_gpu_idx }})
+      become: true
+      ansible.builtin.shell: >
+        kubectl --kubeconfig {{ _k8s_kubeconfig }} get pod -l app=vllm-g{{ _k8s_gpu_idx }}
+        -o jsonpath='{.items[0].metadata.name}'
+      register: _k8s_pod
+      changed_when: false
+
+    - name: Warm up GPU {{ _k8s_gpu_idx }} (representative prefill, x2)
+      become: true
+      ansible.builtin.shell: |
+        set -o errexit -o pipefail
+        kubectl --kubeconfig {{ _k8s_kubeconfig }} exec {{ _k8s_pod.stdout | trim }} -- \
+          curl -sf -m 120 -X POST http://127.0.0.1:{{ gpu_benchmark.vllm_context.api_port }}/v1/completions \
+          -H 'Content-Type: application/json' \
+          -d '{"model": "{{ _model }}", "prompt": "{{ 'benchmark warm up token ' * 100 }}", "max_tokens": 8}' \
+          > /dev/null
+      args:
+        executable: /bin/bash
+      register: _k8s_warm
+      until: _k8s_warm.rc == 0
+      retries: 5
+      delay: 10
+      loop: [1, 2]
+      loop_control:
+        label: "warm-up {{ item }}"
+      changed_when: false
+
+    # SAME shared profile as every other backend — the comparability
+    # guarantee. pip + guidellm write to files inside the pod; the exec
+    # channel only carries the log tail at the end.
+    # Quoted heredoc through stdin: the shared profile carries single
+    # quotes, so no bash -c wrapper can hold it — same discipline as the
+    # ssh heredocs (and NO apostrophes in comments inside the heredoc).
+    - name: Run GuideLLM in the pod (GPU {{ _k8s_gpu_idx }})
+      become: true
+      ansible.builtin.shell: |
+        set -o pipefail
+        kubectl --kubeconfig {{ _k8s_kubeconfig }} exec -i {{ _k8s_pod.stdout | trim }} -- bash -s <<'REMOTE_EOF'
+        pip install -q guidellm==0.7.1 > /tmp/pip.log 2>&1 < /dev/null || { echo PIP_INSTALL_FAILED; tail -n 20 /tmp/pip.log; exit 97; }
+        guidellm run --backend 'kind=openai_http,target=http://127.0.0.1:{{ gpu_benchmark.vllm_context.api_port }},model={{ _model }}' {{ gpu_benchmark.guidellm_profile }} --constraint kind=max_duration,seconds={{ gpu_benchmark.guidellm_max_duration_s | default(20) | int }} --tokenizer 'kind=huggingface_auto,model={{ _model }}' --output 'kind=json,path=/tmp/result.json' --disable-console-interactive > /tmp/guidellm.log 2>&1 < /dev/null
+        rc=$?
+        tail -c 6000 /tmp/guidellm.log
+        exit $rc
+        REMOTE_EOF
+      args:
+        executable: /bin/bash
+      register: _k8s_bench
+      changed_when: true
+
+    - name: Read the GuideLLM report (GPU {{ _k8s_gpu_idx }})
+      become: true
+      ansible.builtin.shell: >
+        kubectl --kubeconfig {{ _k8s_kubeconfig }} exec {{ _k8s_pod.stdout | trim }} -- cat /tmp/result.json
+      register: _k8s_gl_json
+      changed_when: false
+
+    - name: Query the GPU name in the pod (GPU {{ _k8s_gpu_idx }})
+      become: true
+      ansible.builtin.shell: >
+        kubectl --kubeconfig {{ _k8s_kubeconfig }} exec {{ _k8s_pod.stdout | trim }} --
+        nvidia-smi --query-gpu=name --format=csv,noheader
+      register: _k8s_gpu_name
+      changed_when: false
+      failed_when: false
+
+    - name: Parse GuideLLM metrics (GPU {{ _k8s_gpu_idx }})
+      ansible.builtin.include_tasks: lib/parse_guidellm.yml
+      vars:
+        _guidellm_report: "{{ _k8s_gl_json.stdout | from_json }}"
+
+    # UNSATURATED RETRY: the guidellm client is bimodal (slow mode wastes
+    # ~1.4 s per request slot and the ladder stops below the knee — see
+    # parse_guidellm). One redraw, keep the better curve; a failed retry
+    # never discards the first attempt. Same heredoc discipline as the
+    # first run (no apostrophes in comments, file redirects, stdin guards).
+    - name: Decide on a sweep retry (GPU {{ _k8s_gpu_idx }})
+      ansible.builtin.set_fact:
+        _llm_retry_needed: >-
+          {{ (gpu_benchmark.llm_retry_unsaturated | default(true) | bool)
+             and ((_llm_metrics.sweep_unsaturated | default(false) | string) == 'True') }}
+        _llm_metrics_first: "{{ _llm_metrics }}"
+
+    - name: Retry the unsaturated load sweep once (GPU {{ _k8s_gpu_idx }})
+      become: true
+      ansible.builtin.shell: |
+        set -o pipefail
+        kubectl --kubeconfig {{ _k8s_kubeconfig }} exec -i {{ _k8s_pod.stdout | trim }} -- bash -s <<'REMOTE_EOF'
+        guidellm run --backend 'kind=openai_http,target=http://127.0.0.1:{{ gpu_benchmark.vllm_context.api_port }},model={{ _model }}' {{ gpu_benchmark.guidellm_profile }} --constraint kind=max_duration,seconds={{ gpu_benchmark.guidellm_max_duration_s | default(20) | int }} --tokenizer 'kind=huggingface_auto,model={{ _model }}' --output 'kind=json,path=/tmp/result_r2.json' --disable-console-interactive > /tmp/guidellm_r2.log 2>&1 < /dev/null
+        rc=$?
+        tail -c 4000 /tmp/guidellm_r2.log
+        exit $rc
+        REMOTE_EOF
+      args:
+        executable: /bin/bash
+      register: _retry_bench
+      changed_when: true
+      failed_when: false
+      when: _llm_retry_needed | bool
+
+    - name: Read the retry report (GPU {{ _k8s_gpu_idx }})
+      become: true
+      ansible.builtin.shell: >
+        kubectl --kubeconfig {{ _k8s_kubeconfig }} exec {{ _k8s_pod.stdout | trim }} -- cat /tmp/result_r2.json
+      register: _retry_json
+      changed_when: false
+      failed_when: false
+      when: (_llm_retry_needed | bool) and ((_retry_bench.rc | default(1) | int) == 0)
+
+    # Own rescue: a retry report that begins with a brace but is
+    # truncated/malformed must NOT escape to the site rescue and discard
+    # a valid attempt 1 — the parse failure is swallowed and keep-better
+    # simply keeps the first attempt.
+    - name: Parse the retry metrics (GPU {{ _k8s_gpu_idx }})
+      block:
+        - name: Parse the retry report (GPU {{ _k8s_gpu_idx }})
+          ansible.builtin.include_tasks: lib/parse_guidellm.yml
+          vars:
+            _guidellm_report: "{{ _retry_json.stdout | from_json }}"
+      rescue:
+        - name: Note the unparseable retry report (GPU {{ _k8s_gpu_idx }})
+          ansible.builtin.debug:
+            msg: "retry report unparseable — keeping the first attempt"
+      when:
+        - _llm_retry_needed | bool
+        - (_retry_bench.rc | default(1) | int) == 0
+        - (_retry_json.rc | default(1) | int) == 0
+        - (_retry_json.stdout | default('') | trim).startswith('{')
+
+    - name: Keep the better sweep attempt (GPU {{ _k8s_gpu_idx }})
+      ansible.builtin.set_fact:
+        _llm_metrics: >-
+          {{ _llm_metrics_first
+             if ((_llm_metrics_first.output_tok_s_saturated | default('') | string | length > 0)
+                 and ((_llm_metrics_first.output_tok_s_saturated | default(0) | float)
+                      > (_llm_metrics.output_tok_s_saturated | default(0) | float)))
+             else _llm_metrics }}
+      when: _llm_retry_needed | bool
+
+    - name: Resolve SLO thresholds (GPU {{ _k8s_gpu_idx }})
+      ansible.builtin.include_tasks: lib/resolve_thresholds.yml
+      vars:
+        _gpu_name: "{{ _k8s_gpu_name.stdout_lines | default([]) | first | default('') | trim }}"
+
+    - name: Evaluate metrics (GPU {{ _k8s_gpu_idx }})
+      ansible.builtin.include_tasks: lib/evaluate_llm.yml
+      vars:
+        _eval_thresholds: "{{ _resolved_thresholds }}"
+        _eval_thresholds_source: "{{ _resolved_thresholds_source }}"
+
+    - name: Capture tool versions (last GPU's pod)
+      become: true
+      ansible.builtin.shell: |
+        set -o pipefail
+        kubectl --kubeconfig {{ _k8s_kubeconfig }} exec {{ _k8s_pod.stdout | trim }} -- bash -c \
+          'pip show guidellm vllm 2>/dev/null | grep -E "^(Name|Version):" | paste -sd" " -'
+      args:
+        executable: /bin/bash
+      register: _tool_versions
+      changed_when: false
+      failed_when: false
+      when: (_k8s_gpu_idx | int) == ((_k8s_nodes | length | int) - 1)
+
+    - name: Record GPU {{ _k8s_gpu_idx }} result (k8s)
+      ansible.builtin.set_fact:
+        _model_gpu_results: >-
+          {{ _model_gpu_results + [{
+            'gpu': _k8s_gpu_idx | int,
+            'node': _k8s_node_name,
+            'metrics': _llm_metrics,
+            'evaluation': _llm_eval
+          }] }}
+
+  rescue:
+    - name: Collect failure diagnostics (GPU {{ _k8s_gpu_idx }}, best effort)
+      become: true
+      ansible.builtin.shell: |
+        export KUBECONFIG={{ _k8s_kubeconfig }}
+        POD="$(kubectl get pod -l app=vllm-g{{ _k8s_gpu_idx }} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
+        echo "=== pod status ==="
+        kubectl get pod -l app=vllm-g{{ _k8s_gpu_idx }} 2>/dev/null
+        echo "=== vllm log tail ==="
+        [ -n "$POD" ] && kubectl logs "$POD" --tail=25 2>/dev/null
+        echo "=== guidellm log tail ==="
+        [ -n "$POD" ] && kubectl exec "$POD" -- tail -n 25 /tmp/guidellm.log 2>/dev/null
+        true
+      args:
+        executable: /bin/bash
+      register: _k8s_diag
+      changed_when: false
+      failed_when: false
+
+    - name: Record GPU {{ _k8s_gpu_idx }} failure (k8s)
+      ansible.builtin.set_fact:
+        _model_gpu_results: >-
+          {{ _model_gpu_results + [{
+            'gpu': _k8s_gpu_idx | int,
+            'node': _k8s_node_name,
+            'status': 'failed',
+            'error': ((ansible_failed_result.msg | default('error') | string | truncate(300, true))
+                      ~ ' | diagnostics: '
+                      ~ (_k8s_diag.stdout | default('none') | string | truncate(1200, true)))
+          }] }}
+      no_log: true
