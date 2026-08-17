@@ -52,7 +52,7 @@ If any testcase is disabled compared to the current [all.yml](./inventory/refere
 4. To execute `ansible-playbook` using the example template you can run
 
    ```shell
-   make I=inventory/reference/example.yml validation ANSIBLE_ARGS="-e @playbooks/report_input_vars.yml.example
+   make I=inventory/reference/example.yml validation ANSIBLE_ARGS="-e @playbooks/report_input_vars.yml.example"
    ```
 Ensure that your Python virtual environment is activated before running the playbook.
 
@@ -77,6 +77,5 @@ The execution of the all the tests produces the following output files on the An
 
 - `/tmp/cloud_verification_report.html`
 - `/tmp/cloud_verification_report.pdf`
-- `/tmp/conn-matrix-report.html`
-- `/tmp/conn-matrix-raw-data.json`
+- `/tmp/conn-matrix-raw-data.json` (when connectivity matrix validation is enabled; HTML results are included in `/tmp/cloud_verification_report.html`)
 - `/tmp/fe_ha_report.html`

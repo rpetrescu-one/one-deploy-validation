@@ -49,38 +49,120 @@
     combined_file_list: "{{ combined_file_list | default([]) + item.files }}"
   loop: "{{ found_files.results }}"
 
-- name: Calculate sha256 sum for each file in the directory
-  stat:
-    path: "{{ item.path }}"
-    checksum_algorithm: sha256
+- name: Set config diff exclude patterns
+  ansible.builtin.set_fact:
+    config_diff_exclude_patterns: "{{ validation.fe_ha.config_diff_exclude_patterns | default(['\\.bak$']) }}"
+
+- name: Exclude configured files from config diff
+  ansible.builtin.set_fact:
+    combined_file_list: "{{ combined_file_list | rejectattr('path', 'search', item) | list }}"
+  loop: "{{ config_diff_exclude_patterns }}"
+  when: config_diff_exclude_patterns | length > 0
+
+- name: Read config files without changing disk
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
   loop: "{{ combined_file_list }}"
-  register: file_hashes
+  register: config_file_contents_raw
+  no_log: true
 
-- name: Save hashes per host
-  set_fact:
-    file_checksums: "{{ file_checksums | default({}) | combine({ item.item.path: item.stat.checksum}) }}"
-  loop: "{{ file_hashes.results }}"
+- name: Save sanitized config file content per host
+  ansible.builtin.set_fact:
+    config_file_contents: >-
+      {{
+        config_file_contents | default({}) | combine({
+          item.item.path: (
+            (item.content | b64decode)
+            | regex_replace('(?m)^\s*SERVER_ID\s*=.*(?:\n|$)', '')
+            if item.item.path == '/etc/one/oned.conf'
+            else (item.content | b64decode)
+          )
+        })
+      }}
+  loop: "{{ config_file_contents_raw.results }}"
   when:
-    - item.stat is defined
-    - item.stat.exists is defined and item.stat.exists
-    - item.stat.isreg is defined and item.stat.isreg
-    - item.stat.checksum is defined
+    - item.content is defined
+    - not item.failed | default(false)
+  no_log: true
 
-# Compare files using fe1 as a reference
-- name: Set fact for diff files
-  set_fact:
-    diff_files: |
-      {% for fname in hostvars[groups['frontend'][0]]['file_checksums'] %}
-        {% if  hostvars[groups['frontend'][0]]['file_checksums'][fname] != hostvars[item]['file_checksums'][fname] %}
-          {{ (diff_files_dict | default({})) | combine({ item : fname }) }}
-        {% endif %}
-      {% endfor %}
-  loop: "{{ groups.frontend }}"
+- name: Build complete config file list across FE nodes
+  ansible.builtin.set_fact:
+    all_config_files: >-
+      {{
+        groups[frontend_group | d('frontend')]
+        | map('extract', hostvars, 'config_file_contents')
+        | map('default', {})
+        | map('dict2items')
+        | flatten
+        | map(attribute='key')
+        | unique
+        | sort
+      }}
+    config_reference_host: "{{ groups[frontend_group | d('frontend')][0] }}"
+    config_differences: {}
   run_once: true
-    
-- name: Save file content checks 
-  set_fact:
-    verification_result: "{{ verification_result | combine({'Check Content of the config diretory for file diffs at all FE nodes. Diff files': diff_files }) }}"
+
+- name: Compare sanitized config file contents across all FE nodes
+  ansible.builtin.set_fact:
+    config_differences: >-
+      {{
+        config_differences | combine({
+          item.0: (
+            config_differences.get(item.0, {}) | combine({
+              item.1: {
+                'status': 'file presence differs' if not (ref_has_file | bool and host_has_file | bool) else 'content differs',
+                'reference_host': config_reference_host,
+                'reference_present': ref_has_file | bool,
+                'host_present': host_has_file | bool,
+                'reference_line_count': (reference_files[item.1].splitlines() | length) if ref_has_file | bool else 0,
+                'host_line_count': (host_files[item.1].splitlines() | length) if host_has_file | bool else 0,
+                'reference_sha256': (reference_files[item.1] | hash('sha256')) if ref_has_file | bool else '',
+                'host_sha256': (host_files[item.1] | hash('sha256')) if host_has_file | bool else '',
+                'reference_only_lines': (reference_files[item.1].splitlines() | difference(host_files[item.1].splitlines())) if ref_has_file | bool and host_has_file | bool else (reference_files[item.1].splitlines() if ref_has_file | bool else []),
+                'host_only_lines': (host_files[item.1].splitlines() | difference(reference_files[item.1].splitlines())) if ref_has_file | bool and host_has_file | bool else (host_files[item.1].splitlines() if host_has_file | bool else [])
+              }
+            })
+          )
+        }, recursive=True)
+      }}
+  loop: "{{ (groups[frontend_group | d('frontend')] | difference([config_reference_host])) | product(all_config_files) | list }}"
+  vars:
+    reference_files: "{{ hostvars[config_reference_host].config_file_contents | default({}) }}"
+    host_files: "{{ hostvars[item.0].config_file_contents | default({}) }}"
+    ref_has_file: "{{ item.1 in reference_files }}"
+    host_has_file: "{{ item.1 in host_files }}"
+  when: >-
+    not (ref_has_file | bool and host_has_file | bool)
+    or reference_files[item.1] != host_files[item.1]
+  no_log: true
+  run_once: true
+
+- name: Build config comparison report
+  ansible.builtin.set_fact:
+    config_diff_report:
+      status: "{{ 'error - config file differences found' if config_differences | length > 0 else 'ok' }}"
+      reference_host: "{{ config_reference_host }}"
+      exclude_patterns: "{{ config_diff_exclude_patterns }}"
+      differences: "{{ config_differences }}"
+  no_log: true
+  run_once: true
+
+- name: Save file content checks
+  ansible.builtin.set_fact:
+    verification_result: >-
+      {{
+        verification_result | combine({
+          'Check content of the config directory for file diffs at all FE nodes':
+            config_diff_report.status
+        })
+      }}
+    verification_comments: >-
+      {{
+        verification_comments | default({}) | combine({
+          'Check content of the config directory for file diffs at all FE nodes':
+            config_diff_report
+        })
+      }}
   run_once: true
 
 ### Leader failover tests

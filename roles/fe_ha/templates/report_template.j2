@@ -41,14 +41,51 @@
 }
 </style>
 
+
+{% macro render_config_diff_comment(comment) -%}
+<pre>{{ {
+  'status': comment.status | default(''),
+  'reference_host': comment.reference_host | default(''),
+  'exclude_patterns': comment.exclude_patterns | default([])
+} | to_nice_json(indent=2) }}</pre>
+{%- for host, files in (comment.differences | default({})).items() %}
+  {%- for file_path, diff in files.items() %}
+<details>
+  <summary>{{ host }} :: {{ file_path }} — {{ diff.status | default('differs') }}</summary>
+  <pre>{{ {
+    'reference_present': diff.reference_present | default(false),
+    'host_present': diff.host_present | default(false),
+    'reference_line_count': diff.reference_line_count | default(0),
+    'host_line_count': diff.host_line_count | default(0),
+    'reference_sha256': diff.reference_sha256 | default(''),
+    'host_sha256': diff.host_sha256 | default(''),
+    'reference_only_lines': diff.reference_only_lines | default([]),
+    'host_only_lines': diff.host_only_lines | default([])
+  } | to_nice_json(indent=2) }}</pre>
+</details>
+  {%- endfor %}
+{%- endfor %}
+{%- endmacro %}
+
+{% macro render_comment(comment) -%}
+  {%- if comment is mapping and comment.differences is defined -%}
+{{ render_config_diff_comment(comment) }}
+  {%- elif comment is mapping or (comment is sequence and comment is not string) -%}
+<pre>{{ comment | to_nice_json(indent=2) }}</pre>
+  {%- else -%}
+{{ comment }}
+  {%- endif -%}
+{%- endmacro %}
+
 <div class="table_component" role="region" tabindex="0">
 
  <!-- Table with the individual tests  -->
  <table>
-      <tr><th> HA validation scenario name</th><th>Test result status</th></tr>
+      <tr><th> HA validation scenario name</th><th>Test result status</th><th>Details</th></tr>
       {% for k, v in verification_result.items() %}
       <tr><td> {{ k }}</td>
-      <td>{{ v }}</td></tr>
+      <td>{{ v }}</td>
+      <td>{% if verification_comments is defined and verification_comments.get(k) is defined %}{{ render_comment(verification_comments.get(k)) }}{% endif %}</td></tr>
       {% endfor %}
     </table>
 </div>

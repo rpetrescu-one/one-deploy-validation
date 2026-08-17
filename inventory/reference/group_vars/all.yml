@@ -143,7 +143,7 @@ validation:
       name: 'public'
       desc: 'A test network for post-deployment cloud verification'
       bridge: 'br0'
-      vn_mad: 'dummy'
+      vn_mad: 'bridge'
       phydev: ''
       network_address: '192.168.150.0'
       network_mask: '255.255.255.0'
@@ -206,6 +206,9 @@ validation:
     one_config_path:
       - /etc/one
       - /var/lib/one/remotes/etc
+    # Regex patterns for files excluded from FE config diff calculation.
+    config_diff_exclude_patterns:
+      - '\.bak$'
     one_zone_name: OpenNebula
 
   # TEST CASE NAME: Federation Validation
@@ -235,30 +238,6 @@ validation:
     # Configuration files
     oned_conf: /etc/one/oned.conf
     fireedge_conf: /etc/one/fireedge-server.conf
-
-  # REPORT SECTION: Target Architecture
-  # DESCRIPTION: Controls optional label overrides for the architecture section in the
-  # HTML report. Networks are discovered live from OpenNebula VNET and VM NIC data.
-  architecture:
-    frontend_role_label: "OpenNebula FE VM"
-    hypervisor_role_label: "KVM"
-    # Optional per-frontend overrides keyed by inventory hostname.
-    # Example:
-    # frontends:
-    #   fe:
-    #     network_ips:
-    #       - "10.125.0.10"
-    #       - "10.126.0.10"
-    frontends: {}
-    # Optional per-hypervisor overrides keyed by inventory hostname.
-    # Example:
-    # hypervisors:
-    #   h1:
-    #     network_ips:
-    #       - "10.125.208.6"
-    #       - "10.126.208.6"
-    #       - "10.127.208.6"
-    hypervisors: {}
 
 # gpu-benchmark role config. This PARTIAL dict is merged recursively over the
 # role defaults by the role itself — you only need to list the keys you

@@ -26,7 +26,7 @@ validation:
       name: 'test-vnet'
       desc: 'A test network for post-deployment cloud verification'
       bridge: 'br-test'
-      vn_mad: 'dummy'
+      vn_mad: 'bridge'
       phydev: 'eth1'
       network_address: '192.168.150.100'
       network_mask: '255.255.255.0'

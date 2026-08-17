@@ -141,7 +141,7 @@ validation:
       name: 'public'
       desc: 'A test network for post-deployment cloud verification'
       bridge: 'br0'
-      vn_mad: 'dummy'
+      vn_mad: 'bridge'
       phydev: ''
       network_address: '192.168.150.0'
       network_mask: '255.255.255.0'
@@ -206,6 +206,9 @@ validation:
     one_config_path:
       - /etc/one
       - /var/lib/one/remotes/etc
+    # Regex patterns for files excluded from FE config diff calculation.
+    config_diff_exclude_patterns:
+      - '\.bak$'
     one_zone_name: OpenNebula
 
   # TEST CASE NAME: Federation Validation
@@ -224,14 +227,3 @@ validation:
     grpc_port: 2634
     oned_conf: /etc/one/oned.conf
     fireedge_conf: /etc/one/fireedge-server.conf
-
-  # REPORT SECTION: Target Architecture
-  # DESCRIPTION: Controls optional label overrides for the architecture section in the
-  # HTML report. Networks are discovered live from OpenNebula VNET and VM NIC data.
-  architecture:
-    frontend_role_label: "OpenNebula FE VM"
-    hypervisor_role_label: "KVM"
-    # Optional per-frontend overrides keyed by inventory hostname.
-    frontends: {}
-    # Optional per-hypervisor overrides keyed by inventory hostname.
-    hypervisors: {}

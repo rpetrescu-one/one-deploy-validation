@@ -160,13 +160,14 @@
   vars:
     _suffix: "{{ (one_clusters_multi | bool) | ternary('-' ~ item.name, '') }}"
     _test_vm_cfg: "{{ validation.test_vm | d({}) }}"
+    _run_test_vm: "{{ validation.run_test_vm | d(true) | bool }}"
     _test_vnet: "{{ _test_vm_cfg.vnet_name | d('VLAN_580') }}"
     _cm_vnet: "{{ (validation.conn_matrix | d({})).vnet_name | d('vnet-default') }}"
     _sb_vnet: "{{ (validation.storage_benchmark | d({})).vnet_name | d('VLAN_580') }}"
     _primary_vnet: >-
       {{ item.vnet_override if item.vnet_override
-         else ((_test_vnet ~ _suffix) if (_test_vm_cfg.create_vnet | d(true))
-         else (_test_vnet if _test_vnet in item.vnet_names_eligible
+         else ((_test_vnet ~ _suffix) if (_run_test_vm and (_test_vm_cfg.create_vnet | d(true)))
+         else (_test_vnet if (_run_test_vm and _test_vnet in item.vnet_names_eligible)
          else (item.vnet_names_eligible | first | d('')))) }}
     _extra:
       name_suffix: "{{ _suffix }}"

@@ -116,7 +116,7 @@
 
 - name: Verify one-gate listen & port on the server
   ansible.builtin.shell: >
-    ss -tlpn | grep $(cat /etc/one/onegate-server.conf | awk '/^:port:/ {print $2}')
+    ss -tlpn | grep $(cat /etc/one/onegate-server.conf | awk '/:port:/ {print $2}')
   register: onegate_service
 
 - name: Save one-gate listen & port on the server

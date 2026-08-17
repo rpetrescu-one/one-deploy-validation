@@ -55,6 +55,14 @@
     retries: 20
     delay: 20
 
+  - name: Set DNS on benchmark VM
+    become: true
+    become_user: oneadmin
+    ansible.builtin.shell: >
+      ssh -q -oStrictHostKeyChecking=no root@{{ vm_ip.stdout }}
+      'printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf'
+    when: not (validation.storage_benchmark.skip_fio_install | d(false))
+
   # Semi air-gapped deployments use an image with fio preinstalled.
   - name: Install fio on benchmark VM
     become: true
@@ -229,6 +237,12 @@
       onevm terminate --hard {{ benchmarkvm_id.stdout.split(':')[1] }}
     register: cleanup_result
     failed_when: "cleanup_result.rc != 0"
+
+  - name: "Record storage benchmark success for cluster '{{ current_cluster.name }}'"
+    ansible.builtin.set_fact:
+      verification_result: >-
+        {{ (verification_result | d({}))
+           | combine({'Storage benchmark' ~ current_cluster.report_suffix: 'ok'}) }}
 
   when: validation.run_storage_benchmark | d(true)
   rescue:

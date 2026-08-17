@@ -1,0 +1,45 @@
+{% if validation_vars.run_conn_matrix | default(false) and conn_results_matrix is defined and conn_results_matrix | length > 0 %}
+{% set all_hosts = conn_results_matrix.keys() | list %}
+<section class="data-section">
+  {% set cm_status = cm_ns.status if cm_ns is defined and cm_ns.status is defined else 'info' %}
+  <div class="section-title">Connectivity Matrix {{ badge(cm_status) }}</div>
+  <p>Instantiates a test VM on each hypervisor hosts registered in the OpenNebula cloud. From each host accesses the VM (temporarily sets up local routing on the configured bridge) and runs a connectivity test to all other VMs running on the other hosts.</p>
+  <p><strong>Virtual Network:</strong> {{ (validation_vars.conn_matrix | default({})).vnet_name | default('UNKNOWN') }}</p>
+  <div class="table-scroll">
+    <table class="gtable">
+      <thead>
+        <tr>
+          <th>From / To</th>
+          {% for dst in all_hosts %}
+          <th>{{ dst }}</th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for src in all_hosts %}
+        <tr>
+          <td><strong>{{ src }}</strong></td>
+          {% for dst in all_hosts %}
+            {% if src == dst %}
+          <td class="matrix-warn">self</td>
+            {% else %}
+              {% set result_element = (conn_results_matrix[src] | dict2items | selectattr('key', 'search', dst + '.json$') | map(attribute='value') | list) %}
+              {% if result_element | length != 1 %}
+          <td class="matrix-warn">missing</td>
+              {% else %}
+                {% set result = result_element | first %}
+                {% if result.packet_loss_percent is defined %}
+          <td class="{{ 'matrix-ok' if result.packet_loss_percent == 0.0 else 'matrix-bad' }}">{{ result.packet_loss_percent }}%</td>
+                {% else %}
+          <td class="matrix-bad">missing</td>
+                {% endif %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}

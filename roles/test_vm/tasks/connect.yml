@@ -1,7 +1,16 @@
 - name: Determine active OpenNebula leader
   ansible.builtin.shell: >
     onezone show 0 -j | jq -r '.ZONE.SERVER_POOL.SERVER[] | select(.STATE == "3").NAME'
-  register: active_leader
+  register: _active_leader_raw
+  run_once: true
+  when: (groups[frontend_group | d('frontend')] | length) > 1
+
+- name: Set active leader fact
+  ansible.builtin.set_fact:
+    active_leader: >-
+      {{ groups[frontend_group | d('frontend')][0]
+         if (groups[frontend_group | d('frontend')] | length) == 1
+         else (_active_leader_raw.stdout | trim) }}
   run_once: true
 
 - name: Check connection to VM
@@ -16,12 +25,12 @@
   - name: Attach NIC to test VM
     ansible.builtin.shell: >
       onevm nic-attach -n '{{ _connect_vnet_name }}' {{ vm_id.stdout.split(':')[1] | trim }}
-    when: inventory_hostname == active_leader.stdout | trim
+    when: inventory_hostname == active_leader
 
   - name: Wait until NIC is attached
     ansible.builtin.shell: >
       onevm show -j {{vm_id.stdout.split(':')[1]}} | jq -r .VM.LCM_STATE
-    when: inventory_hostname == active_leader.stdout | trim
+    when: inventory_hostname == active_leader
     register: vm_state_result
     until: vm_state_result.stdout | trim == "3"
     retries: 10
