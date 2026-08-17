@@ -1,0 +1,164 @@
+---
+- name: Detect NVIDIA GPUs bound to vfio-pci
+  ansible.builtin.shell: |
+    set -o pipefail
+    OUT=""
+    for D in /sys/bus/pci/devices/*; do
+      VEN="$(cat "$D/vendor" 2>/dev/null)" || continue
+      CLS="$(cat "$D/class" 2>/dev/null)" || continue
+      case "$CLS" in 0x0300*|0x0302*) ;; *) continue ;; esac
+      [ "$VEN" = "0x10de" ] || continue
+      DRV="$(basename "$(readlink -f "$D/driver" 2>/dev/null)" 2>/dev/null)" || DRV=""
+      # nouveau counts too: a previous run that lost the driverless-window
+      # race leaves the GPU on nouveau — release it the same way.
+      if [ "$DRV" = "vfio-pci" ] || [ "$DRV" = "nouveau" ]; then
+        OUT="$OUT $(basename "$D")"
+      fi
+    done
+    echo "${OUT# }"
+  args:
+    executable: /bin/bash
+  register: _bm_vfio_out
+  changed_when: false
+
+- name: Record the vfio-bound GPU addresses
+  ansible.builtin.set_fact:
+    _bm_vfio_addrs: "{{ (_bm_vfio_out.stdout | trim).split() | select('ne', '') | list }}"
+    _bm_vfio_overrides: []
+    _bm_vfio_plain: []
+
+- name: Refuse to start while gpu-bench VMs from an earlier run exist
+  become: true
+  become_user: oneadmin
+  ansible.builtin.shell: |
+    set -o pipefail
+    onevm list -j 2>/dev/null | jq -r '
+      [.VM_POOL.VM? // [] | if type=="array" then . else [.] end | .[]
+       | select(.NAME | test("^(gpu-bench-|vr-gpu-bench)"))]
+      | map(.ID + ":" + .NAME) | join(" ")' 2>/dev/null || true
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ groups[frontend_group | d('frontend')] | first }}"
+  register: _bm_leftover_vms
+  changed_when: false
+  failed_when: false
+  when: _bm_vfio_addrs | length > 0
+
+- name: Abort on leftover gpu-bench VMs
+  ansible.builtin.fail:
+    msg: >-
+      Benchmark VMs from an earlier run are still alive:
+      {{ _bm_leftover_vms.stdout | trim }} — an interrupted run (network
+      flop, Ctrl-C) never reached its cleanup. Terminate them first
+      (onevm terminate --hard <ID>) and re-run; releasing a GPU under a
+      running guest wedges the kernel until that VM dies.
+  when:
+    - _bm_vfio_addrs | length > 0
+    - (_bm_leftover_vms.stdout | default('') | trim | length) > 0
+
+- name: Refuse to release a GPU a running VM holds
+  ansible.builtin.shell: |
+    BUSY=""
+    for A in {{ _bm_vfio_addrs | join(' ') }}; do
+      G="$(basename "$(readlink -f "/sys/bus/pci/devices/$A/iommu_group" 2>/dev/null)" 2>/dev/null)" || G=""
+      [ -n "$G" ] || continue
+      [ -e "/dev/vfio/$G" ] || continue
+      HOLDER=""
+      for FD in /proc/[0-9]*/fd/*; do
+        if [ "$(readlink "$FD" 2>/dev/null)" = "/dev/vfio/$G" ]; then
+          HOLDER="$(echo "$FD" | cut -d/ -f3)"
+          break
+        fi
+      done
+      if [ -z "$HOLDER" ] && command -v fuser >/dev/null 2>&1 && fuser -s "/dev/vfio/$G" 2>/dev/null; then
+        HOLDER="fuser"
+      fi
+      if [ -n "$HOLDER" ]; then
+        NAME="$(tr "\0" " " < "/proc/$HOLDER/cmdline" 2>/dev/null | grep -oE "guest=[^, ]+" | head -1 || true)"
+        BUSY="$BUSY $A(pid $HOLDER ${NAME:-holder})"
+      fi
+    done
+    echo "${BUSY# }"
+  args:
+    executable: /bin/bash
+  register: _bm_vfio_busy
+  changed_when: false
+  when: _bm_vfio_addrs | length > 0
+
+- name: Abort when passthrough GPUs are in use
+  ansible.builtin.fail:
+    msg: >-
+      GPU(s) {{ _bm_vfio_busy.stdout | trim }} are attached to running VMs —
+      the live bare-metal re-measure cannot release them (releasing a GPU
+      under a running guest wedges the kernel in vfio_unregister_group
+      until that VM dies). Terminate the VMs named above (onevm list on the
+      frontend; guest=one-<ID>) and re-run.
+  when:
+    - _bm_vfio_addrs | length > 0
+    - (_bm_vfio_busy.stdout | default('') | trim | length) > 0
+
+- name: Release the GPUs from vfio-pci
+  ansible.builtin.shell: |
+    systemctl stop nvidia-persistenced 2>/dev/null || true
+    modprobe -r nouveau 2>/dev/null || true
+    for A in {{ _bm_vfio_addrs | join(' ') }}; do
+      HAD_OVERRIDE=0
+      if command -v driverctl >/dev/null 2>&1 \
+         && driverctl -v list-overrides 2>/dev/null | grep -qF "$A"; then
+        HAD_OVERRIDE=1
+        driverctl --noprobe unset-override "$A" >/dev/null 2>&1 &
+        DPID=$!
+        for i in $(seq 1 90); do
+          kill -0 "$DPID" 2>/dev/null || break
+          sleep 1
+        done
+        if kill -0 "$DPID" 2>/dev/null; then
+          echo "RELEASE_WEDGED $A (driverctl pid $DPID stuck — a guest still holds the vfio group)"
+          continue
+        fi
+      fi
+      DRV="$(basename "$(readlink -f "/sys/bus/pci/devices/$A/driver" 2>/dev/null)" 2>/dev/null)" || DRV=""
+      if [ "$DRV" = "vfio-pci" ] || [ "$DRV" = "nouveau" ]; then
+        echo "$A" > "/sys/bus/pci/devices/$A/driver/unbind" 2>/dev/null || true
+      fi
+      echo "nvidia" > "/sys/bus/pci/devices/$A/driver_override" 2>/dev/null || true
+      if [ -w "/sys/bus/pci/devices/$A/reset" ]; then
+        echo 1 > "/sys/bus/pci/devices/$A/reset" 2>/dev/null || true
+        sleep 1
+      fi
+      DRV="$(basename "$(readlink -f "/sys/bus/pci/devices/$A/driver" 2>/dev/null)" 2>/dev/null)" || DRV=""
+      if [ "$DRV" = "vfio-pci" ] || [ "$DRV" = "nouveau" ]; then
+        echo "RELEASE_FAILED $A"
+      elif [ "$HAD_OVERRIDE" = "1" ]; then
+        echo "OVERRIDE_REMOVED $A"
+      else
+        echo "UNBOUND $A"
+      fi
+    done
+  args:
+    executable: /bin/bash
+  register: _bm_vfio_release
+  changed_when: true
+  when: _bm_vfio_addrs | length > 0
+
+- name: Record how each GPU was released (restore mirrors it)
+  ansible.builtin.set_fact:
+    _bm_vfio_overrides: >-
+      {{ _bm_vfio_release.stdout_lines | default([]) | select('match', '^OVERRIDE_REMOVED ')
+         | map('regex_replace', '^OVERRIDE_REMOVED ', '') | list }}
+    _bm_vfio_plain: >-
+      {{ _bm_vfio_release.stdout_lines | default([]) | select('match', '^UNBOUND ')
+         | map('regex_replace', '^UNBOUND ', '') | list }}
+  when: _bm_vfio_addrs | length > 0
+
+- name: Abort when a GPU could not be released
+  ansible.builtin.fail:
+    msg: >-
+      Failed to release from vfio-pci:
+      {{ _bm_vfio_release.stdout_lines | default([]) | select('match', '^RELEASE_(FAILED|WEDGED) ') | join(', ') }}
+      — the GPUs already released will be rebound by cleanup. A WEDGED
+      entry means a running guest holds that GPU: terminate the VM
+      (the stuck driverctl completes by itself once the group is freed).
+  when:
+    - _bm_vfio_addrs | length > 0
+    - _bm_vfio_release.stdout_lines | default([]) | select('match', '^RELEASE_(FAILED|WEDGED) ') | list | length > 0

@@ -77,6 +77,10 @@
     _floored: >-
       {{ (item.key == 'throughput_req_s_mean')
          and ((_best | float) < (gpu_benchmark.compare_min_throughput_req_s | default(1.0) | float)) }}
+    _ttft_floored: >-
+      {{ (item.key == 'ttft_p95_ms')
+         and ((((_worst | float) - (_best | float)) | abs)
+              <= (gpu_benchmark.compare_min_ttft_delta_ms | default(25) | float)) }}
     # Sustained throughput derives from the sweep peak — a LOW value on a
     # truncated GPU is a measurement artifact, so DIRECTIONAL suppression:
     # only the truncated GPUs are removed from the flag list. A truncated
@@ -89,16 +93,18 @@
          if item.better == 'higher'
          else (_gpu_num | selectattr(item.key, 'gt', _bound | float) | map(attribute='gpu') | list) }}
     _flagged: >-
-      {{ [] if ((not (_cmp_sufficient | bool)) or (_floored | bool))
+      {{ [] if ((not (_cmp_sufficient | bool)) or (_floored | bool) or (_ttft_floored | bool))
          else ((_raw_flagged | difference(_cmp_truncated_gpus))
                if (item.key == 'throughput_req_s_mean') else _raw_flagged) }}
     _note: >-
       {{ ('insufficient sample (' ~ _cmp_min_samples ~ ' successful requests)') if (not (_cmp_sufficient | bool))
+         else (('TTFT delta below the noise floor (<= ' ~ (gpu_benchmark.compare_min_ttft_delta_ms | default(25)) ~ ' ms) — spread not flagged')
+               if ((_ttft_floored | bool) and (_raw_flagged | length > 0))
          else ('below measurement floor (< ' ~ (gpu_benchmark.compare_min_throughput_req_s | default(1.0)) ~ ' req/s)' if (_floored | bool)
                else (('sweep truncated/unsaturated on GPU ' ~ (_cmp_truncated_gpus | join(', GPU '))
                       ~ ' — its throughput is a lower bound; gaps against it are not flagged')
                      if ((item.key == 'throughput_req_s_mean') and (_cmp_truncated_gpus | length > 0))
-                     else '')) }}
+                     else ''))) }}
 
 - name: Assemble GPU delta
   ansible.builtin.set_fact:

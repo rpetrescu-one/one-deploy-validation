@@ -9,13 +9,16 @@
 - hosts: "{{ node_group | d('node') }}"
   vars:
     _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
+    _gb_bm_live: >-
+      {{ (not (_gb_pre | bool))
+         and ('baremetal' in ((gpu_benchmark | d({})).llm_backends | d([]))) }}
   tasks:
-    - name: Run bare-metal GPU baseline (pre-deploy phase)
+    - name: Run bare-metal GPU baseline (pre-deploy phase or live re-measure)
       ansible.builtin.include_role:
         name: gpu-benchmark
         tasks_from: baremetal/main.yml
       when:
-        - _gb_pre | bool
+        - (_gb_pre | bool) or (_gb_bm_live | bool)
         - validation.run_gpu_benchmark | d(false)
       tags:
         - gpu_benchmark
@@ -217,6 +220,24 @@
         label: "{{ item }}"
       when:
         - _gb_pre | bool
+        - hostvars[item].verification_result is defined
+
+    - name: Fold live bare-metal re-measure results into the report
+      ansible.builtin.set_fact:
+        report_verification_result: >-
+          {{ (report_verification_result | default({}))
+             | combine(hostvars[item].verification_result | default({}) | dict2items
+                       | selectattr('key', 'search', 'GPU baseline') | items2dict) }}
+        report_verification_comments: >-
+          {{ (report_verification_comments | default({}))
+             | combine(hostvars[item].verification_comments | default({}) | dict2items
+                       | selectattr('key', 'search', 'GPU baseline') | items2dict) }}
+      loop: "{{ groups[node_group | d('node')] }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - not (_gb_pre | bool)
+        - "'baremetal' in ((gpu_benchmark | d({})).llm_backends | d([]))"
         - hostvars[item].verification_result is defined
 
     - name: Collect federation results from all frontend hosts

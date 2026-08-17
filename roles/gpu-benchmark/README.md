@@ -1,8 +1,12 @@
 gpu-benchmark
 =============
 
-GPU / LLM inference benchmark for AI Factory validation. Per GPU-bearing host
-it runs:
+GPU / LLM inference benchmark for AI Factory validation. It measures the same
+hardware in up to three environments — **bare-metal host**, the **vLLM
+appliance VM** (GPU passthrough) and a **Kubernetes cluster** deployed per the
+OpenNebula AI-ready K8s guide — with one shared load profile, and reports the
+virtualization overhead of each against the physical numbers, with noise
+guards so that only real regressions flag. Per GPU-bearing host it runs:
 
 - a **GPU health phase**: nvidia-smi inventory (VRAM, PCIe width, ECC,
   throttling, compute capability, VBIOS, power limit, clocks, temperature), a
@@ -36,10 +40,28 @@ validation:
 
 gpu_benchmark:            # partial dict, merged recursively over role defaults
   vnet_name: nat          # VM network; needs egress for model/toolkit download
+  llm_backends: ['baremetal', 'appliance', 'k8s']   # any subset; default ['appliance']
 ```
 
-See `defaults/main.yml` for every knob and
-`inventory/reference/group_vars/all.yml` for a documented example.
+`inventory/reference/group_vars/all.yml` is the **complete, commented knob
+reference** (every key the role reads, at its default value); the rationale
+behind each default lives next to it in `defaults/main.yml`. Secrets such as
+`hf_token` must come from the environment
+(`"{{ lookup('env', 'HF_TOKEN') }}"`), never from a committed file.
+
+Configuration reference (grouped)
+---------------------------------
+
+| Group | Keys | Notes |
+|---|---|---|
+| What runs | `phase`, `llm_backends`, `appliance_market_name`, `vnet_name`, `models`, `hf_token`, `gpu_count` | `llm_backends` accepts `baremetal`, `appliance`, `k8s` in any combination |
+| Bare-metal | `baremetal.{hosts, workdir, vllm_version, allow_driver_install, baseline_tolerance_pct, baseline_file, allow_on_deployed, numa_pin}` | phase=pre AND the live `baremetal` backend; pin `vllm_version` to the appliance |
+| VM sizing | `vm.{vcpu, memory_mb, disk_mb, pin_policy}`, `vm_per_gpu`, `vm_apt_https`, `serve_timeout_s`, `vllm_context.{api_port, gpu_mem_util, model_max_length}` | 32 vCPU / 64 GiB + `vm_per_gpu: true` validated on L40S |
+| Kubernetes | `k8s.{capi_app_name, release_name, capone_chart_version, gpu_operator_version, router_image_url, node_image_url, worker_disk_mb, one_xmlrpc_ip, deploy_timeout_s, bootstrap_timeout_s, unwedge_apiserver_cache, keep_stack_on_failure, hw_probe, cuda_devel_image, hw_probe_timeout_s}` | versions/URLs pinned to the guide; `node_image_url` kernel must still have headers in the archive |
+| Load profile | `guidellm_profile`, `guidellm_status`, `guidellm_max_duration_s`, `llm_retry_unsaturated` | shared by every backend — changing it re-defines the measurement (re-record the baseline) |
+| SLO gates | `thresholds.{profile, ttft_p95_ms, itl_p95_ms, min_throughput_req_s}`, `reference` | `reference` = per-GPU-name x model overrides |
+| Comparisons | `llm_variance_pct`, `compare_min_samples`, `compare_min_throughput_req_s`, `compare_min_ttft_delta_ms`, `fail_on_flag` | the noise guards (see "How results are judged") |
+| Hardware diag | `cublas.{enabled, n, iters, variance_pct, allow_toolkit_install}`, `dcgm.{enabled, level, timeout_s, allow_install, run_in_vm}`, `pcie_bw.{enabled, size_mb, iters, min_gbs}`, `pcie_expected_width`, `functional.enabled`, `power_sampling.{enabled, interval_s}` | all on by default |
 
 Bare-metal baseline (pre-deploy phase)
 --------------------------------------
@@ -104,6 +126,29 @@ relative to its socket. Two knobs make both phases NUMA-deterministic:
   node is reported. Cost: one appliance boot + model download per GPU.
   Default (`vm_per_gpu: false`) keeps the original all-GPUs-in-one-VM flow —
   note that flow cannot be NUMA-local to GPUs on different sockets.
+
+Live bare-metal re-measure in the post run
+------------------------------------------
+
+Adding `'baremetal'` to `gpu_benchmark.llm_backends` makes the post run
+refresh the physical numbers FIRST, on the deployed node, before the
+appliance/k8s backends run: the node's GPUs are temporarily released from
+`vfio-pci` (the persistent driverctl override is lifted), the NVIDIA
+driver is installed, the exact pre-phase benchmark runs on the host
+(hardware + LLM, NUMA-pinned, with the unsaturated-sweep retry), the
+fresh numbers replace `gpu_baseline.json`, and cleanup restores the vfio
+binding — override persistence included — before any VM is created. The
+comparison then uses SAME-DAY, SAME-DRIVER physical data, eliminating the
+"driver differs between runs" caveat.
+
+Safety: a GPU attached to a running VM aborts the release with the
+address named (terminate those VMs first); `nvidia-persistenced` is
+stopped around every vfio (re)bind (a running persistenced wedges the
+bind forever — hit live during a one-deploy install); an incomplete
+restore is surfaced loudly in the report, since a node without vfio on
+its GPUs cannot serve passthrough VMs. Cost: ~35-45 min per run (driver
+install + model download on the host). The two-phase flow (pre before
+deploy, post after) remains the default and needs none of this.
 
 Kubernetes backend (bare-metal vs vLLM appliance vs K8s)
 --------------------------------------------------------
@@ -195,6 +240,12 @@ byte-identical in both modes. The role defends in two layers:
   affected GPU and keeps the better curve. Capacity is a max-capability
   metric, so best-of-two removes the downward bias and cannot inflate
   the result; a failed retry never discards the first attempt.
+
+Noise guards on every comparison: low sample counts, sub-floor throughput,
+truncated/unsaturated sweeps (lower bounds), and sync-TTFT deltas below
+`compare_min_ttft_delta_ms` (default 25 ms — the p95 of ~a dozen requests
+jitters 10-20 ms on identical hardware; a relative spread/breach only flags
+when the absolute delta is material too).
 
 How results are judged
 ----------------------
@@ -338,7 +389,9 @@ On the frontend, per run:
   truth for calibration values);
 - `/tmp/gpu_benchmark/<cluster>_<model>_h<host>_g<gpu>_guidellm.json` — raw
   GuideLLM reports (one per GPU);
-- `*_failure.log` — auto-collected diagnostics when a benchmark fails.
+- `*_failure.log` — auto-collected diagnostics when a benchmark fails;
+- `k8s_failure<cluster>.log` — the redacted stdout/stderr tail of a failed
+  K8s stack step (survives teardown), referenced from the report.
 
 Testing
 -------

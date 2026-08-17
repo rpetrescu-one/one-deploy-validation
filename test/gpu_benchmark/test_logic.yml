@@ -1331,6 +1331,74 @@
           - _baseline_delta.status == 'ok'
         fail_msg: "compare_baseline truncated-virt case produced {{ _baseline_delta }}"
 
+    - name: compare_baseline — sub-floor TTFT breach is not flagged
+      vars:
+        gpu_benchmark:
+          compare_min_samples: 30
+          compare_min_throughput_req_s: 1.0
+          compare_min_ttft_delta_ms: 25
+          baremetal: {baseline_tolerance_pct: 10}
+        _baseline:
+          hosts:
+            n1:
+              gpus: []
+              llm:
+                "m1":
+                  per_gpu:
+                    - gpu: 0
+                      metrics: {output_tok_s_saturated: "3905.7", throughput_req_s_mean: "15.26", ttft_p95_ms: "37.42", requests_successful: "500"}
+        _post_llm:
+          "m1":
+            model: "m1"
+            per_gpu:
+              - gpu: 0
+                metrics: {output_tok_s_saturated: "3883.5", throughput_req_s_mean: "15.17", ttft_p95_ms: "41.5", requests_successful: "500"}
+        _post_health_hosts: []
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_baseline.yml
+    - name: assert the sub-floor baseline TTFT breach is ok with a note
+      ansible.builtin.assert:
+        that:
+          # 10.9% relative breach, +4.1 ms absolute -> noise floor
+          - (_baseline_delta.rows | selectattr('metric', 'search', 'TTFT') | first).ok
+          - "'noise floor' in (_baseline_delta.rows | selectattr('metric', 'search', 'TTFT') | first).note"
+          - _baseline_delta.status == 'ok'
+        fail_msg: "compare_baseline ttft-floor case produced {{ _baseline_delta }}"
+
+    - name: compare_baseline — material TTFT breach still flags
+      vars:
+        gpu_benchmark:
+          compare_min_samples: 30
+          compare_min_throughput_req_s: 1.0
+          compare_min_ttft_delta_ms: 25
+          baremetal: {baseline_tolerance_pct: 10}
+        _baseline:
+          hosts:
+            n1:
+              gpus: []
+              llm:
+                "m1":
+                  per_gpu:
+                    - gpu: 0
+                      metrics: {output_tok_s_saturated: "3905.7", throughput_req_s_mean: "15.26", ttft_p95_ms: "37.42", requests_successful: "500"}
+        _post_llm:
+          "m1":
+            model: "m1"
+            per_gpu:
+              - gpu: 0
+                metrics: {output_tok_s_saturated: "3883.5", throughput_req_s_mean: "15.17", ttft_p95_ms: "70.0", requests_successful: "500"}
+        _post_health_hosts: []
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_baseline.yml
+    - name: assert the material baseline TTFT breach flags
+      ansible.builtin.assert:
+        that:
+          - not (_baseline_delta.rows | selectattr('metric', 'search', 'TTFT') | first).ok
+          - _baseline_delta.status == 'flag'
+        fail_msg: "compare_baseline ttft-material case produced {{ _baseline_delta }}"
+
     # UNSATURATED, baseline edition — the run-23 live case: every post-side
     # probe landed in the slow client mode (~12.8 req/s vs the 15.31
     # baseline), a ~16% apparent overhead that is a measurement artifact.
@@ -1920,6 +1988,40 @@
           - "'sweep truncated/unsaturated on GPU 1' in (_gpu_delta.metrics | selectattr('metric', 'eq', 'throughput_req_s_mean') | first).note"
         fail_msg: "compare_gpus unsaturated case produced {{ _gpu_delta }}"
 
+    - name: compare_gpus — TTFT spread below the noise floor is not flagged
+      vars:
+        gpu_benchmark: {llm_variance_pct: 20, compare_min_ttft_delta_ms: 25}
+        _model_gpu_results:
+          - {gpu: 0, metrics: {throughput_req_s_mean: "14.65", req_latency_p95_s: "2.52", ttft_p95_ms: "55.574", itl_p95_ms: "9.68", tpot_p95_ms: "9.86", requests_successful: "513"}}
+          - {gpu: 1, metrics: {throughput_req_s_mean: "15.22", req_latency_p95_s: "2.51", ttft_p95_ms: "38.75", itl_p95_ms: "9.69", tpot_p95_ms: "9.8", requests_successful: "513"}}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_gpus.yml
+    - name: assert the sub-floor TTFT spread is suppressed with a note
+      ansible.builtin.assert:
+        that:
+          - (_gpu_delta.metrics | selectattr('metric', 'eq', 'ttft_p95_ms') | first).flagged_gpus | length == 0
+          - (_gpu_delta.metrics | selectattr('metric', 'eq', 'ttft_p95_ms') | first).ok
+          - "'noise floor' in (_gpu_delta.metrics | selectattr('metric', 'eq', 'ttft_p95_ms') | first).note"
+          - _gpu_delta.status == 'ok'
+        fail_msg: "compare_gpus ttft-floor case produced {{ _gpu_delta }}"
+
+    - name: compare_gpus — TTFT spread above the noise floor still flags
+      vars:
+        gpu_benchmark: {llm_variance_pct: 20, compare_min_ttft_delta_ms: 25}
+        _model_gpu_results:
+          - {gpu: 0, metrics: {throughput_req_s_mean: "14.65", req_latency_p95_s: "2.52", ttft_p95_ms: "80.0", itl_p95_ms: "9.68", tpot_p95_ms: "9.86", requests_successful: "513"}}
+          - {gpu: 1, metrics: {throughput_req_s_mean: "15.22", req_latency_p95_s: "2.51", ttft_p95_ms: "38.75", itl_p95_ms: "9.69", tpot_p95_ms: "9.8", requests_successful: "513"}}
+      ansible.builtin.include_role:
+        name: gpu-benchmark
+        tasks_from: lib/compare_gpus.yml
+    - name: assert the material TTFT regression still flags
+      ansible.builtin.assert:
+        that:
+          - (_gpu_delta.metrics | selectattr('metric', 'eq', 'ttft_p95_ms') | first).flagged_gpus == [0]
+          - not (_gpu_delta.metrics | selectattr('metric', 'eq', 'ttft_p95_ms') | first).ok
+        fail_msg: "compare_gpus ttft-material case produced {{ _gpu_delta }}"
+
     # DIRECTIONAL: a truncated BEST only understates the spread — an
     # untruncated sibling below the variance bound has a GENUINE deficit
     # and must still flag (throughput-only degradation would otherwise be
@@ -2126,7 +2228,7 @@
             versions: "Name: guidellm Version: 0.7.1 Name: vllm Version: 0.11.0"
             per_gpu:
               # tok/s 20% down, sustained 25% down, ttft 50% up — all breach 10%
-              - {gpu: 0, metrics: {output_tok_s_saturated: "1280.0", throughput_req_s_mean: "4.7", ttft_p95_ms: "52.5", requests_successful: "180"}}
+              - {gpu: 0, metrics: {output_tok_s_saturated: "1280.0", throughput_req_s_mean: "4.7", ttft_p95_ms: "70.0", requests_successful: "180"}}
         _post_health_hosts:
           - driver_version: "570.195.03"
             nvidia_smi: [{index: "0", name: "NVIDIA L40S"}]

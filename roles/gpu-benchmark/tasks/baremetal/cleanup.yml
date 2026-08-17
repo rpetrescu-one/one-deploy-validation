@@ -54,6 +54,11 @@
   failed_when: false
   when: "'cuda-drivers' in (_bm_installed_pkgs | default([]))"
 
+- name: Restore vfio-pci passthrough binding (live re-measure)
+  ansible.builtin.include_tasks: baremetal/vfio_restore.yml
+  when: >-
+    ((_bm_vfio_overrides | default([]) | length) + (_bm_vfio_plain | default([]) | length)) > 0
+
 # Sentinel-guarded: only delete a directory this role created/adopted (the
 # preflight guard refuses foreign non-empty dirs, but never delete blindly).
 - name: Remove the working directory (venv, model cache, logs, results)

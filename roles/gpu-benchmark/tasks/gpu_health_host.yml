@@ -344,7 +344,9 @@
              | map('regex_replace', '^(.*)$', 'GPU \1 PCIe bandwidth below ' ~ (gpu_benchmark.pcie_bw.min_gbs) ~ ' GB/s')
              | list }}
         _dcgm_issues: >-
-          {{ ['DCGM diag failed: ' ~ ((_dcgm.failed | default([])) | join(', '))]
+          {{ ['DCGM diag failed: ' ~ ((_dcgm.failed | default([])) | join(', '))
+              ~ ((' — ' ~ ((_dcgm.messages | default([]) | first) | truncate(160, true)))
+                 if ((_dcgm.messages | default([]) | length) > 0) else '')]
              if (((_dcgm | default({})).status | default('pass')) == 'fail') else [] }}
 
   rescue:

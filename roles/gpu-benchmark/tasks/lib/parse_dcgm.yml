@@ -4,6 +4,7 @@
     _dcgm_failed: []
     _dcgm_warned: []
     _dcgm_skipped: []
+    _dcgm_msgs: []
     _dcgm_detail: "{{ _root.runtime_error | default('') }}"
     _dcgm_tests: >-
       {{ _root.test_categories | default([])
@@ -22,6 +23,12 @@
     _dcgm_skipped: >-
       {{ _dcgm_skipped + ([item.name | default('?')]
          if ((_st | length == 0) or (_st | reject('eq', 'Skip') | list | length == 0)) else []) }}
+    _dcgm_msgs: >-
+      {{ (_dcgm_msgs + (item.results | default([]) | selectattr('status', 'defined')
+                        | selectattr('status', 'eq', 'Fail')
+                        | map(attribute='warnings') | select('defined') | flatten
+                        | map(attribute='warning') | select('defined')
+                        | map('string') | list)) | unique | list }}
   loop: "{{ _dcgm_tests }}"
   loop_control:
     label: "{{ item.name | default('?') }}"
@@ -39,6 +46,7 @@
       tests_skipped: "{{ _dcgm_skipped | length }}"
       failed: "{{ _dcgm_failed }}"
       warned: "{{ _dcgm_warned }}"
+      messages: "{{ _dcgm_msgs | list }}"
       detail: >-
         {{ _dcgm_detail if (_dcgm_detail | length > 0)
            else ('all tests skipped by the tool' if ((_dcgm_tests | length) > 0

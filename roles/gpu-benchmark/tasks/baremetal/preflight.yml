@@ -47,6 +47,11 @@
   when:
     - (_bm_one_pkgs.stdout | trim | default('0')) | int > 0
     - not (gpu_benchmark.baremetal.allow_on_deployed | default(false) | bool)
+    - "'baremetal' not in (gpu_benchmark.llm_backends | default([]))"
+
+- name: Release passthrough GPUs for the live re-measure
+  ansible.builtin.include_tasks: baremetal/vfio_release.yml
+  when: "'baremetal' in (gpu_benchmark.llm_backends | default([]))"
 
 - name: Inventory NVIDIA GPUs on the PCI bus
   ansible.builtin.shell: |
@@ -73,7 +78,18 @@
 # (otherwise it could purge pre-existing packages unrelated to this run).
 - name: Probe pre-existing software (manifest)
   ansible.builtin.shell: |
-    printf 'driver=%s\n'  "$(command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1 && echo yes || echo no)"
+    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+      printf 'driver=yes\n'
+    elif modinfo nvidia >/dev/null 2>&1; then
+      modprobe nvidia 2>/dev/null || true
+      if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+        printf 'driver=yes\n'
+      else
+        printf 'driver=installed_unloaded\n'
+      fi
+    else
+      printf 'driver=no\n'
+    fi
     printf 'nvcc=%s\n'    "$(command -v nvcc >/dev/null 2>&1 && echo yes || echo no)"
     printf 'dcgmi=%s\n'   "$(command -v dcgmi >/dev/null 2>&1 && echo yes || echo no)"
     printf 'venv=%s\n'    "$(python3 -c 'import ensurepip' >/dev/null 2>&1 && echo yes || echo no)"
@@ -89,7 +105,11 @@
 
 - name: Parse manifest
   ansible.builtin.set_fact:
-    _bm_had_driver: "{{ 'driver=yes' in _bm_probe.stdout }}"
+    # installed_unloaded counts as PRE-EXISTING: never install over it (the
+    # verify step later reports honestly if it cannot claim the GPUs).
+    _bm_had_driver: >-
+      {{ ('driver=yes' in _bm_probe.stdout)
+         or ('driver=installed_unloaded' in _bm_probe.stdout) }}
     _bm_had_nvcc: "{{ 'nvcc=yes' in _bm_probe.stdout }}"
     _bm_had_dcgmi: "{{ 'dcgmi=yes' in _bm_probe.stdout }}"
     _bm_had_venv: "{{ 'venv=yes' in _bm_probe.stdout }}"
@@ -196,6 +216,56 @@
   register: _bm_smi_check
   changed_when: false
 
+- name: Evict nouveau and retry the claim (lost driverless-window race)
+  ansible.builtin.shell: |
+    FIXED=""
+    # Also re-init GPUs the driver holds but could not initialize
+    # (RmInitAdapter failed — dirty state after passthrough): unbind, FLR,
+    # rebind. Detected by comparing nvidia-bound devices with what
+    # nvidia-smi enumerates.
+    SEEN="$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null | tr "A-F" "a-f" | sed "s/^0000/0000/" | tr "\n" " ")" || SEEN=""
+    for D in /sys/bus/pci/devices/*; do
+      VEN="$(cat "$D/vendor" 2>/dev/null)" || continue
+      CLS="$(cat "$D/class" 2>/dev/null)" || continue
+      case "$CLS" in 0x0300*|0x0302*) ;; *) continue ;; esac
+      [ "$VEN" = "0x10de" ] || continue
+      DRV="$(basename "$(readlink -f "$D/driver" 2>/dev/null)" 2>/dev/null)" || DRV=""
+      A="$(basename "$D")"
+      if [ "$DRV" = "nouveau" ]; then
+        echo "$A" > "$D/driver/unbind" 2>/dev/null || true
+        echo "nvidia" > "$D/driver_override" 2>/dev/null || true
+        FIXED="$FIXED $A"
+      elif [ "$DRV" = "nvidia" ] && ! echo "$SEEN" | grep -qiF "$A"; then
+        echo "$A" > "$D/driver/unbind" 2>/dev/null || true
+        if [ -w "$D/reset" ]; then echo 1 > "$D/reset" 2>/dev/null || true; fi
+        sleep 1
+        echo "nvidia" > "$D/driver_override" 2>/dev/null || true
+        FIXED="$FIXED $A"
+      fi
+    done
+    modprobe -r nouveau 2>/dev/null || true
+    if [ -n "$FIXED" ]; then
+      echo "evicted nouveau from:$FIXED"
+      modprobe nvidia 2>/dev/null || true
+      for A in $FIXED; do
+        echo "$A" > /sys/bus/pci/drivers_probe 2>/dev/null || true
+      done
+      sleep 2
+    fi
+    nvidia-smi -L 2>&1 | grep -c '^GPU' || true
+  args:
+    executable: /bin/bash
+  register: _bm_smi_retry
+  changed_when: true
+  failed_when: false
+  when: (_bm_smi_check.stdout | trim | default('0')) | int < (_bm_gpu_count | int)
+
+- name: Record the final GPU-claim count
+  ansible.builtin.set_fact:
+    _bm_smi_claims: >-
+      {{ ((_bm_smi_retry.stdout_lines | default([]) | last | default('0'))
+          if not (_bm_smi_retry is skipped) else (_bm_smi_check.stdout | trim | default('0'))) }}
+
 - name: Fail when the driver cannot see the GPUs (with diagnostics)
   ansible.builtin.shell: |
     echo "=== nvidia-smi ==="; nvidia-smi -L 2>&1 | head -5
@@ -204,12 +274,13 @@
   register: _bm_drv_diag
   changed_when: false
   failed_when: false
-  when: (_bm_smi_check.stdout | trim | default('0')) | int == 0
+  when: (_bm_smi_claims | default('0') | trim) | int < (_bm_gpu_count | int)
 
 - name: Abort on unusable driver
   ansible.builtin.fail:
     msg: >-
-      NVIDIA driver present but no GPU is visible on {{ inventory_hostname }}.
+      NVIDIA driver present but only {{ _bm_smi_claims | default('0') | trim }} of
+      {{ _bm_gpu_count }} GPU(s) visible on {{ inventory_hostname }}.
       {{ 'The GPUs could NOT be unbound from nouveau — blacklist it and
       reboot, then re-run: echo "blacklist nouveau" >
       /etc/modprobe.d/blacklist-nouveau.conf && update-initramfs -u && reboot.'
@@ -217,4 +288,4 @@
          else 'The kernel module could not claim the devices — a reboot may be
       required.' }}
       Diagnostics: {{ (_bm_drv_diag.stdout | default('')) | truncate(400, true) }}
-  when: (_bm_smi_check.stdout | trim | default('0')) | int == 0
+  when: (_bm_smi_claims | default('0') | trim) | int < (_bm_gpu_count | int)

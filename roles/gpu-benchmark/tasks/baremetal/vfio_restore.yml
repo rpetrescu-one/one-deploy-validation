@@ -1,0 +1,55 @@
+---
+- name: Rebind released GPUs to vfio-pci (restore passthrough)
+  ansible.builtin.shell: |
+    systemctl stop nvidia-persistenced 2>/dev/null || true
+    modprobe vfio-pci 2>/dev/null || true
+    for A in {{ _bm_vfio_overrides | default([]) | join(' ') }}; do
+      # Background + poll (a D-state driverctl ignores `timeout` and would
+      # hang the always block; the readlink verdict below is the truth).
+      driverctl set-override "$A" vfio-pci >/dev/null 2>&1 &
+      DPID=$!
+      for i in $(seq 1 120); do
+        kill -0 "$DPID" 2>/dev/null || break
+        sleep 1
+      done
+      if kill -0 "$DPID" 2>/dev/null; then echo "REBIND_STUCK $A (driverctl pid $DPID)"; fi
+    done
+    for A in {{ _bm_vfio_plain | default([]) | join(' ') }}; do
+      if [ -e "/sys/bus/pci/devices/$A/driver" ]; then
+        echo "$A" > "/sys/bus/pci/devices/$A/driver/unbind" 2>/dev/null || true
+      fi
+      echo "vfio-pci" > "/sys/bus/pci/devices/$A/driver_override" 2>/dev/null || true
+      if ! echo "$A" > /sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null; then
+        echo "$A" > /sys/bus/pci/drivers_probe 2>/dev/null || echo "REBIND_FAILED $A"
+      fi
+    done
+    BAD=""
+    for A in {{ ((_bm_vfio_overrides | default([]) | list) + (_bm_vfio_plain | default([]) | list)) | join(' ') }}; do
+      DRV="$(basename "$(readlink -f "/sys/bus/pci/devices/$A/driver" 2>/dev/null)" 2>/dev/null)" || DRV=""
+      if [ "$DRV" != "vfio-pci" ]; then BAD="$BAD $A(now:${DRV:-none})"; fi
+    done
+    if [ -n "$BAD" ]; then
+      echo "VFIO_RESTORE_INCOMPLETE:${BAD}"
+    else
+      echo "VFIO_RESTORED"
+    fi
+  args:
+    executable: /bin/bash
+  register: _bm_vfio_restore
+  changed_when: true
+  failed_when: false
+
+- name: Surface an incomplete vfio restore in the report
+  ansible.builtin.set_fact:
+    verification_comments: >-
+      {{ verification_comments | default({}) | combine({
+        'GPU baseline (bare-metal, pre-deploy)':
+          ('vfio-pci restore INCOMPLETE after the live re-measure: '
+           ~ (_bm_vfio_restore.stdout_lines | default([])
+              | select('match', '^VFIO_RESTORE_INCOMPLETE') | first | default('')
+              | regex_replace('^VFIO_RESTORE_INCOMPLETE:', '') | trim)
+           ~ ' — rebind manually (driverctl set-override <addr> vfio-pci) before instantiating passthrough VMs.')
+      }) }}
+  when: >-
+    _bm_vfio_restore.stdout_lines | default([])
+    | select('match', '^VFIO_RESTORE_INCOMPLETE') | list | length > 0

@@ -101,6 +101,13 @@ _gpu_benchmark_defaults:
   # (Service Capi + capone/capone-rke2 + nvidia gpu-operator) with one
   # vLLM pod per GPU worker. Both together = one run, 3-way report
   # (bare-metal | appliance | k8s).
+  # 'baremetal' as an EXTRA backend re-measures the physical numbers LIVE in
+  # the post run: the node's GPUs are temporarily released from vfio-pci to
+  # the NVIDIA driver (persistent driverctl override lifted and restored —
+  # a running VM on the GPU aborts the release), the pre-phase benchmark
+  # runs on the host, the fresh numbers replace gpu_baseline.json, and the
+  # appliance/k8s backends then compare against SAME-DAY, SAME-DRIVER
+  # physical data (no more "driver differs" caveat). Cost: ~35-45 min.
   llm_backends: ['appliance']
   # K8s backend settings (versions/URLs pinned to the guide,
   # docs.opennebula.io 7.4 ai_ready_k8s). RESOURCES deliberately override
@@ -236,6 +243,12 @@ _gpu_benchmark_defaults:
   # denominator), so throughput is not flagged.
   compare_min_samples: 30
   compare_min_throughput_req_s: 1.0
+  # Sync-phase TTFT p95 comes from only ~a dozen requests — its tail
+  # jitters 10-20 ms run-to-run on identical hardware (seen live: 55.6 vs
+  # 38.7 ms with IDENTICAL ITL/TPOT/tok/s). A relative TTFT spread or
+  # baseline breach only flags when the ABSOLUTE delta also exceeds this
+  # floor (milliseconds) — real regressions (e.g. 200 vs 38 ms) still flag.
+  compare_min_ttft_delta_ms: 25
   # Retry the load sweep ONCE when the ladder ends UNSATURATED (the
   # guidellm client is bimodal — proven live 2026-08-11: in its slow mode
   # the generator wastes ~1.4 s per request slot and the capped probe
