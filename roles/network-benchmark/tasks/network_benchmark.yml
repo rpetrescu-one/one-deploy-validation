@@ -1,73 +1,134 @@
 ---
+# Ping RTT + iperf3 throughput mesh between hypervisor nodes.
+# Runs on every host of the node group; iperf3 client runs are throttled to
+# one host at a time. Wrapped in block/rescue/always so a failure on one node
+# never aborts the suite and never leaves an iperf3 server behind — and a
+# pre-existing iperf3 server (reused, not started by us) is never killed.
 
-- name: Update apt cache if the system is Debian
-  ansible.builtin.apt:
-    update_cache: yes
-  when: ansible_os_family == "Debian"
+- name: Network benchmark with cleanup harness
+  block:
+    - name: "Debug: induced failure hook"
+      ansible.builtin.fail:
+        msg: "Induced failure (validation.debug.fail_in=network_benchmark)"
+      when: (odv_fail_in | d((validation.debug | d({})).fail_in | d(''))) == 'network_benchmark'
 
-- name: Install ping dependencies
-  ansible.builtin.package:
-    name: 
-      - jc
-      - jq
-      - iperf3
-    state: present
+    - name: Update apt cache if the system is Debian
+      ansible.builtin.apt:
+        update_cache: yes
+      when: ansible_os_family == "Debian"
 
-- name: Run ping tests
-  ansible.builtin.shell: >
-    ping -c 10 {{ item }} | jc --ping | jq .round_trip_ms_avg
-  args:
-    executable: /bin/bash
-  register: ping_exec
-  with_items: "{{ groups['node'] | map('extract', hostvars, 'ansible_host') | difference([hostvars[inventory_hostname]['ansible_host']]) }}"    
-  loop_control:
-    label: "{{ item }}"
-  changed_when: ping_exec.rc == 0
+    - name: "Install ping/iperf3 dependencies (jc, jq, iperf3)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: install_packages_tracked.yml
+      vars:
+        pkg_names: [jc, jq, iperf3]
+        pkg_role: network-benchmark
 
-- name: Show ping results
-  ansible.builtin.debug:
-    msg: "Ping from: {{ inventory_hostname }} to: {{ item.item }} Result: {{ item.stdout }} ms"
-  loop: "{{ ping_exec.results }}"
+    - name: Run ping tests
+      ansible.builtin.shell: >
+        ping -c 10 {{ item }} | jc --ping | jq .round_trip_ms_avg
+      args:
+        executable: /bin/bash
+      register: ping_exec
+      with_items: "{{ groups[node_group | d('node')] | map('extract', hostvars, 'ansible_host') | difference([hostvars[inventory_hostname]['ansible_host']]) }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: ping_exec.rc == 0
 
-- name: Check if iperf3 server is running
-  ansible.builtin.command: pgrep -f "iperf3 -s -p {{ _iperf_port }}"
-  register: iperf3_check
-  ignore_errors: true
-  changed_when: false
+    - name: Show ping results
+      ansible.builtin.debug:
+        msg: "Ping from: {{ inventory_hostname }} to: {{ item.item }} Result: {{ item.stdout }} ms"
+      loop: "{{ ping_exec.results }}"
 
-- name: Start iperf3 server in all hosts
-  ansible.builtin.command: nohup iperf3 -s -p {{ _iperf_port }} > /dev/null 2>&1 &
-  async: 600
-  poll: 0
-  when: iperf3_check.rc != 0
-  changed_when: true
+    - name: Check if iperf3 server is running
+      ansible.builtin.command: pgrep -f "iperf3 -s -p {{ _iperf_port }}"
+      register: iperf3_check
+      ignore_errors: true
+      changed_when: false
 
-- name: Verify iperf3 is running
-  ansible.builtin.wait_for:
-    port: "{{ _iperf_port }}"
-    timeout: 30
+    - name: "Manifest: register iperf3 server process (about to be started)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: manifest_add.yml
+      vars:
+        manifest_type: process
+        manifest_id: ""
+        manifest_name: "iperf3:{{ _iperf_port }}"
+        manifest_cluster: ""
+        manifest_role: network-benchmark
+        manifest_disposition: created
+      when: iperf3_check.rc != 0
 
-- name: Run iperf3 tests
-  ansible.builtin.shell: |
-    set -o pipefail
-    iperf3 -c {{ item }} -p {{ _iperf_port }} -t {{ _iperf_test_time }} -J | jq .end.sum_sent.bits_per_second
-  args:
-    executable: /bin/bash
-  register: iperf_results
-  with_items: "{{ groups['node'] | map('extract', hostvars, 'ansible_host') | difference([hostvars[inventory_hostname]['ansible_host']]) }}"
-  loop_control:
-    label: "{{ item }}"
-  throttle: 1 # Force sequential (one host at a time)
-  changed_when: false
+    - name: Start iperf3 server in all hosts
+      ansible.builtin.command: nohup iperf3 -s -p {{ _iperf_port }} > /dev/null 2>&1 &
+      async: 600
+      poll: 0
+      when: iperf3_check.rc != 0
+      changed_when: true
 
-- name: Kill the iperf3 server process
-  ansible.builtin.command: pkill iperf3
-  ignore_errors: true
-  register: iperf_killing
-  changed_when: iperf_killing.rc == 0
+    - name: Mark iperf3 server as started by this run
+      ansible.builtin.set_fact:
+        _iperf_started_by_us: true
+      when: iperf3_check.rc != 0
 
-- name: Show iperf3 results
-  ansible.builtin.debug: 
-    msg: "Iperf_client: {{ inventory_hostname }} Iperf_server: {{ item.item }} Result: {{ (item.stdout | int) / 1000000 }} Mbps"
-  loop: "{{ iperf_results.results }}"
+    - name: Verify iperf3 is running
+      ansible.builtin.wait_for:
+        port: "{{ _iperf_port }}"
+        timeout: 30
+
+    - name: Run iperf3 tests
+      ansible.builtin.shell: |
+        set -o pipefail
+        iperf3 -c {{ item }} -p {{ _iperf_port }} -t {{ _iperf_test_time }} -J | jq .end.sum_sent.bits_per_second
+      args:
+        executable: /bin/bash
+      register: iperf_results
+      with_items: "{{ groups[node_group | d('node')] | map('extract', hostvars, 'ansible_host') | difference([hostvars[inventory_hostname]['ansible_host']]) }}"
+      loop_control:
+        label: "{{ item }}"
+      throttle: 1 # Force sequential (one host at a time)
+      changed_when: false
+
+    - name: Show iperf3 results
+      ansible.builtin.debug:
+        msg: "Iperf_client: {{ inventory_hostname }} Iperf_server: {{ item.item }} Result: {{ (item.stdout | int) / 1000000 }} Mbps"
+      loop: "{{ iperf_results.results }}"
+
+    - name: "Record network benchmark success"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Network benchmark on {{ inventory_hostname }}"
+        result_value: "ok"
+
+  rescue:
+    - name: "Record network benchmark failure"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_failure.yml
+      vars:
+        failure_key: "Network benchmark on {{ inventory_hostname }}"
+
+  always:
+    - name: Kill the iperf3 server process (only when this run started it)
+      ansible.builtin.command: pkill -f "iperf3 -s -p {{ _iperf_port }}"
+      register: iperf_killing
+      failed_when: false
+      changed_when: iperf_killing.rc == 0
+      when: _iperf_started_by_us | d(false)
+
+    - name: Note leftover iperf3 server when the kill errored
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_leftover.yml
+      vars:
+        leftover_type: process
+        leftover_name: "iperf3:{{ _iperf_port }}"
+        leftover_role: network-benchmark
+        leftover_detail: "pkill rc={{ iperf_killing.rc | d('unknown') }}"
+      when:
+        - _iperf_started_by_us | d(false)
+        - (iperf_killing.rc | d(0)) | int > 1
 

@@ -1,5 +1,11 @@
 ---
-- name: Remove SSH key pair for conn-matrix
+# State-independent node-side cleanup. Runs from the role's `always` section
+# and must also work standalone: everything it needs is re-derived here (live
+# bridge state + this host's odv_manifest entries) — no facts from the create
+# or test phases. Nothing in this file may abort the run: iproute2 failures
+# downgrade to odv_leftovers entries instead of task failures.
+
+- name: "Cleanup: remove SSH key pair for conn-matrix"
   ansible.builtin.file:
     path: "{{ item }}"
     state: absent
@@ -7,17 +13,53 @@
     - "{{ ansible_env.HOME }}/.ssh/conn-matrix"
     - "{{ ansible_env.HOME }}/.ssh/conn-matrix.pub"
 
-- name: Remove the tmp directories from the remote hosts
+- name: "Cleanup: remove the results directory"
   ansible.builtin.file:
-    path: "/tmp/conn-matrix-results/"
+    path: /tmp/conn-matrix-results/
     state: absent
 
-- name: Remove the IP address and route added to {{ _conn_matrix_bridge_name }}
+- name: "Cleanup: list addresses on {{ _conn_matrix_bridge_name }}"
+  ansible.builtin.command: ip -o addr show dev {{ _conn_matrix_bridge_name }}
+  register: _cm_bridge_addrs
+  failed_when: false
+  changed_when: false
+
+- name: "Cleanup: derive manifest-recorded entries to remove"
+  ansible.builtin.include_tasks: derive_bridge_cleanup.yml
   vars:
-    _my_vm_ip: "{{ host_name_to_vm_ip[hostname_cmd] }}"
-    _mapping_length: "{{ host_name_to_vm_ip | length }}"
-  ansible.builtin.shell: |
-    ip addr del {{ _my_vm_ip | ansible.utils.ipmath(_mapping_length) }}/32 dev {{ _conn_matrix_bridge_name }}
-    ip route del {{ _my_vm_ip }}/32 dev {{ _conn_matrix_bridge_name }}
-  when: hostname_cmd in (host_name_to_vm_ip | d({}))
-  ignore_errors: true
+    _cm_bridge_addr_lines: "{{ (_cm_bridge_addrs.rc == 0) | ternary(_cm_bridge_addrs.stdout_lines, []) }}"
+
+- name: "Cleanup: remove manifest-recorded /32 addresses from {{ _conn_matrix_bridge_name }}"
+  ansible.builtin.command: ip addr del {{ item }} dev {{ _conn_matrix_bridge_name }}
+  loop: "{{ _cm_addrs_to_del }}"
+  register: _cm_addr_del
+  changed_when: _cm_addr_del.rc == 0
+  failed_when: false
+
+# Attempted for EVERY manifest cidr: the entry that was an address (not a
+# route) fails with 'No such process', which is benign and tolerated below.
+- name: "Cleanup: remove manifest-recorded /32 routes from {{ _conn_matrix_bridge_name }}"
+  ansible.builtin.command: ip route del {{ item }} dev {{ _conn_matrix_bridge_name }}
+  loop: "{{ _cm_manifest_cidrs }}"
+  register: _cm_route_del
+  changed_when: _cm_route_del.rc == 0
+  failed_when: false
+
+- name: "Cleanup: record bridge entries that could not be removed"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_leftover.yml
+  vars:
+    leftover_type: ip_addr
+    leftover_name: "{{ item.item }}:dev:{{ _conn_matrix_bridge_name }}"
+    leftover_role: conn_matrix
+    leftover_detail: "{{ ((item.stderr | d('')) | trim)[:200] }}"
+  loop: "{{ (_cm_addr_del.results | d([])) + (_cm_route_del.results | d([])) }}"
+  loop_control:
+    label: "{{ item.item | d('') }}"
+  when:
+    - (item.rc | d(0)) != 0
+    - "'Cannot assign requested address' not in (item.stderr | d(''))"
+    - "'No such process' not in (item.stderr | d(''))"
+    - "'Cannot find device' not in (item.stderr | d(''))"
+    - "'No such device' not in (item.stderr | d(''))"

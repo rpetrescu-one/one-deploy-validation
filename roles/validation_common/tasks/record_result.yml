@@ -1,0 +1,13 @@
+---
+# Records one check outcome into the shared report facts.
+# Inputs: result_key (full key incl. cluster suffix), result_value
+# ('ok' | 'failed' | 'skipped — <reason>' | free string), optional result_comment.
+
+- name: "Record result: {{ result_key }} = {{ result_value }}"
+  ansible.builtin.set_fact:
+    verification_result: "{{ (verification_result | d({})) | combine({result_key: result_value}) }}"
+
+- name: "Record comment: {{ result_key }}"
+  ansible.builtin.set_fact:
+    verification_comments: "{{ (verification_comments | d({})) | combine({result_key: result_comment}) }}"
+  when: (result_comment | d('')) | length > 0

@@ -1,6 +1,11 @@
 ---
 - name: GPU/LLM benchmark for cluster {{ current_cluster.name }}
   block:
+    - name: "Debug: induced failure hook"
+      ansible.builtin.fail:
+        msg: "Induced failure (validation.debug.fail_in=gpu_benchmark)"
+      when: (odv_fail_in | d((validation.debug | d({})).fail_in | d(''))) == 'gpu_benchmark'
+
     - name: Reset per-cluster note
       ansible.builtin.set_fact:
         _cluster_note: ""
@@ -22,14 +27,23 @@
         _cluster_note: "no NVIDIA GPUs discovered"
       when: _gpu_inventory.gpu_count | int == 0
 
-    - name: Export vLLM appliance from the marketplace (once per cluster)
+    # Reuses the shared ensure_test_template.yml service (export + manifest
+    # registration for template+image, created/reused disposition handled
+    # internally). ensure_apply_extra: false — this is the GPU APPLIANCE
+    # template, not the generic test-VM one: applying
+    # validation.test_vm.vm.template_extra here would inject the test-VM
+    # CONTEXT into the appliance, which is wrong.
+    - name: Ensure the vLLM appliance template exists for this cluster
       ansible.builtin.include_role:
         name: validation_common
-        tasks_from: export_marketapp.yml
+        tasks_from: ensure_test_template.yml
       vars:
-        _export_app_name: "{{ gpu_benchmark.appliance_market_name }}"
-        _export_name: "{{ gpu_benchmark.appliance_market_name | regex_replace('[^A-Za-z0-9_-]', '_') }}{{ current_cluster.name_suffix }}"
-        _export_ds_id: "{{ current_cluster.image_ds_id }}"
+        ensure_app_name: "{{ gpu_benchmark.appliance_market_name }}"
+        ensure_name: "{{ gpu_benchmark.appliance_market_name | regex_replace('[^A-Za-z0-9_-]', '_') }}{{ current_cluster.name_suffix }}"
+        ensure_ds_id: "{{ current_cluster.image_ds_id }}"
+        ensure_role: gpu-benchmark
+        ensure_cluster: "{{ current_cluster.name | d('') }}"
+        ensure_apply_extra: false
       when: _gpu_inventory.gpu_count | int > 0
 
     - name: Record appliance template id
@@ -214,9 +228,6 @@
           }) }}
 
   rescue:
-    - name: Best-effort cleanup of leaked VM
-      ansible.builtin.include_tasks: cleanup.yml
-
     - name: Record cluster failure
       vars:
         _rk: "{{ inventory_hostname ~ current_cluster.report_suffix }}"
@@ -234,3 +245,14 @@
           {{ verification_result | default({}) | combine({
             ('GPU benchmark' ~ current_cluster.report_suffix): 'failed'
           }) }}
+
+  always:
+    # Success AND failure path: the inner per-VM blocks already terminate
+    # their VMs in their own always, but a failure that lands BETWEEN those
+    # inner blocks (or in phase-level tasks) previously only cleaned up via
+    # the rescue. cleanup.yml is idempotent and double-call safe (VM tasks
+    # guarded on a non-empty _vm_id, which it clears; file removal is
+    # state=absent), so running it here unconditionally is a no-op when the
+    # inner always already did the work.
+    - name: Best-effort cleanup of any leaked benchmark VM
+      ansible.builtin.include_tasks: cleanup.yml

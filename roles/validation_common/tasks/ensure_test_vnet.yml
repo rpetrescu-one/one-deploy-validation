@@ -1,0 +1,93 @@
+---
+# Shared service: make sure the per-cluster test vnet exists, is assigned to
+# the cluster, and is registered in the run manifest. Extracted from the
+# test_vm role so any test can provision it independently.
+#
+# Inputs:
+#   ensure_vnet_cluster - a cluster dict from one_clusters (id, name, name_suffix)
+#   ensure_role         - role slug for manifest attribution
+# Facts produced:
+#   _ensure_vnet_name   - the vnet name (validation.test_vm.vnet_name + suffix)
+
+- name: Set test vnet name
+  ansible.builtin.set_fact:
+    _ensure_vnet_name: "{{ validation.test_vm.vnet_name }}{{ ensure_vnet_cluster.name_suffix }}"
+
+- name: "Ensure test vnet '{{ _ensure_vnet_name }}'"
+  when: validation.test_vm.create_vnet
+  block:
+    # become_user: oneadmin sits on the ONE-CLI tasks individually (as in the
+    # original network.yml) — a block-level oneadmin would propagate into the
+    # manifest_add include and write the /tmp/odv_manifest.json mirror as
+    # oneadmin, colliding with the root-owned mirror in sticky /tmp.
+    - name: Get existing vnets
+      ansible.builtin.shell:
+        cmd: "onevnet list -j"
+      register: _ensure_vnet_list
+      changed_when: false
+      become: true
+      become_user: oneadmin
+
+    # A pool with a single vnet arrives as a mapping instead of a list.
+    - name: Set existing vnet names
+      ansible.builtin.set_fact:
+        _ensure_vnet_names: "{{ ([_vp] if _vp is mapping else (_vp or [])) | map(attribute='NAME') | list }}"
+      vars:
+        _vp: "{{ (_ensure_vnet_list.stdout | from_json).VNET_POOL.VNET | d([]) }}"
+
+    - name: "Manifest: register vnet '{{ _ensure_vnet_name }}'"
+      ansible.builtin.include_tasks: manifest_add.yml
+      vars:
+        manifest_type: vnet
+        manifest_name: "{{ _ensure_vnet_name }}"
+        manifest_cluster: "{{ ensure_vnet_cluster.name | d('') }}"
+        manifest_role: "{{ ensure_role }}"
+        manifest_disposition: "{{ 'reused' if _ensure_vnet_name in _ensure_vnet_names else 'created' }}"
+
+    - name: Render vnet config
+      ansible.builtin.template:
+        src: test_vnet.j2
+        dest: "/var/tmp/vnet_{{ _ensure_vnet_name }}.template"
+
+    - name: Update existing test network
+      ansible.builtin.shell: >
+        cat /var/tmp/vnet_{{ _ensure_vnet_name }}.template | onevnet update {{ _ensure_vnet_name }}
+      register: _ensure_vnet_cmd
+      failed_when: _ensure_vnet_cmd.rc != 0
+      become: true
+      become_user: oneadmin
+      when: _ensure_vnet_name in _ensure_vnet_names
+
+    - name: Create test network
+      ansible.builtin.shell: >
+        onevnet create /var/tmp/vnet_{{ _ensure_vnet_name }}.template
+      register: _ensure_vnet_cmd
+      failed_when: _ensure_vnet_cmd.rc != 0
+      become: true
+      become_user: oneadmin
+      when: _ensure_vnet_name not in _ensure_vnet_names
+
+    - name: Assign the test network to the cluster
+      ansible.builtin.shell: >
+        onecluster addvnet {{ ensure_vnet_cluster.id }} '{{ _ensure_vnet_name }}'
+      register: _ensure_addvnet
+      # Re-runs find the vnet already in the cluster; tolerate that.
+      failed_when: _ensure_addvnet.rc != 0 and 'already' not in (_ensure_addvnet.stderr | lower)
+      become: true
+      become_user: oneadmin
+      when: ensure_vnet_cluster.id != '0'
+
+    # New vnets land in the default cluster; remove them from it so the
+    # scheduler only matches hosts of the target cluster.
+    - name: Remove the test network from the default cluster
+      ansible.builtin.shell: >
+        onecluster delvnet 0 '{{ _ensure_vnet_name }}'
+      failed_when: false
+      become: true
+      become_user: oneadmin
+      when: ensure_vnet_cluster.id != '0'
+
+    - name: Delete vnet definition file
+      ansible.builtin.file:
+        path: "/var/tmp/vnet_{{ _ensure_vnet_name }}.template"
+        state: absent

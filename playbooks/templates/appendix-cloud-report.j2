@@ -109,6 +109,7 @@
 {% macro status_from(value, comment='') -%}
   {%- set text = ((value | string) ~ ' ' ~ (comment | default('') | string)) | lower -%}
   {%- if 'unreachable' in text or 'inactive' in text or 'failed' in text or 'error' in text or (text | regex_search('(^|[^a-z])fault([^a-z]|$)')) -%}fail
+  {%- elif 'skipped' in text and 'disabled' in text -%}info
   {%- elif 'warning' in text or 'skipped' in text or 'unknown' in text or ' n/a' in text -%}warn
   {%- elif value == 'ok' or value == 'reachable' or value == 'active' or value == 'enabled' or value == 'running' or 'ok -' in text or 'state=running' in text or ('packet_loss_percent' in text and ('packet_loss_percent": 0.0' in text or "packet_loss_percent': 0.0" in text or 'packet_loss_percent: 0.0' in text)) -%}pass
   {%- else -%}info
@@ -411,7 +412,7 @@
       {% if validation_vars.networks_verification | default(false) and network_verification_results is defined and network_verification_results | length > 0 %}
       <li><span class="toc-label">3. Virtual Networks automated validation results</span><span class="toc-page">5</span></li>
       {% endif %}
-      {% if validation_vars.run_storage_benchmark | default(false) or validation_vars.run_network_benchmark | default(false) %}
+      {% if validation_vars.run_storage_benchmark | default(false) or validation_vars.run_network_benchmark | default(true) %}
       <li><span class="toc-label">4. Benchmarking of the OpenNebula infrastructure</span><span class="toc-page">later</span></li>
       {% endif %}
       <li><span class="toc-label">5. Variables used for validation</span><span class="toc-page">final</span></li>
@@ -420,7 +421,7 @@
 
   <div class="header">
     <div class="header-logo"><a href="https://opennebula.io" target="_blank" rel="noopener">{% include '_report_logo_fragment.html' %}</a></div><div class="header-div"></div>
-    <div class="hm"><h1>Automated Cloud Verification Report</h1><p>Generated: <strong>{{ date }}</strong> &nbsp;.&nbsp; Repository version: <strong>{{ repo_version }}</strong></p><p>{{ arch.summary | default('OpenNebula installation verification results, network validation, benchmark data, and validation variables.') | safe }}</p></div>
+    <div class="hm"><h1>Automated Cloud Verification Report</h1><p>Generated: <strong>{{ date }}</strong> &nbsp;.&nbsp; Repository version: <strong>{{ repo_version }}</strong></p>{% if report_run_tags | default(['all']) != ['all'] %}<p><strong>PARTIAL RUN</strong> — only tags: {{ report_run_tags | join(', ') }}. Sections for unselected tests are absent or stale; run without -t/T for a complete report.</p>{% endif %}<p>{{ arch.summary | default('OpenNebula installation verification results, network validation, benchmark data, and validation variables.') | safe }}</p></div>
     <div class="header-meta"><span class="role-pill">Cloud Verification</span><span class="ts">{{ date }}</span></div>
   </div>
 
@@ -810,11 +811,99 @@
   </section>
   {% endif %}
 
-  {% if validation_vars.run_network_benchmark | default(false) and network_benchmark is defined and network_benchmark | length > 0 %}
+  {% if validation_vars.run_network_benchmark | default(true) and network_benchmark is defined and network_benchmark | length > 0 %}
   <section class="data-section"><div class="section-title">Network Benchmarking Results</div><div class="section-title" style="margin-top:14px">Throughput (iperf3)</div><div class="table-scroll"><table class="gtable bench-table"><colgroup><col style="width:38%"><col style="width:38%"><col style="width:24%"></colgroup><thead><tr><th>Client host</th><th>Server</th><th class="num">Throughput</th></tr></thead><tbody>{% for host, data in network_benchmark.items() %}{% if data.iperf_results is defined and data.iperf_results.results is defined %}{% for it in data.iperf_results.results %}{% set bps = it.stdout | default('0') | float %}{% set server_name = ip_to_hostname.get(it.item) if ip_to_hostname is defined else None %}<tr><td>{{ host }}</td><td>{{ server_name | default(it.item, true) }}</td><td class="num">{{ '%.2f' | format(bps / 1000000.0) }} Mbps</td></tr>{% endfor %}{% else %}<tr><td colspan="3">No iperf3 results for {{ host }}</td></tr>{% endif %}{% endfor %}</tbody></table></div><div class="section-title" style="margin-top:18px">Ping (average RTT)</div><div class="table-scroll"><table class="gtable bench-table"><colgroup><col style="width:38%"><col style="width:38%"><col style="width:24%"></colgroup><thead><tr><th>Source host</th><th>Destination</th><th class="num">Avg RTT</th></tr></thead><tbody>{% for host, data in network_benchmark.items() %}{% if data.ping_exec is defined and data.ping_exec.results is defined %}{% for it in data.ping_exec.results %}{% set rtt_raw = it.stdout | default('') %}{% set dest_name = ip_to_hostname.get(it.item) if ip_to_hostname is defined else None %}<tr><td>{{ host }}</td><td>{{ dest_name | default(it.item, true) }}</td><td class="num">{% if rtt_raw != '' and rtt_raw != 'null' %}{{ '%.2f' | format(rtt_raw | float) }} ms{% else %}N/A{% endif %}</td></tr>{% endfor %}{% else %}<tr><td colspan="3">No ping results for {{ host }}</td></tr>{% endif %}{% endfor %}</tbody></table></div></section>
   {% endif %}
 
   {% include "connectivity-matrix.j2" %}
+
+  {# ============================================================
+     Execution & Cleanup Summary — the run's audit trail.
+     Renders UNCONDITIONALLY (no run_* gate, no data gate): the reader
+     must always see which tests were enabled, what each one recorded,
+     and what happened to every resource the run created.
+     ============================================================ #}
+  {% macro exec_worst_of(prefixes) -%}
+    {#- worst-of over verification_result keys starting with any prefix:
+        failed > warning > skipped > ok > none. Any recorded value that is
+        not failed/error/warning/skipped (e.g. 'ok', 'ok - ...', a free
+        string) counts toward the ok bucket — a result WAS recorded. A row
+        shows SKIPPED only when nothing recorded ok: a partial skip (one
+        sub-check disabled by config) must not mask green checks. Values
+        starting with 'error' or containing 'unreachable' count as failed,
+        matching how the main table's status_from macro classifies them
+        (e.g. FE HA records 'error - config file differences found'). -#}
+    {%- set nsw = namespace(failed=false, warning=false, skipped=false, ok=false) -%}
+    {%- for k, v in (verification_result | default({})).items() -%}
+      {%- set nsm = namespace(matched=false) -%}
+      {%- for p in prefixes -%}{%- if k.startswith(p) -%}{%- set nsm.matched = true -%}{%- endif -%}{%- endfor -%}
+      {%- if nsm.matched -%}
+        {%- set vt = v | string | trim | lower -%}
+        {%- if vt.startswith('failed') or vt.startswith('error') or 'unreachable' in vt -%}{%- set nsw.failed = true -%}
+        {%- elif vt.startswith('warning') -%}{%- set nsw.warning = true -%}
+        {%- elif vt.startswith('skipped') -%}{%- set nsw.skipped = true -%}
+        {%- else -%}{%- set nsw.ok = true -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if nsw.failed -%}failed{%- elif nsw.warning -%}warning{%- elif nsw.ok -%}ok{%- elif nsw.skipped -%}skipped{%- else -%}none{%- endif -%}
+  {%- endmacro %}
+  {# Enabled defaults = inventory/reference/group_vars/all.yml (authoritative).
+     prefixes = report-key prefixes owned by the test: harness main key first,
+     legacy per-check keys after. #}
+  {% set exec_tests = [
+    {'label': 'Test VM',             'flag': validation_vars.run_test_vm | default(true),
+     'prefixes': ['Test VM', 'Test network creation', 'Connection to the test VM']},
+    {'label': 'Storage benchmark',   'flag': validation_vars.run_storage_benchmark | default(true),
+     'prefixes': ['Storage benchmark']},
+    {'label': 'Network validation',  'flag': validation_vars.networks_verification | default(true),
+     'prefixes': ['Network validation']},
+    {'label': 'Connectivity matrix', 'flag': validation_vars.run_conn_matrix | default(false),
+     'prefixes': ['Connectivity matrix']},
+    {'label': 'Network benchmark',   'flag': validation_vars.run_network_benchmark | default(true),
+     'prefixes': ['Network benchmark']},
+    {'label': 'Core services',       'flag': validation_vars.run_core_services | default(true),
+     'prefixes': ['Core services']},
+    {'label': 'OneFlow smoke test',  'flag': validation_vars.run_one_flow | default(false),
+     'prefixes': ['OneFlow']},
+    {'label': 'LDAP authentication', 'flag': validation_vars.run_ldap_auth | default(false),
+     'prefixes': ['LDAP', 'OpenNebula LDAP auth driver', 'OpenNebula group mapping', 'XML-RPC (RPC2) login (LDAP)', 'FireEdge UI login (LDAP)', 'Local auth fallback']},
+    {'label': 'VM HA',               'flag': validation_vars.run_vm_ha | default(false),
+     'prefixes': ['VM HA']},
+    {'label': 'FE HA',               'flag': validation_vars.run_fe_ha | default(false),
+     'prefixes': ['FE HA', 'VIP connectivity from all FEs', 'Initial FE leader node', 'VIP reachability after leader migration', 'A new FE leader node', 'Check content of the config directory']},
+    {'label': 'Federation',          'flag': validation_vars.run_federation | default(false),
+     'prefixes': ['Federation']},
+    {'label': 'GPU benchmark',       'flag': validation_vars.run_gpu_benchmark | default(false),
+     'prefixes': ['GPU benchmark', 'GPU baseline']}
+  ] %}
+  <section class="data-section">
+    <div class="section-title">Execution &amp; Cleanup Summary</div>
+    {% if report_run_tags | default(['all']) != ['all'] %}<div class="mini-pre">PARTIAL RUN (tags: {{ report_run_tags | join(', ') }}) — rows below reflect only what this run executed.</div>{% endif %}
+    <div class="section-title" style="margin-top:14px">Test execution</div>
+    <div class="table-scroll"><table class="gtable"><thead><tr><th>Test</th><th>Enabled</th><th>Result</th></tr></thead><tbody>
+    {% for t in exec_tests %}
+      {% set w = exec_worst_of(t.prefixes) | trim %}
+      <tr><td>{{ t.label }}</td><td>{% if t.flag | bool %}<span class="badge bp">YES</span>{% else %}<span class="badge bi">NO</span>{% endif %}</td><td>{% if w == 'failed' %}<span class="badge bf">FAILED</span>{% elif w == 'warning' %}<span class="badge bw">WARNING</span>{% elif w == 'skipped' %}<span class="badge bw">SKIPPED</span>{% elif w == 'ok' %}<span class="badge bp">OK</span>{% else %}<span class="badge bi">NO RESULT RECORDED</span>{% endif %}</td></tr>
+    {% endfor %}
+    </tbody></table></div>
+    <div class="section-title" style="margin-top:18px">Cleanup</div>
+    <div class="mini-pre">{{ (report_manifest | default([])) | length }} resource(s) registered in the run manifest.{% if ((report_manifest | default([])) | length > 0) and ((report_sweep_results | default([])) | length == 0) %} WARNING: the cleanup sweep reported no results for them — the sweep play may not have run; check /tmp/odv_manifest.json on the frontend.{% endif %}</div>
+    {# Sweep rows (Task 5): action is 'removed' | 'kept (reused)' | 'kept (by
+       flag)' | 'leftover' (a resource the sweep FAILED to delete — rendered
+       as red LEFTOVER, same as odv_leftovers rows). #}
+    <div class="table-scroll"><table class="gtable"><thead><tr><th>Resource type</th><th>Name</th><th>Cluster</th><th>Created by</th><th>Action</th><th>Detail</th></tr></thead><tbody>
+    {% if ((report_sweep_results | default([])) | length == 0) and ((report_leftovers | default([])) | length == 0) %}
+      <tr><td colspan="6">(none)</td></tr>
+    {% endif %}
+    {% for r in report_sweep_results | default([]) %}
+      <tr><td class="mono">{{ r.type | default('') }}</td><td class="mono">{{ r.name | default('') }}</td><td>{{ r.cluster | default('') }}</td><td>{{ r.role | default('') }}</td>{% if r.action | default('') == 'leftover' %}<td class="matrix-bad">LEFTOVER</td>{% else %}<td>{{ r.action | default('') }}</td>{% endif %}<td>{{ r.detail | default('') }}</td></tr>
+    {% endfor %}
+    {% for r in report_leftovers | default([]) %}
+      <tr><td class="mono">{{ r.type | default('') }}</td><td class="mono">{{ r.name | default('') }}</td><td>{{ r.cluster | default('') }}</td><td>{{ r.role | default('') }}</td><td class="matrix-bad">LEFTOVER</td><td>{{ r.detail | default('') }}{% if r.host is defined %} (host: {{ r.host }}){% endif %}</td></tr>
+    {% endfor %}
+    </tbody></table></div>
+  </section>
 
   <section class="data-section"><div class="section-title">Variables Used For Validation</div><pre>{{ validation_vars | to_nice_yaml }}</pre></section>
   <div class="footer"><div>OpenNebula Cloud Verification</div><div><a href="https://docs.opennebula.io/" target="_blank" rel="noopener">OpenNebula Docs</a>&nbsp;.&nbsp;<a href="https://github.com/OpenNebula/one-deploy" target="_blank" rel="noopener">one-deploy GitHub</a></div></div>

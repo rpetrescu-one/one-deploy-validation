@@ -17,9 +17,23 @@
         }, recursive=True)
       }}
 
+- name: "Core services: skip — cluster discovery failed"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "Core services validation"
+    result_value: "skipped — cluster discovery failed"
+  when:
+    - validation.run_core_services | d(true)
+    - hostvars[groups[frontend_group | d('frontend')][0]].odv_discovery_failed | d(false)
+
 - name: Run core infrastucture verification test
   ansible.builtin.include_tasks:
     file: "{{ role_path }}/tasks/core_services_verification.yml"
-  when: validation.run_core_services
+  when:
+    - validation.run_core_services | d(true)
+    - not (hostvars[groups[frontend_group | d('frontend')][0]].odv_discovery_failed | d(false))
+    - inventory_hostname == groups[frontend_group | d('frontend')][0]
 
 

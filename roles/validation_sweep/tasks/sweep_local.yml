@@ -1,0 +1,72 @@
+---
+- name: Select this host's local plan entries
+  ansible.builtin.set_fact:
+    _sweep_local: >-
+      {{ _sweep_plan | selectattr('host', 'equalto', inventory_hostname)
+                     | selectattr('action', 'equalto', 'delete')
+                     | selectattr('type', 'in', ['file', 'package', 'process', 'ip_addr'])
+                     | list }}
+
+# ignore_errors (not failed_when: false) so per-item results keep failed: true
+# for the leftover detection below while the play still continues.
+- name: "Sweep: remove files"
+  ansible.builtin.file:
+    path: "{{ item.name }}"
+    state: absent
+  register: _sweep_files
+  ignore_errors: true
+  loop: "{{ _sweep_local | selectattr('type', 'equalto', 'file') | list }}"
+  loop_control: { label: "{{ item.name }}" }
+
+# ip_addr entries carry name '<ip>/32:dev:<bridge>' (contract, set by conn_matrix)
+- name: "Sweep: remove bridge addresses"
+  ansible.builtin.shell: |
+    ip addr del {{ item.name.split(':dev:')[0] }} dev {{ item.name.split(':dev:')[1] }} 2>/dev/null || true
+    ip route del {{ item.name.split(':dev:')[0].split('/')[0] }}/32 dev {{ item.name.split(':dev:')[1] }} 2>/dev/null || true
+    echo OK
+  register: _sweep_ips
+  failed_when: false
+  loop: "{{ _sweep_local | selectattr('type', 'equalto', 'ip_addr') | list }}"
+  loop_control: { label: "{{ item.name }}" }
+
+# process entries carry name '<binary>:<port-or-detail>' (e.g. 'iperf3:5201')
+- name: "Sweep: kill leftover processes"
+  vars:
+    # Bracket the first character of the binary name so the pattern text
+    # itself never appears literally in any process's cmdline — including
+    # this very wrapper shell's own. procps pkill only excludes its own PID,
+    # not its parent shell, so an unbracketed pattern self-matches the shell
+    # that invoked it (its cmdline contains the -c '<pattern>' argument
+    # verbatim), killing it with rc -15 and recording a false LEFTOVER on
+    # every default run.
+    _sweep_kill_pattern: "[{{ item.name.split(':')[0][:1] }}]{{ item.name.split(':')[0][1:] }} -s -p {{ item.name.split(':')[1] }}"
+  ansible.builtin.shell: |
+    pkill -f '{{ _sweep_kill_pattern }}' 2>/dev/null
+    RC=$?
+    [ "$RC" = "0" ] || [ "$RC" = "1" ] && { echo OK; exit 0; }
+    exit "$RC"
+  register: _sweep_procs
+  failed_when: false
+  loop: "{{ _sweep_local | selectattr('type', 'equalto', 'process') | list }}"
+  loop_control: { label: "{{ item.name }}" }
+
+- name: "Sweep: remove packages we installed"
+  ansible.builtin.package:
+    name: "{{ item.name }}"
+    state: absent
+  register: _sweep_pkgs
+  ignore_errors: true
+  loop: "{{ _sweep_local | selectattr('type', 'equalto', 'package') | list }}"
+  loop_control: { label: "{{ item.name }}" }
+
+- name: "Sweep: record local results"
+  ansible.builtin.set_fact:
+    odv_sweep_results: >-
+      {{ (odv_sweep_results | d([])) + [item.item | combine({
+           'action': ('leftover' if (item.failed | d(false)) or ((item.rc | d(0)) not in [0, 1]) else 'removed'),
+           'detail': ('' if not ((item.failed | d(false)) or ((item.rc | d(0)) not in [0, 1])) else (item.msg | d(item.stderr | d('')) | truncate(200))) })] }}
+  loop: >-
+    {{ (_sweep_files.results | d([])) + (_sweep_ips.results | d([]))
+       + (_sweep_procs.results | d([])) + (_sweep_pkgs.results | d([])) }}
+  loop_control: { label: "{{ item.item.name | d('?') }}" }
+  when: item.item is defined

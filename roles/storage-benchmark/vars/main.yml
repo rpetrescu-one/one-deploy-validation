@@ -3,3 +3,9 @@ _primary_frontend: "{{ groups[frontend_group | d('frontend')][0] }}"
 _one_clusters: "{{ hostvars[_primary_frontend].one_clusters | d([]) }}"
 _one_clusters_multi: "{{ hostvars[_primary_frontend].one_clusters_multi | d(false) }}"
 _test_vm_template_image_ids_map: "{{ hostvars[_primary_frontend].test_vm_template_image_ids | d({}) }}"
+# Default benchmark template: the same marketplace app test_vm uses (matches
+# roles/test_vm/defaults/main.yml). The defaulted attribute chain keeps this
+# safe when validation.test_vm is absent entirely (run_test_vm=false
+# deployments) — the bare validation.test_vm.vm.market_name lookup used
+# before would render undefined there.
+_sb_default_template_name: "{{ ((validation.test_vm | d({})).vm | d({})).market_name | d('Alpine Linux 3.21') }}"

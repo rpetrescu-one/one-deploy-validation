@@ -6,58 +6,90 @@
          flag{print}' {{ _federation_oned_conf }}
   register: federation_config
   changed_when: false
+  failed_when: false
 
 - name: Parse federation MODE
   set_fact:
-    federation_mode_actual: "{{ federation_config.stdout | regex_search('MODE\\s*=\\s*\"([^\"]+)\"', '\\1') | default([''], true) | first }}"
+    federation_mode_actual: "{{ federation_config.stdout | d('') | regex_search('MODE\\s*=\\s*\"([^\"]+)\"', '\\1') | default([''], true) | first }}"
 
 - name: Parse federation ZONE_ID
   set_fact:
-    federation_zone_id_actual: "{{ federation_config.stdout | regex_search('ZONE_ID\\s*=\\s*(\\d+)', '\\1') | default([''], true) | first }}"
+    federation_zone_id_actual: "{{ federation_config.stdout | d('') | regex_search('ZONE_ID\\s*=\\s*(\\d+)', '\\1') | default([''], true) | first }}"
 
 - name: Parse federation MASTER_ONED
   set_fact:
-    federation_master_oned_actual: "{{ federation_config.stdout | regex_search('MASTER_ONED\\s*=\\s*\"([^\"]+)\"', '\\1') | default([''], true) | first }}"
+    federation_master_oned_actual: "{{ federation_config.stdout | d('') | regex_search('MASTER_ONED\\s*=\\s*\"([^\"]+)\"', '\\1') | default([''], true) | first }}"
 
-- name: Verify federation mode is set
-  ansible.builtin.assert:
-    that:
-      - federation_mode_actual != ""
-      - federation_mode_actual in ['MASTER', 'SLAVE']
-    fail_msg: "Federation MODE not properly configured in {{ _federation_oned_conf }}"
-    success_msg: "Federation MODE is {{ federation_mode_actual }}"
-
-- name: Save federation mode to verification results
+- name: Evaluate federation MODE and ZONE_ID checks
   set_fact:
-    verification_result: "{{ verification_result | combine({'Federation MODE on ' ~ inventory_hostname: federation_mode_actual}) }}"
+    _fed_mode_ok: "{{ federation_mode_actual != '' and federation_mode_actual in ['MASTER', 'SLAVE'] }}"
+    _fed_zone_id_ok: "{{ federation_zone_id_actual != '' }}"
     one_federation_mode: "{{ federation_mode_actual }}"
     one_federation_zone_id: "{{ federation_zone_id_actual }}"
     one_federation_master_oned: "{{ federation_master_oned_actual if federation_master_oned_actual != '' else 'N/A' }}"
 
-- name: Verify ZONE_ID is set
-  ansible.builtin.assert:
-    that:
-      - federation_zone_id_actual != ""
-    fail_msg: "Federation ZONE_ID not properly configured in {{ _federation_oned_conf }}"
-    success_msg: "Federation ZONE_ID is {{ federation_zone_id_actual }}"
+- name: "Record result: federation MODE (ok)"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "Federation MODE on {{ inventory_hostname }}"
+    result_value: "{{ federation_mode_actual }}"
+  when: _fed_mode_ok | bool
 
-- name: Save federation ZONE_ID to verification results
-  set_fact:
-    verification_result: "{{ verification_result | combine({'Federation ZONE_ID on ' ~ inventory_hostname: federation_zone_id_actual}) }}"
+- name: "Record result: federation MODE (failed)"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "Federation MODE on {{ inventory_hostname }}"
+    result_value: "failed"
+    result_comment: "Federation MODE not properly configured in {{ _federation_oned_conf }} (parsed: '{{ federation_mode_actual }}')"
+  when: not (_fed_mode_ok | bool)
+
+- name: "Record result: federation ZONE_ID (ok)"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "Federation ZONE_ID on {{ inventory_hostname }}"
+    result_value: "{{ federation_zone_id_actual }}"
+  when: _fed_zone_id_ok | bool
+
+- name: "Record result: federation ZONE_ID (failed)"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "Federation ZONE_ID on {{ inventory_hostname }}"
+    result_value: "failed"
+    result_comment: "Federation ZONE_ID not properly configured in {{ _federation_oned_conf }}"
+  when: not (_fed_zone_id_ok | bool)
 
 - name: Check MASTER_ONED on slave zones
   block:
-    - name: Verify MASTER_ONED is set on slave
-      ansible.builtin.assert:
-        that:
-          - federation_master_oned_actual != ""
-          - "'http://' in federation_master_oned_actual or 'https://' in federation_master_oned_actual"
-        fail_msg: "MASTER_ONED not properly configured on slave zone in {{ _federation_oned_conf }}"
-        success_msg: "MASTER_ONED is {{ federation_master_oned_actual }}"
-    
-    - name: Save MASTER_ONED to verification results
+    - name: Evaluate MASTER_ONED check
       set_fact:
-        verification_result: "{{ verification_result | combine({'Federation MASTER_ONED on ' ~ inventory_hostname: federation_master_oned_actual}) }}"
+        _fed_master_oned_ok: "{{ federation_master_oned_actual != '' and ('http://' in federation_master_oned_actual or 'https://' in federation_master_oned_actual) }}"
+
+    - name: "Record result: MASTER_ONED (ok)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Federation MASTER_ONED on {{ inventory_hostname }}"
+        result_value: "{{ federation_master_oned_actual }}"
+      when: _fed_master_oned_ok | bool
+
+    - name: "Record result: MASTER_ONED (failed)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Federation MASTER_ONED on {{ inventory_hostname }}"
+        result_value: "failed"
+        result_comment: "MASTER_ONED not properly configured on slave zone in {{ _federation_oned_conf }} (parsed: '{{ federation_master_oned_actual }}')"
+      when: not (_fed_master_oned_ok | bool)
   when: federation_mode_actual == 'SLAVE'
 
 - name: Check FireEdge configuration

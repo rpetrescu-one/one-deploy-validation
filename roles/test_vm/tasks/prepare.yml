@@ -1,38 +1,43 @@
 ---
-- name: Export the test VM template from the marketplace for this cluster
+# Template/image provisioning goes through the shared service so other tests
+# (storage-benchmark, oneflow, ...) can provision it independently of
+# run_test_vm, and so the exported template+image land in the run manifest.
+- name: Ensure the test VM template exists for this cluster
   ansible.builtin.include_role:
     name: validation_common
-    tasks_from: export_marketapp.yml
+    tasks_from: ensure_test_template.yml
   vars:
-    _export_app_name: "{{ _test_vm_name }}"
-    _export_name: "{{ _test_vm_name }}{{ current_cluster.name_suffix }}"
-    _export_ds_id: "{{ current_cluster.image_ds_id }}"
+    ensure_app_name: "{{ _test_vm_name }}"
+    ensure_name: "{{ _test_vm_name }}{{ current_cluster.name_suffix }}"
+    ensure_ds_id: "{{ current_cluster.image_ds_id }}"
+    ensure_role: test_vm
 
-# Recorded only when the marketplace was actually used — in semi air-gapped
-# deployments the template pre-exists and the export is skipped.
-- name: Verify VM Download from Marketplace
-  set_fact:
-    verification_result: "{{ (verification_result | default({})) | combine({'Download a test VM template from the marketplace' ~ current_cluster.report_suffix : 'ok' }) }}"
-  when: (_export_cmd is not skipped) and _export_cmd.rc == 0
+# 'ok' only when the marketplace was actually used — in semi air-gapped
+# deployments the template pre-exists and the export is skipped inside the
+# shared service (_export_cmd is its register and stays visible here).
+- name: Record marketplace download result
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "Download a test VM template from the marketplace{{ current_cluster.report_suffix }}"
+    result_value: >-
+      {{ 'ok' if ((_export_cmd is defined) and (_export_cmd is not skipped)
+                  and ((_export_cmd.rc | d(1)) == 0))
+         else 'skipped — template pre-exists, marketplace not used' }}
 
-- name: Write extra template variables to a temporary file on the remote host
-  ansible.builtin.copy:
-    content: "{{ validation.test_vm.vm.template_extra }}"
-    dest: "/tmp/test_vm_template_extra.txt"
-  when: validation.test_vm.vm.template_extra is defined
-
-- name: Update VM template with extra data
-  ansible.builtin.shell: >
-    onetemplate update --append {{ _export_template_id }} /tmp/test_vm_template_extra.txt
-  register: update_vm_template_extra
-  failed_when: update_vm_template_extra.rc != 0
-  become: true
-  become_user: oneadmin
-  when: validation.test_vm.vm.template_extra is defined
-
-- name: Verify VM template update
-  set_fact:
-    verification_result: "{{ (verification_result | default({})) | combine({'Updating a VM template' ~ current_cluster.report_suffix : 'ok' }) }}"
+# template_extra is applied inside ensure_test_template.yml (shared service)
+# so it also lands when another test provisions the template first
+# (run_test_vm: false). Only the report row stays here.
+- name: Record VM template update result
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "Updating a VM template{{ current_cluster.report_suffix }}"
+    result_value: >-
+      {{ 'ok' if (validation.test_vm.vm.template_extra is defined)
+         else 'skipped — no template_extra defined' }}
 
 # Per-cluster maps consumed by create_vm, storage-benchmark and
 # oneflow_validation; the scalar facts keep the first cluster's IDs for

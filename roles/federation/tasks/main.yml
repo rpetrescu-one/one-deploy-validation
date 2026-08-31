@@ -3,20 +3,53 @@
   set_fact:
     verification_result: "{{ verification_result | default({}) }}"
 
-- name: Check federation configuration
-  include_tasks: check_federation_config.yml
+# Standard discovery skip guard: discovery failing usually means oned is
+# down — without this, every read-only check below would record a 'failed'
+# row instead of one clean skip.
+- name: "Federation: skip — cluster discovery failed"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "Federation validation on {{ inventory_hostname }}"
+    result_value: "skipped — cluster discovery failed"
+  when: hostvars[groups[frontend_group | d('frontend')][0]].odv_discovery_failed | d(false)
 
-- name: Validate zones
-  include_tasks: check_zones.yml
+- name: Federation validation
+  when: not (hostvars[groups[frontend_group | d('frontend')][0]].odv_discovery_failed | d(false))
+  block:
+    - name: "Debug: induced failure hook"
+      ansible.builtin.fail:
+        msg: "Induced failure (validation.debug.fail_in=federation)"
+      when: (odv_fail_in | d((validation.debug | d({})).fail_in | d(''))) == 'federation'
 
-- name: Check endpoint connectivity
-  include_tasks: check_endpoints.yml
+    - name: Check federation configuration
+      include_tasks: check_federation_config.yml
+      when: _federation_check_federation_config | bool
 
-- name: Verify federated data synchronization
-  include_tasks: check_data_sync.yml
+    - name: Validate zones
+      include_tasks: check_zones.yml
+      when: _federation_check_zones | bool
 
-- name: Advanced federation consistency checks
-  include_tasks: check_advanced_sync.yml
+    - name: Check endpoint connectivity
+      include_tasks: check_endpoints.yml
+      when: _federation_check_endpoints | bool
 
-- name: Compare federation consistency across all zones
-  include_tasks: check_consistency.yml
+    - name: Verify federated data synchronization
+      include_tasks: check_data_sync.yml
+      when: _federation_check_data_sync | bool
+
+    - name: Advanced federation consistency checks
+      include_tasks: check_advanced_sync.yml
+      when: _federation_check_advanced_sync | bool
+
+    - name: Compare federation consistency across all zones
+      include_tasks: check_consistency.yml
+      when: _federation_check_consistency | bool
+  rescue:
+    - name: Record federation validation failure
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_failure.yml
+      vars:
+        failure_key: "Federation validation on {{ inventory_hostname }}"

@@ -1,10 +1,15 @@
 ---
-- name: Install ping dependencies
-  ansible.builtin.package:
-    name:
-      - jc
-      - jq
-    state: present
+# Contract: package manifest entries ONLY for packages the install actually
+# added — pre-installed packages are never manifest-created and never
+# removed. The sweep play removes disposition=created package entries; the
+# role itself does not uninstall.
+- name: "Install ping dependencies (jc, jq)"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: install_packages_tracked.yml
+  vars:
+    pkg_names: [jc, jq]
+    pkg_role: conn_matrix
 
 - name: Fetch host_name_to_vm_ip mapping from the first frontend node
   set_fact:
@@ -14,6 +19,34 @@
 - name: Fetch hostname-to-cluster mapping from the first frontend node
   set_fact:
     hostname_to_cluster_name: "{{ hostvars[groups[frontend_group | d('frontend')][0]]['hostname_to_cluster_name'] | d({}) }}"
+
+# Register the /32 address and the /32 route we are about to add on the
+# bridge, so cleanup.yml can re-derive what to remove with NO facts from this
+# phase. Both use the '<cidr>:dev:<bridge>' name format: cleanup intersects
+# the entries with the addresses live on the bridge (only the added address
+# matches) and attempts `ip route del` for every entry (the pure-address
+# entry yields a benign 'No such process', which cleanup tolerates). The
+# expressions mirror the shell below exactly so the strings match.
+# Loop items are templated BEFORE the per-item when is evaluated, so they
+# must render even when this host is absent from the VM map — the '0.0.0.0'
+# placeholder only ever renders for skipped items and is never registered.
+- name: "Manifest: register bridge address and route"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: manifest_add.yml
+  vars:
+    _mapping_length: "{{ host_name_to_vm_ip | d({}) | length }}"
+    _cm_my_vm_ip: "{{ (host_name_to_vm_ip | d({})).get(hostname_cmd | d(''), '0.0.0.0') }}"
+    manifest_type: ip_addr
+    manifest_id: ""
+    manifest_name: "{{ item }}"
+    manifest_cluster: ""
+    manifest_role: conn_matrix
+    manifest_disposition: created
+  loop:
+    - "{{ _cm_my_vm_ip | ansible.utils.ipmath(_mapping_length | int) }}/32:dev:{{ _conn_matrix_bridge_name }}"
+    - "{{ _cm_my_vm_ip }}/32:dev:{{ _conn_matrix_bridge_name }}"
+  when: hostname_cmd in (host_name_to_vm_ip | d({}))
 
 - name: Add VM IP+offset/32 to {{ _conn_matrix_bridge_name }} and route for each VM IP
   vars:
@@ -27,6 +60,18 @@
   ansible.builtin.shell: |
     ip addr add {{ host_name_to_vm_ip[hostname_cmd] | ansible.utils.ipmath(_mapping_length) }}/32 dev {{ _conn_matrix_bridge_name }}
     ip route add {{ host_name_to_vm_ip[hostname_cmd] }}/32 dev {{ _conn_matrix_bridge_name }}
+
+- name: "Manifest: register results directory"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: manifest_add.yml
+  vars:
+    manifest_type: file
+    manifest_id: ""
+    manifest_name: "/tmp/conn-matrix-results"
+    manifest_cluster: ""
+    manifest_role: conn_matrix
+    manifest_disposition: created
 
 - name: Ensure results directory exists for this host
   file:

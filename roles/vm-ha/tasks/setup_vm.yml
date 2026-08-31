@@ -1,22 +1,42 @@
 ---
 # Only execute these steps on a single frontend host AND when VM HA validation is enabled
-- name: Export the HA test VM template from the marketplace for this cluster
+- name: Ensure the HA test VM template exists for this cluster
   ansible.builtin.include_role:
     name: validation_common
-    tasks_from: export_marketapp.yml
+    tasks_from: ensure_test_template.yml
   vars:
-    _export_app_name: "{{ _test_vm_ha_name }}"
-    _export_name: "{{ _test_vm_ha_name }}{{ current_cluster.name_suffix }}"
-    _export_ds_id: "{{ current_cluster.image_ds_id }}"
+    ensure_app_name: "{{ _test_vm_ha_name }}"
+    ensure_name: "{{ _test_vm_ha_name }}{{ current_cluster.name_suffix }}"
+    ensure_ds_id: "{{ current_cluster.image_ds_id }}"
+    ensure_role: vm-ha
 
 - name: Verify VM Download from Marketplace
-  set_fact:
-    verification_result: "{{ (verification_result | default({})) | combine({'VM HA: download a test VM template from the marketplace' ~ current_cluster.report_suffix : 'ok' }) }}"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "VM HA: download a test VM template from the marketplace{{ current_cluster.report_suffix }}"
+    result_value: "ok"
 
 - name: "Check if VM already exists"
   ansible.builtin.command: onevm list -l ID --csv --filter NAME=test_vm_ha{{ current_cluster.name_suffix }} --no-header
   register: existing_vm
   changed_when: false
+
+# Registered immediately BEFORE the instantiate so the sweep can find the VM
+# even if the instantiate half-succeeds. id is '' for a new VM (sweep resolves
+# by name), the existing id when we reuse one.
+- name: "Manifest: register HA test VM"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: manifest_add.yml
+  vars:
+    manifest_type: vm
+    manifest_id: "{{ existing_vm.stdout | trim }}"
+    manifest_name: "test_vm_ha{{ current_cluster.name_suffix }}"
+    manifest_cluster: "{{ current_cluster.name }}"
+    manifest_role: vm-ha
+    manifest_disposition: "{{ ((existing_vm.stdout | trim) != '') | ternary('reused', 'created') }}"
 
 # The HA VM has no NIC, so anchor it to the cluster explicitly.
 - name: Instantiate test VM
@@ -31,27 +51,45 @@
   set_fact:
     test_vm_ha_id: "{{ (existing_vm.stdout | trim) if existing_vm.stdout != '' else (test_vm_ha.stdout.split(':')[1] | trim) }}"
 
+# failed_when must also assert the final state: with rc-only failed_when an
+# exhausted until passes SILENTLY and the role then works on a pending VM
+# (observed right after core-services cycles the hosts through disable/
+# enable — scheduling resumes only once they are monitored again, so the
+# window is configurable and generous by default).
 - name: Wait for VM to be in running state
   ansible.builtin.shell: >
     onevm list --f ID={{ test_vm_ha_id }} -l STAT --no-header
   register: vm_state
-  failed_when: "vm_state.rc != 0"
+  failed_when: "vm_state.rc != 0 or vm_state.stdout != 'runn'"
   until: vm_state.stdout == "runn"
-  retries: 10
-  delay: 10
+  retries: "{{ (validation.vm_ha | d({})).deploy_retries | d(30) }}"
+  delay: "{{ (validation.vm_ha | d({})).deploy_delay | d(10) }}"
 
-- name: Fetch VM information in JSON format
+# 'runn' can be observed a beat before the placement HISTORY record is
+# written, so retry until the VM actually reports a deployment host — else
+# the extraction below hits an empty HISTORY_RECORDS ('no attribute HISTORY').
+- name: Fetch VM information in JSON format (wait for a placement record)
   ansible.builtin.shell: >
-    onevm list --f ID={{ test_vm_ha_id }} -j
+    onevm show {{ test_vm_ha_id }} -j
   register: vm_info_json
+  changed_when: false
   failed_when: "vm_info_json.rc != 0"
+  until: >-
+    (vm_info_json.stdout | d('{}') | from_json).VM.HISTORY_RECORDS.HISTORY
+    is defined
+  retries: 12
+  delay: 5
 
 - name: Extract HOSTNAME and HID from VM history
   set_fact:
-    host_name: >-
-      {{ (vm_info_json.stdout | from_json).VM_POOL.VM[0].HISTORY_RECORDS.HISTORY.HOSTNAME }}
-    host_id: >-
-      {{ (vm_info_json.stdout | from_json).VM_POOL.VM[0].HISTORY_RECORDS.HISTORY.HID }}
+    # onevm show returns the last HISTORY as a mapping (single) or a list
+    # (after migrations); take the last entry in both shapes.
+    host_name: "{{ _vm_ha_last_history.HOSTNAME }}"
+    host_id: "{{ _vm_ha_last_history.HID }}"
+    _vm_ha_ds_id: "{{ _vm_ha_last_history.DS_ID | d('0') }}"
+  vars:
+    _vm_ha_hist: "{{ (vm_info_json.stdout | from_json).VM.HISTORY_RECORDS.HISTORY }}"
+    _vm_ha_last_history: "{{ _vm_ha_hist[-1] if (_vm_ha_hist is sequence and _vm_ha_hist is not mapping) else _vm_ha_hist }}"
 
 - name: Set the selected host to produce an error for VM HA Test
   set_fact:

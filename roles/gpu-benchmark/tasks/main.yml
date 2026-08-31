@@ -4,6 +4,20 @@
     gpu_benchmark: "{{ _gpu_benchmark_defaults | combine(gpu_benchmark | default({}), recursive=True) }}"
   when: hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host
 
+# Run-to-completion: when cluster discovery failed, record an explicit skip
+# instead of leaving the report row silently absent. Recorded only on the
+# primary frontend (the host the report play reads facts from).
+- name: "GPU benchmark: skip — cluster discovery failed"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "GPU benchmark"
+    result_value: "skipped — cluster discovery failed"
+  when:
+    - hostvars[groups[frontend_group | d('frontend')][0]].odv_discovery_failed | d(false)
+    - hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host
+
 - name: Run GPU/LLM benchmark per cluster
   ansible.builtin.include_tasks:
     file: per_cluster.yml
@@ -11,7 +25,9 @@
   loop_control:
     loop_var: current_cluster
     label: "{{ current_cluster.name }}"
-  when: hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host
+  when:
+    - hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host
+    - not (hostvars[groups[frontend_group | d('frontend')][0]].odv_discovery_failed | d(false))
 
 - name: Ensure benchmark artifacts directory exists on the frontend
   ansible.builtin.file:

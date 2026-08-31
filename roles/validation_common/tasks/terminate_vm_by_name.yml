@@ -1,0 +1,111 @@
+---
+# Shared cleanup primitive: resolve VM(s) by exact NAME or by a regex against
+# NAME, terminate --hard (falling back to recover --delete), poll until each
+# is gone, and record any survivor as an odv_leftovers row. Meant to be
+# called from `always:` sections — every task here is tolerant
+# (failed_when: false) and nothing in this file may abort a play.
+#
+# Inputs (include vars):
+#   tvbn_name          - exact NAME to match (XOR tvbn_regex)
+#   tvbn_regex         - extended regex matched against NAME (XOR tvbn_name)
+#   tvbn_role          - role slug used for odv_leftovers attribution
+#   tvbn_retries       - poll retries for the gone-wait (optional, default 10)
+#   tvbn_delay         - seconds between polls (optional, default 10)
+#   tvbn_detail_suffix - string appended to the leftover detail (optional)
+#
+# Facts out:
+#   _tvbn_survivors - list of 'id:name' strings still present, [] when clean
+#
+# Side effect: appends one odv_leftovers row per survivor
+#   {type: 'vm', name: <vm name>, role: tvbn_role, host: inventory_hostname,
+#    detail: 'terminate did not converge' ~ (tvbn_detail_suffix | d(''))}
+# A separate row (same shape, distinct detail) is appended instead if the
+# initial listing itself fails — that case can't identify individual
+# survivors, so a single row stands in for "cleanup could not verify state".
+
+- name: "terminate_vm_by_name ({{ tvbn_role }}): list candidate VM(s)"
+  # WARNING: this folded (>-) scalar's continuation lines MUST stay at the
+  # SAME indentation as the first content line. YAML only folds
+  # equally-indented lines into one line with a single space between them; a
+  # MORE-indented continuation line keeps its newline instead. This shell
+  # command depends on being rendered as one line — a deeper-indented
+  # continuation here previously split it across newlines, and bash then ran
+  # each fragment (e.g. "-v pat='...'") as its own invalid command,
+  # producing rc=127 on every call site. (This exact bug shipped once —
+  # verified by test/harness/test_logic.yml's "renders as a single line"
+  # assertion below.)
+  ansible.builtin.shell: >-
+    onevm list --csv -l ID,NAME --no-header |
+    awk -F',' -v mode='{{ "regex" if (tvbn_regex is defined) else "exact" }}' -v pat='{{ tvbn_regex | d(tvbn_name) }}'
+    '(mode=="regex" && $2 ~ pat) || (mode=="exact" && $2==pat) {print $1":"$2}'
+  args:
+    executable: /bin/bash
+  register: _tvbn_list
+  become: true
+  become_user: oneadmin
+  failed_when: false
+  changed_when: false
+
+- name: "terminate_vm_by_name ({{ tvbn_role }}): flag listing failure as a survivor"
+  ansible.builtin.set_fact:
+    _tvbn_survivors: ["?:onevm-list-failed"]
+  when: (_tvbn_list.rc | d(1)) != 0
+
+- name: "terminate_vm_by_name ({{ tvbn_role }}): record leftover when listing failed"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_leftover.yml
+  vars:
+    leftover_type: vm
+    leftover_name: "{{ tvbn_name | d(tvbn_regex | d('?')) }}"
+    leftover_role: "{{ tvbn_role }}"
+    leftover_detail: "{{ ('onevm list failed during cleanup (rc=' ~ (_tvbn_list.rc | d('?')) ~ ')') ~ (tvbn_detail_suffix | d('')) }}"
+  when: (_tvbn_list.rc | d(1)) != 0
+
+- name: "terminate_vm_by_name ({{ tvbn_role }}): terminate/recover + wait per candidate"
+  ansible.builtin.shell: |
+    set -o pipefail
+    ID='{{ item.split(":")[0] }}'
+    onevm terminate --hard "$ID" 2>/dev/null || onevm recover --delete "$ID" 2>/dev/null || true
+    for i in $(seq 1 {{ tvbn_retries | d(10) }}); do
+      onevm show "$ID" >/dev/null 2>&1 || { echo GONE; exit 0; }
+      STATE=$(onevm show "$ID" -j 2>/dev/null | jq -r .VM.STATE 2>/dev/null)
+      [ "$STATE" = "6" ] && { echo GONE; exit 0; }
+      sleep {{ tvbn_delay | d(10) }}
+    done
+    echo STUCK; exit 1
+  args:
+    executable: /bin/bash
+  register: _tvbn_term
+  become: true
+  become_user: oneadmin
+  failed_when: false
+  changed_when: false
+  loop: "{{ _tvbn_list.stdout_lines | d([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when: (_tvbn_list.rc | d(1)) == 0
+
+- name: "terminate_vm_by_name ({{ tvbn_role }}): compute survivor list"
+  ansible.builtin.set_fact:
+    _tvbn_survivors: >-
+      {{ _tvbn_term.results | d([])
+         | selectattr('rc', 'defined')
+         | selectattr('rc', '!=', 0)
+         | map(attribute='item')
+         | list }}
+  when: (_tvbn_list.rc | d(1)) == 0
+
+- name: "terminate_vm_by_name ({{ tvbn_role }}): record leftover survivors"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_leftover.yml
+  vars:
+    leftover_type: vm
+    leftover_name: "{{ item.split(':', 1)[1] | d(item) }}"
+    leftover_role: "{{ tvbn_role }}"
+    leftover_detail: "{{ 'terminate did not converge' ~ (tvbn_detail_suffix | d('')) }}"
+  loop: "{{ _tvbn_survivors | d([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when: (_tvbn_list.rc | d(1)) == 0

@@ -1,25 +1,89 @@
 ---
+# One cluster's network validation. Harness shape:
+#   block  — induced-failure hook, the tests (cluster_networks.yml ->
+#            per_vnet.yml), overall verification_result row
+#   rescue — record the failure (legacy report-table row preserved +
+#            record_failure.yml)
+#   always — terminate --hard every 'odv-netval-*<name_suffix>' VM by NAME
+#            PATTERN and wait until gone; survivors become odv_leftovers.
+# All working facts are reset at iteration start so a failure in cluster N
+# can never act on registers/facts left over from cluster N-1 (the old code
+# re-terminated the PREVIOUS cluster's VMs through the stale 'vms' register;
+# that register no longer exists — per_vnet.yml uses _nv_vm, reset here).
+
+- name: "Reset per-cluster network validation state (cluster '{{ current_cluster.name }}')"
+  ansible.builtin.set_fact:
+    _nv_networks: []
+    _nv_vnet_failures: []
+    _nv_vm: {}
+    _nv_vm_name: ""
+  run_once: true
+
 - name: "Network validation for cluster '{{ current_cluster.name }}'"
   block:
+    - name: "Debug: induced failure hook"
+      ansible.builtin.fail:
+        msg: "Induced failure (validation.debug.fail_in=network_validation)"
+      when: (odv_fail_in | d((validation.debug | d({})).fail_in | d(''))) == 'network_validation'
+
     - name: "Validate the networks of cluster '{{ current_cluster.name }}'"
       ansible.builtin.include_tasks:
         file: cluster_networks.yml
-  rescue:
-    - name: Best-effort cleanup of leaked network-test VMs
-      ansible.builtin.shell: >
-        onevm terminate --hard '{{ item.stdout.split(":")[1] | trim }}'
-      loop: "{{ (vms | d({})).results | d([]) }}"
-      when: "':' in (item.stdout | d('') | string)"
-      failed_when: false
-      run_once: true
 
-    - name: "Record network validation failure for cluster '{{ current_cluster.name }}'"
+    - name: "Record network validation result (cluster '{{ current_cluster.name }}')"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Network validation{{ current_cluster.report_suffix }}"
+        result_value: >-
+          {{ 'skipped — no eligible vNETs'
+             if (_nv_networks | d([]) | length == 0)
+             else 'ok' }}
+      when: _nv_vnet_failures | d([]) | length == 0
+
+    - name: "Record network validation result — failed vNETs (cluster '{{ current_cluster.name }}')"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Network validation{{ current_cluster.report_suffix }}"
+        result_value: "failed"
+        result_comment: "Failed vNETs: {{ _nv_vnet_failures | join(', ') }}"
+      when: _nv_vnet_failures | d([]) | length > 0
+  rescue:
+    - name: "Record network validation failure for cluster '{{ current_cluster.name }}' (report table row)"
       ansible.builtin.set_fact:
         network_verification_results: >-
           {{ (network_verification_results | default({}))
              | combine({(current_cluster.name ~ '/validation'): {'Result': 'failed'}}) }}
       run_once: true
 
+    - name: "Record network validation failure"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_failure.yml
+      vars:
+        failure_key: "Network validation{{ current_cluster.report_suffix }}"
+
     - name: "Show failure"
       ansible.builtin.debug:
         msg: "Network validation failed in cluster '{{ current_cluster.name }}', continuing with the next cluster."
+  always:
+    # Single execution per cluster (not once per frontend host in HA
+    # inventories): gated by `when` on the primary frontend rather than
+    # `run_once`, because a run_once'd odv_leftovers set_fact would broadcast
+    # the executing host's list to every host, clobbering per-host entries
+    # recorded by other roles (see terminate_vm_by_name.yml — none of its
+    # tasks are run_once, so this `when` is the only thing limiting it to
+    # one execution).
+    - name: "Cleanup: terminate surviving network-test VMs (odv-netval-*{{ current_cluster.name_suffix }})"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: terminate_vm_by_name.yml
+      vars:
+        tvbn_regex: "^odv-netval-.*{{ current_cluster.name_suffix }}$"
+        tvbn_role: network_validation
+        tvbn_retries: 30
+        tvbn_delay: 5
+      when: inventory_hostname == groups[frontend_group | d('frontend')][0]

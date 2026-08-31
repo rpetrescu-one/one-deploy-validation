@@ -58,13 +58,40 @@ validation:
         desc: OpenNebula Fireedge GUI
       # Add other services if more should be checked.
     check_fireedge_ui: true
+
+  # CLEANUP BEHAVIOR: the suite always removes every resource it created
+  # (VMs, vnets, flow services, exported images/templates, files, packages),
+  # even when tests fail — a final sweep play runs unconditionally and the
+  # report gets an 'Execution & Cleanup Summary' section listing every
+  # resource and its fate. Resources that pre-existed (reused) are never
+  # touched. Set keep_exported_images to keep the marketplace exports
+  # (useful for iterative runs; the vLLM appliance image is multi-GB).
+  cleanup:
+    keep_exported_images: false
+
+  # DEBUG: force a failure inside a given test to exercise the harness
+  # (accepted slugs: test_vm, storage_benchmark, conn_matrix,
+  # network_validation, network_benchmark, vm_ha, fe_ha, ldap_auth,
+  # federation, one_flow, core_services, gpu_benchmark).
+  # Can also be armed per-run without touching this file via the standalone
+  # extra var:  ansible-playbook ... -e odv_fail_in=<slug>
+  # debug:
+  #   fail_in: test_vm
+
   # TEST CASE NAME: OneFlow Smoke Test (service/state/vms)
   # DESCRIPTION: Creates and instantiates a temporary OneFlow service, checks its state and
   # VM count, and reports the result. If the service does not reach RUNNING, the state is
   # recorded as a comment in the HTML report.
   # OUTPUT: OneFlow smoke test result and optional failure comment in /tmp/cloud_verification_report.html
   run_one_flow: true
- 
+  # one_flow:
+  #   state_retries: 30    # x state_delay = the service-state poll window (default: 300s)
+  #   state_delay: 10      # seconds between polls
+  #   # Raise these on HA frontends: right after core_services restarts oned/
+  #   # opennebula-flow, the service-state poll can hit a longer stretch of
+  #   # transient '[one.document.info] Error getting document' errors than
+  #   # the default window tolerates.
+
 
   # TEST CASE NAME: Networking subsystem validation
   # DESCRIPTION: Instantiates a VM at each OpenNebula vNET, checks external connectivity
@@ -106,12 +133,12 @@ validation:
     iperf_test_time: 10
 
   # TEST CASE NAME: Connectivity Matrix
-  # DESCRIPTION: Instantiates a test VM on each hypervisor hosts registered in the 
+  # DESCRIPTION: Instantiates a test VM on each hypervisor hosts registered in the
   # OpenNebula cloud. From each host accesses the VM (temporarily sets up local routing
   # on the configured bridge) and runs a connectivity test to all other VMs running on
   # the other hosts.
-  # OUTPUT: 
-  #    - HTML document at /tmp/conn-matrix-report.html
+  # OUTPUT:
+  #    - Matrix rendered inside the main verification report
   #    - Raw JSON data at /tmp/conn-matrix-raw-data.json
   run_conn_matrix: false
   conn_matrix:
@@ -182,10 +209,12 @@ validation:
 
   # TEST CASE NAME: VM High Availability
   # DESCRIPTION: The prerequisite is to have VM HA configured, see details in OpenNebula documentation.
-  # Instantiates a VM and produces an error on its host with a configurable method (e.g. bringing the 
+  # Instantiates a VM and produces an error on its host with a configurable method (e.g. bringing the
   # main interface down). Checks that the error is detected and the VM is migrated to another host.
   # NOTE: Blocks the test execution and asks for manual confirmation before the fencing occurs (that will shut
-  # down the host). Does not provide an automatic way to recover the host.
+  # down the host). The fenced host is set OFFLINE after the test (this stops the host_error hook
+  # from re-firing and re-fencing it); set vm_ha.node_power_on_cmd to also power the node back on
+  # and re-enable it automatically.
   # OUTPUT: HTML document at /tmp/cloud_verification_report.html
   run_vm_ha: false
   vm_ha:
@@ -195,6 +224,27 @@ validation:
     fencing_check_retries: 8
     fencing_check_delay: 60
     vm_market_name: 'Alpine Linux 3.21'
+    # After fencing, how long to wait for the recreated VM to reach RUNNING
+    # on the surviving host (recovery_retries x recovery_delay seconds; the
+    # image is re-cloned from scratch there, so slow storage needs more).
+    # recovery_retries: 60
+    # recovery_delay: 10
+    # Set to true for unattended runs: skips the interactive confirmation
+    # pause before the destructive fault injection.
+    auto_confirm: false
+    # Automated fenced-node recovery — the power-on counterpart of your
+    # fence driver. Runs on the first frontend as oneadmin with
+    # $ODV_FENCED_HOST (the OpenNebula host NAME) and $ODV_FENCED_HOST_ID
+    # in the environment (e.g. an ipmitool chassis power on, or a resume
+    # of the backing VM in a nested lab). When set, the suite powers the
+    # node back on, waits up to node_boot_timeout seconds for boot,
+    # removes the stale system-datastore directory the fenced recreate
+    # left on the node, re-enables the host and polls
+    # node_monitored_retries x 10s until it is monitored again. Without
+    # it the host stays OFFLINE and the report carries the manual runbook.
+    # node_power_on_cmd: 'ipmitool -H <bmc-of-$ODV_FENCED_HOST> chassis power on'
+    # node_boot_timeout: 300
+    # node_monitored_retries: 30
 
   # TEST CASE NAME: Front-end High Availability
   # DESCRIPTION: The prerequisite is to have the Front-end HA configured, see details in OpenNebula documentation.
@@ -238,6 +288,14 @@ validation:
     # Configuration files
     oned_conf: /etc/one/oned.conf
     fireedge_conf: /etc/one/fireedge-server.conf
+    # Per-include sub-check toggles: disable individual sections of the
+    # federation validation without touching the others (all default true)
+    # check_federation_config: true
+    # check_zones: true
+    # check_endpoints: true
+    # check_data_sync: true
+    # check_advanced_sync: true
+    # check_consistency: true
 
 # gpu-benchmark role config. This PARTIAL dict is merged recursively over the
 # role defaults by the role itself — you only need to list the keys you

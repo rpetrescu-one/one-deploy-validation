@@ -1,5 +1,59 @@
 ---
-- name: Cleanup VM Groups and VMs
+# State-independent frontend-side cleanup. Runs from the role's `always`
+# section and must also work standalone: every input is re-derived here (no
+# registers/facts from the create phase) and every task tolerates resources
+# that are already gone. Nothing in this file may abort the run: OpenNebula
+# CLI failures downgrade to odv_leftovers entries instead of task failures.
+
+- name: "Cleanup: get list of OpenNebula host IDs and names"
+  ansible.builtin.shell: onehost list -l ID,NAME --csv --no-header
+  register: _cm_cleanup_hosts
+  failed_when: false
+  changed_when: false
+
+- name: "Cleanup: record possible VM leftovers when oned is unreachable"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_leftover.yml
+  vars:
+    leftover_type: vm
+    leftover_name: "conn-mtx-vm-on-host-*"
+    leftover_role: conn_matrix
+    leftover_detail: >-
+      onehost list failed during cleanup (rc={{ _cm_cleanup_hosts.rc }});
+      conn-matrix VMs and VM groups may remain
+  when: _cm_cleanup_hosts.rc != 0
+
+# No _host_id_to_cluster filter here on purpose: cleanup sweeps conn-mtx
+# resources for EVERY listed host id; the per-host file tolerates not-found.
+- name: "Cleanup: delete conn-matrix VM and VM group per host"
   ansible.builtin.include_tasks: cleanup_conn_matrix_per_host.yml
-  loop: "{{ host_ids_and_names.stdout_lines }}"
-  when: item.split(',')[0] in _host_id_to_cluster
+  loop: "{{ (_cm_cleanup_hosts.rc == 0) | ternary(_cm_cleanup_hosts.stdout_lines, []) }}"
+
+# Second net: VMs whose host id is no longer in `onehost list` (host removed
+# or renamed since a crashed earlier run). Convergence-based (not a bare
+# re-terminate): the per-host loop above may have just hard-terminated these
+# VMs and they stay visible in EPILOG/SHUTDOWN for a few seconds.
+- name: "Cleanup: terminate leftover conn-matrix VMs by name pattern (second net)"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: terminate_vm_by_name.yml
+  vars:
+    tvbn_regex: "^conn-mtx-vm-on-host"
+    tvbn_role: conn_matrix
+    tvbn_retries: 12
+    tvbn_delay: 5
+
+- name: "Cleanup: find rendered conn-matrix template files"
+  ansible.builtin.find:
+    paths: /tmp
+    patterns:
+      - 'vm-group-*.tmpl'
+      - 'vm-on-host-*.tmpl'
+  register: _cm_tmpl_files
+
+- name: "Cleanup: remove rendered conn-matrix template files"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ _cm_tmpl_files.files | map(attribute='path') | list }}"

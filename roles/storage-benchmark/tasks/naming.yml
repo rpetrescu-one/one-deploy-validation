@@ -1,0 +1,23 @@
+---
+# Pure-logic naming facts for one (cluster, template) pair.
+# Unit-tested in test/harness/test_logic.yml — keep this file free of
+# shell/CLI tasks so it can run against localhost fixtures.
+#
+# Inputs:
+#   _sb_pair                  - [cluster_entry, template_name] (main.yml loop_var)
+#   _sb_default_template_name - role var (vars/main.yml), overridable by tests
+# Facts produced:
+#   current_cluster       - the cluster entry (dict)
+#   _sb_template          - the template name for this pair
+#   _sb_default_template  - stringly bool ('True'/'False', non-native Jinja):
+#                           always consume with `| bool`
+#   _sb_report_key        - 'Storage benchmark (<template>)<report_suffix>'
+#   _sb_vm_name           - deterministic benchmark VM name; cleanup finds the
+#                           VM by this name regardless of how far the test got
+- name: Resolve benchmark cluster, template and naming facts
+  ansible.builtin.set_fact:
+    current_cluster: "{{ _sb_pair.0 }}"
+    _sb_template: "{{ _sb_pair.1 }}"
+    _sb_default_template: "{{ _sb_pair.1 == _sb_default_template_name }}"
+    _sb_report_key: "Storage benchmark ({{ _sb_pair.1 }}){{ _sb_pair.0.report_suffix }}"
+    _sb_vm_name: "odv-storage-bench-{{ _sb_pair.1 | lower | regex_replace('[^a-z0-9]+', '-') }}{{ _sb_pair.0.name_suffix }}"

@@ -1,0 +1,119 @@
+---
+# One vNET's network test: instantiate a named VM on it, verify gateway /
+# DNS / external reachability from inside, save this vNET's report row
+# IMMEDIATELY, then terminate the VM. Own block/rescue: a failure here marks
+# only this vNET's row as failed and appends the vNET to _nv_vnet_failures;
+# the calling loop continues with the next vNET. VM cleanup is guaranteed by
+# the always-sweep in per_cluster.yml (name pattern odv-netval-*<suffix>).
+
+- name: "Set VM name for vNET '{{ current_vnet }}'"
+  ansible.builtin.set_fact:
+    _nv_vm_name: "odv-netval-{{ current_vnet | lower | regex_replace('[^a-z0-9]+', '-') }}{{ current_cluster.name_suffix }}"
+    _nv_prefix: "{{ (_one_clusters_multi | bool) | ternary(current_cluster.name ~ '/', '') }}"
+  run_once: true
+
+- name: "Test vNET '{{ current_vnet }}' (cluster '{{ current_cluster.name }}')"
+  block:
+    - name: "Manifest: register network-test VM '{{ _nv_vm_name }}'"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: manifest_add.yml
+      vars:
+        manifest_type: vm
+        manifest_id: ""
+        manifest_name: "{{ _nv_vm_name }}"
+        manifest_cluster: "{{ current_cluster.name | d('') }}"
+        manifest_role: network_validation
+        manifest_disposition: created
+      # One manifest entry per VM (not per frontend): do NOT use run_once here
+      # (the inner set_fact would broadcast and clobber other hosts' lists).
+      when: inventory_hostname == groups[frontend_group | d('frontend')][0]
+
+    - name: "Instantiate VM on vNET '{{ current_vnet }}'"
+      ansible.builtin.shell: >
+        onetemplate instantiate '{{ _export_template_id }}' --nic '{{ current_vnet }}' --name '{{ _nv_vm_name }}'
+      register: _nv_vm
+      failed_when: "_nv_vm.rc != 0"
+      run_once: true
+
+    - name: "Wait for VM '{{ _nv_vm_name }}' to come up"
+      ansible.builtin.shell: >
+        onevm list --f ID={{ _nv_vm.stdout.split(':')[1] | trim }} -l STAT --no-header
+      register: _nv_vm_state
+      failed_when: "_nv_vm_state.rc != 0"
+      until: _nv_vm_state.stdout == "runn"
+      retries: 10
+      delay: 10
+      run_once: true
+
+    - name: "Get VM IP"
+      ansible.builtin.shell: >
+        onevm list --f ID={{ _nv_vm.stdout.split(':')[1] | trim }} -l IP --no-header
+      register: _nv_vm_ip
+      run_once: true
+
+    - name: "Verify ssh connection to the test VM"
+      ansible.builtin.shell: >
+        ssh -i ~oneadmin/.ssh/id_rsa -o StrictHostKeyChecking=no root@{{ _nv_vm_ip.stdout }} hostname
+      register: _nv_ssh
+      until: _nv_ssh.rc == 0
+      retries: 30
+      delay: 20
+      run_once: true
+
+    - name: "Install required packages in the test VM"
+      ansible.builtin.shell: |
+        ssh -i ~oneadmin/.ssh/id_rsa -o StrictHostKeyChecking=no root@{{ _nv_vm_ip.stdout }} apk update
+        ssh -i ~oneadmin/.ssh/id_rsa -o StrictHostKeyChecking=no root@{{ _nv_vm_ip.stdout }} apk add bind-tools jq jc
+      register: _nv_pkgs
+      run_once: true
+
+    - name: "Check GW reachability from VM"
+      ansible.builtin.shell: |
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _nv_vm_ip.stdout }} "ping -c 10 \$(ip route show default | awk '/default/ {print \$3}') | jc --ping --pretty"
+      register: _nv_gw
+      run_once: true
+
+    - name: "Check DNS resolvation"
+      ansible.builtin.shell: |
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _nv_vm_ip.stdout }} "dig {{ validation.network.ext_host }} | jc --dig -p | jq '.[].answer[].data'"
+      register: _nv_dns
+      run_once: true
+
+    - name: "Check external host reachability from the test VM"
+      ansible.builtin.shell: |
+        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{ _nv_vm_ip.stdout }} "ping -c 3 {{ validation.network.ext_host }} | /usr/bin/jc --ping --pretty"
+      register: _nv_ext
+      run_once: true
+
+    # Saved NOW, not at cluster end: a later vNET's failure can no longer
+    # discard this vNET's finished results. Key strings (incl. the literal
+    # leading newlines from this double-quoted scalar) are load-bearing for
+    # playbooks/templates/appendix-cloud-report.j2 — do not reformat.
+    - name: "Save report row for vNET '{{ current_vnet }}'"
+      ansible.builtin.set_fact:
+        network_verification_results: "{{ (network_verification_results | default({})) | combine({(_nv_prefix ~ current_vnet): {'Test VM IP': _nv_vm_ip.stdout, '\nNetwork GW ping, packet received': _nv_gw.stdout, '\nExternal Host ping: ': _nv_ext.stdout, '\nExternal host DNS resolvation': _nv_dns.stdout}}) }}"
+      run_once: true
+
+    - name: "Remove test VM '{{ _nv_vm_name }}'"
+      ansible.builtin.shell: >
+        onevm terminate --hard '{{ _nv_vm.stdout.split(":")[1] | trim }}'
+      register: _nv_terminate
+      failed_when: "_nv_terminate.rc != 0"
+      run_once: true
+  rescue:
+    - name: "Record failure of vNET '{{ current_vnet }}'"
+      ansible.builtin.set_fact:
+        network_verification_results: >-
+          {{ (network_verification_results | default({}))
+             | combine({(_nv_prefix ~ current_vnet):
+                        {'Result': 'failed',
+                         'Detail': (((ansible_failed_result | d({})).msg
+                                     | d((ansible_failed_result | d({})).stderr | d('see run log'), true))
+                                    | string | truncate(800, True)) ~ ''}}) }}
+        _nv_vnet_failures: "{{ (_nv_vnet_failures | d([])) + [current_vnet] }}"
+      run_once: true
+
+    - name: "Show vNET failure"
+      ansible.builtin.debug:
+        msg: "Network test of vNET '{{ current_vnet }}' failed in cluster '{{ current_cluster.name }}', continuing with the next vNET."

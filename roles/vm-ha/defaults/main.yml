@@ -1,1 +1,5 @@
 _test_vm_ha_name: "{{ validation.vm_ha.vm_market_name | d('Alpine Linux 3.21') }}"
+# When true, the interactive confirmation pause before fault injection is
+# skipped — REQUIRED for unattended runs (ansible.builtin.pause otherwise
+# blocks forever without a TTY).
+_vm_ha_auto_confirm: "{{ validation.vm_ha.auto_confirm | d(false) }}"

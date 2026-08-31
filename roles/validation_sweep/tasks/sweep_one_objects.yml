@@ -1,0 +1,227 @@
+---
+- name: "Sweep: delete OneFlow services"
+  ansible.builtin.shell: |
+    ID="{{ item.id }}"
+    if [ -z "$ID" ]; then
+      ID=$(oneflow list 2>/dev/null | awk -v n='{{ item.name }}' '$0 ~ n {print $1; exit}')
+    fi
+    [ -z "$ID" ] && { echo ABSENT; exit 0; }
+    oneflow delete "$ID" 2>/dev/null || oneflow recover --delete "$ID" 2>/dev/null || true
+    for i in $(seq 1 20); do
+      oneflow show "$ID" >/dev/null 2>&1 || { echo GONE; exit 0; }
+      sleep 6
+    done
+    echo STUCK; exit 1
+  become: true
+  become_user: oneadmin
+  register: _sweep_svc
+  failed_when: false
+  loop: "{{ _sweep_plan | selectattr('type', 'equalto', 'service') | selectattr('action', 'equalto', 'delete') | list }}"
+  loop_control: { label: "{{ item.name }}" }
+
+- name: "Sweep: delete OneFlow service templates"
+  ansible.builtin.shell: |
+    ID="{{ item.id }}"
+    if [ -z "$ID" ]; then
+      ID=$(oneflow-template list 2>/dev/null | awk -v n='{{ item.name }}' '$0 ~ n {print $1; exit}')
+    fi
+    [ -z "$ID" ] && { echo ABSENT; exit 0; }
+    oneflow-template delete "$ID"
+  become: true
+  become_user: oneadmin
+  register: _sweep_svctpl
+  failed_when: false
+  loop: "{{ _sweep_plan | selectattr('type', 'equalto', 'service_template') | selectattr('action', 'equalto', 'delete') | list }}"
+  loop_control: { label: "{{ item.name }}" }
+
+# NOTE: deliberately NOT converted to validation_common/terminate_vm_by_name.yml.
+# This sweep's contract (odv_sweep_results rows keyed by action
+# removed|leftover, resolving id-or-name against the manifest, tolerating
+# already-ABSENT resources) is intentionally different from the per-role
+# always-block cleanup that terminate_vm_by_name.yml consolidates.
+- name: "Sweep: terminate VMs"
+  ansible.builtin.shell: |
+    ID=$(onevm list --csv -f NAME='{{ item.name }}' -l ID --no-header 2>/dev/null | head -1)
+    if [ -z "$ID" ]; then
+      # manifest-id fallback: NEVER act on an id whose NAME no longer matches
+      # the manifest entry (stale mirror/poisoned id must not kill a bystander)
+      ID="{{ item.id }}"
+      [ -z "$ID" ] && { echo ABSENT; exit 0; }
+      CUR=$(onevm show "$ID" -j 2>/dev/null | jq -r .VM.NAME)
+      [ "$CUR" = "{{ item.name }}" ] || { echo ABSENT; exit 0; }
+    fi
+    onevm show "$ID" >/dev/null 2>&1 || { echo ABSENT; exit 0; }
+    onevm terminate --hard "$ID" 2>/dev/null || onevm recover --delete "$ID" 2>/dev/null || true
+    for i in $(seq 1 20); do
+      onevm show "$ID" >/dev/null 2>&1 || { echo GONE; exit 0; }
+      STATE=$(onevm show "$ID" -j 2>/dev/null | jq -r .VM.STATE)
+      [ "$STATE" = "6" ] && { echo GONE; exit 0; }
+      sleep 5
+    done
+    echo STUCK; exit 1
+  become: true
+  become_user: oneadmin
+  register: _sweep_vm
+  failed_when: false
+  loop: "{{ _sweep_plan | selectattr('type', 'equalto', 'vm') | selectattr('action', 'equalto', 'delete') | list }}"
+  loop_control: { label: "{{ item.name }}" }
+
+- name: "Sweep: delete VM groups"
+  ansible.builtin.shell: |
+    onevmgroup show '{{ item.name }}' >/dev/null 2>&1 || { echo ABSENT; exit 0; }
+    onevmgroup delete '{{ item.name }}'
+  become: true
+  become_user: oneadmin
+  register: _sweep_vmg
+  failed_when: false
+  loop: "{{ _sweep_plan | selectattr('type', 'equalto', 'vm_group') | selectattr('action', 'equalto', 'delete') | list }}"
+  loop_control: { label: "{{ item.name }}" }
+
+- name: "Sweep: delete vnets"
+  ansible.builtin.shell: |
+    onevnet show '{{ item.name }}' >/dev/null 2>&1 || { echo ABSENT; exit 0; }
+    onevnet delete '{{ item.name }}'
+    for i in $(seq 1 10); do
+      onevnet show '{{ item.name }}' >/dev/null 2>&1 || { echo GONE; exit 0; }
+      sleep 3
+    done
+    echo STUCK; exit 1
+  become: true
+  become_user: oneadmin
+  register: _sweep_vnet
+  failed_when: false
+  loop: "{{ _sweep_plan | selectattr('type', 'equalto', 'vnet') | selectattr('action', 'equalto', 'delete') | list }}"
+  loop_control: { label: "{{ item.name }}" }
+
+- name: "Sweep: delete VM templates"
+  ansible.builtin.shell: |
+    ID=$(onetemplate list --csv -f NAME='{{ item.name }}' -l ID --no-header 2>/dev/null | head -1)
+    if [ -z "$ID" ]; then
+      ID="{{ item.id }}"
+      [ -z "$ID" ] && { echo ABSENT; exit 0; }
+      CUR=$(onetemplate show "$ID" -j 2>/dev/null | jq -r .VMTEMPLATE.NAME)
+      [ "$CUR" = "{{ item.name }}" ] || { echo ABSENT; exit 0; }
+    fi
+    onetemplate show "$ID" >/dev/null 2>&1 || { echo ABSENT; exit 0; }
+    onetemplate delete "$ID"
+  become: true
+  become_user: oneadmin
+  register: _sweep_tpl
+  failed_when: false
+  loop: "{{ _sweep_plan | selectattr('type', 'equalto', 'template') | selectattr('action', 'equalto', 'delete') | list }}"
+  loop_control: { label: "{{ item.name }}" }
+
+- name: "Sweep: delete images"
+  ansible.builtin.shell: |
+    ID=$(oneimage list --csv -f NAME='{{ item.name }}' -l ID --no-header 2>/dev/null | head -1)
+    if [ -z "$ID" ]; then
+      ID="{{ item.id }}"
+      [ -z "$ID" ] && { echo ABSENT; exit 0; }
+      CUR=$(oneimage show "$ID" -j 2>/dev/null | jq -r .IMAGE.NAME)
+      [ "$CUR" = "{{ item.name }}" ] || { echo ABSENT; exit 0; }
+    fi
+    oneimage show "$ID" >/dev/null 2>&1 || { echo ABSENT; exit 0; }
+    oneimage delete "$ID"
+    for i in $(seq 1 20); do
+      oneimage show "$ID" >/dev/null 2>&1 || { echo GONE; exit 0; }
+      sleep 6
+    done
+    echo STUCK; exit 1
+  become: true
+  become_user: oneadmin
+  register: _sweep_img
+  failed_when: false
+  loop: "{{ _sweep_plan | selectattr('type', 'equalto', 'image') | selectattr('action', 'equalto', 'delete') | list }}"
+  loop_control: { label: "{{ item.name }}" }
+
+- name: "Sweep: record ONE-object results"
+  ansible.builtin.set_fact:
+    odv_sweep_results: >-
+      {{ (odv_sweep_results | d([])) + [item.item | combine({
+           'action': ('removed' if (item.rc | d(1)) == 0 else 'leftover'),
+           'detail': ('' if (item.rc | d(1)) == 0 else ((item.stdout | d('')) ~ ' ' ~ (item.stderr | d(''))) | trim | truncate(200)) })] }}
+  loop: >-
+    {{ (_sweep_svc.results | d([])) + (_sweep_svctpl.results | d([]))
+       + (_sweep_vm.results | d([])) + (_sweep_vmg.results | d([]))
+       + (_sweep_vnet.results | d([])) + (_sweep_tpl.results | d([]))
+       + (_sweep_img.results | d([])) }}
+  loop_control: { label: "{{ item.item.name | d('?') }}" }
+  when: item.item is defined
+
+# Second net: catch anything that escaped the manifest via the deterministic
+# name conventions. gpu-bench-* is skipped when the user explicitly asked to
+# keep a failed stack for post-mortem.
+- name: Build stray-VM name pattern
+  ansible.builtin.set_fact:
+    _sweep_stray_regex: "^(odv-|conn-mtx-vm-on-host|test_vm_ha{{ '' if _sweep_keep_gpu else '|gpu-bench-' }})"
+  vars:
+    _sweep_keep_gpu: "{{ ((gpu_benchmark | d({})).keep_stack_on_failure | d(false)) | bool }}"
+
+- name: "Sweep second net: stray validation VMs by name"
+  ansible.builtin.shell: >
+    onevm list --csv -l ID,NAME --no-header 2>/dev/null
+    | awk -F, -v re='{{ _sweep_stray_regex }}' '$2 ~ re {print $1 "," $2}'
+  become: true
+  become_user: oneadmin
+  register: _sweep_stray
+  failed_when: false
+  changed_when: false
+
+- name: "Sweep second net: terminate strays"
+  ansible.builtin.shell: |
+    onevm terminate --hard {{ item.split(',')[0] }} 2>/dev/null || onevm recover --delete {{ item.split(',')[0] }} 2>/dev/null || true
+    for i in $(seq 1 20); do
+      onevm show {{ item.split(',')[0] }} >/dev/null 2>&1 || { echo GONE; exit 0; }
+      sleep 5
+    done
+    echo STUCK; exit 1
+  become: true
+  become_user: oneadmin
+  register: _sweep_stray_kill
+  failed_when: false
+  loop: "{{ _sweep_stray.stdout_lines | d([]) }}"
+  loop_control: { label: "{{ item }}" }
+
+- name: "Sweep second net: record results"
+  ansible.builtin.set_fact:
+    odv_sweep_results: >-
+      {{ (odv_sweep_results | d([])) + [{
+           'type': 'vm', 'id': item.item.split(',')[0], 'name': item.item.split(',')[1],
+           'cluster': '', 'role': 'sweep (second net)', 'host': inventory_hostname,
+           'action': ('removed' if (item.rc | d(1)) == 0 else 'leftover'),
+           'detail': ('found by name pattern, not in manifest' if (item.rc | d(1)) == 0 else 'terminate did not converge') }] }}
+  loop: "{{ _sweep_stray_kill.results | d([]) }}"
+  loop_control: { label: "{{ item.item | d('?') }}" }
+
+- name: "Sweep second net: stray flow-smoke services and service templates"
+  ansible.builtin.shell: |
+    OUT=""
+    for ID in $(oneflow list 2>/dev/null | awk '$1 ~ /^[0-9]+$/ && $0 ~ /flow-smoke-svc/ {print $1}'); do
+      oneflow delete "$ID" 2>/dev/null || oneflow recover --delete "$ID" 2>/dev/null || true
+      for i in $(seq 1 20); do
+        oneflow show "$ID" >/dev/null 2>&1 || break
+        sleep 6
+      done
+      oneflow show "$ID" >/dev/null 2>&1 && OUT="$OUT service:$ID:leftover" || OUT="$OUT service:$ID:removed"
+    done
+    for ID in $(oneflow-template list 2>/dev/null | awk '$1 ~ /^[0-9]+$/ && $0 ~ /flow-smoke-svc/ {print $1}'); do
+      oneflow-template delete "$ID" 2>/dev/null \
+        && OUT="$OUT service_template:$ID:removed" || OUT="$OUT service_template:$ID:leftover"
+    done
+    echo "$OUT"
+  become: true
+  become_user: oneadmin
+  register: _sweep_stray_flow
+  failed_when: false
+  changed_when: false
+
+- name: "Sweep second net: record stray flow results"
+  ansible.builtin.set_fact:
+    odv_sweep_results: >-
+      {{ (odv_sweep_results | d([])) + [{
+           'type': item.split(':')[0], 'id': item.split(':')[1], 'name': 'flow-smoke-svc (stray)',
+           'cluster': '', 'role': 'sweep (second net)', 'host': inventory_hostname,
+           'action': ('removed' if item.split(':')[2] == 'removed' else 'leftover'),
+           'detail': 'found by name pattern, not in manifest' }] }}
+  loop: "{{ (_sweep_stray_flow.stdout | d('')).split() }}"
+  loop_control: { label: "{{ item }}" }

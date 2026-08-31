@@ -2,4 +2,12 @@
 _primary_frontend: "{{ groups[frontend_group | d('frontend')][0] }}"
 _one_clusters: "{{ hostvars[_primary_frontend].one_clusters | d([]) }}"
 _one_clusters_multi: "{{ hostvars[_primary_frontend].one_clusters_multi | d(false) }}"
+# First choice: the per-cluster template map test_vm already exported (avoids
+# duplicate marketplace work when test_vm ran). When the map has no entry for
+# this cluster, per_cluster.yml falls back to
+# validation_common/ensure_test_template.yml.
 _test_vm_template_ids_map: "{{ hostvars[_primary_frontend].test_vm_template_ids | d({}) }}"
+# Mirrors _test_vm_name in roles/test_vm/defaults/main.yml so the fallback
+# export resolves to the very template test_vm would have exported (same
+# target name => ensure_test_template reuses it instead of exporting twice).
+_flow_marketapp_name: "{{ validation.test_vm.vm.market_name | d('Alpine Linux 3.21') }}"

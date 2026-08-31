@@ -1,0 +1,31 @@
+---
+# ONE host NAME -> monitored HOSTNAME mapping (plumbing consumed by
+# conn_matrix and vm-ha). Lives here because it is infrastructure, not a test.
+
+- name: Get list of OpenNebula host to "hostname_cmd" mapping
+  shell: onehost list -j
+  register: host_list_json
+  changed_when: false
+  no_log: true
+
+- name: Extract HOST raw (may be mapping or list)
+  set_fact:
+    host_raw: "{{ (host_list_json.stdout | from_json).HOST_POOL.HOST | default([]) }}"
+
+- name: Normalize HOST list (always a list)
+  set_fact:
+    host_list: "{{ [host_raw] if (host_raw is mapping) else (host_raw | default([])) }}"
+
+- name: Set fact with host to 'hostname_cmd' mapping
+  set_fact:
+    host_name_to_hostname_cmd: >-
+      {{
+        dict(
+          (host_list | map(attribute='NAME'))
+          | zip(
+              host_list
+              | map(attribute='TEMPLATE')
+              | map(attribute='HOSTNAME')
+            )
+        )
+      }}

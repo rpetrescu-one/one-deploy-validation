@@ -1,0 +1,597 @@
+---
+- name: validation harness unit tests
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tasks:
+    - name: manifest_add — registers a created resource (defaults applied)
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: manifest_add.yml
+      vars:
+        manifest_type: vm
+        manifest_name: odv-test-vm-c1
+        manifest_cluster: c1
+        manifest_role: test_vm
+
+    - name: manifest_add — registers a reused template with id
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: manifest_add.yml
+      vars:
+        manifest_type: template
+        manifest_id: "42"
+        manifest_name: "Alpine Linux 3.21-c1"
+        manifest_cluster: c1
+        manifest_role: test_vm
+        manifest_disposition: reused
+
+    - name: assert manifest contents
+      ansible.builtin.assert:
+        that:
+          - odv_manifest | length == 2
+          - odv_manifest[0].type == 'vm'
+          - odv_manifest[0].id == ''
+          - odv_manifest[0].disposition == 'created'
+          - odv_manifest[0].host == 'localhost'
+          - odv_manifest[1].id == '42'
+          - odv_manifest[1].disposition == 'reused'
+        fail_msg: "manifest_add produced {{ odv_manifest }}"
+
+    - name: assert manifest mirror file matches the fact
+      ansible.builtin.assert:
+        that:
+          - (lookup('file', '/tmp/odv_manifest.json') | from_json) | length == 2
+
+    - name: record_result — ok without comment
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Harness self-test"
+        result_value: "ok"
+
+    - name: record_result — failed with comment
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Harness self-test 2"
+        result_value: "failed"
+        result_comment: "boom"
+
+    - name: assert recorded results
+      ansible.builtin.assert:
+        that:
+          - verification_result['Harness self-test'] == 'ok'
+          - verification_result['Harness self-test 2'] == 'failed'
+          - verification_comments['Harness self-test 2'] == 'boom'
+          - "'Harness self-test' not in verification_comments"
+
+    - name: record_failure — extracts detail from failed-task vars
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_failure.yml
+      vars:
+        failure_key: "Harness failure-test"
+        ansible_failed_task: { name: "Exploding task" }
+        ansible_failed_result: { msg: "it exploded", rc: 1 }
+
+    - name: assert failure record
+      ansible.builtin.assert:
+        that:
+          - verification_result['Harness failure-test'] == 'failed'
+          - "'Exploding task' in verification_comments['Harness failure-test']"
+          - "'it exploded' in verification_comments['Harness failure-test']"
+
+    - name: sweep plan — created wins over reused, keep-flag protects images
+      ansible.builtin.set_fact:
+        _sweep_manifest:
+          - { type: vm, id: '', name: odv-a, cluster: c1, role: test_vm, disposition: created, host: fe1 }
+          - { type: template, id: '7', name: tpl-x, cluster: c1, role: test_vm, disposition: created, host: fe1 }
+          - { type: template, id: '', name: tpl-x, cluster: c1, role: oneflow_validation, disposition: reused, host: fe1 }
+          - { type: image, id: '8', name: img-y, cluster: c1, role: test_vm, disposition: reused, host: fe1 }
+          - { type: file, id: '', name: /tmp/f, cluster: '', role: conn_matrix, disposition: created, host: n1 }
+          - { type: file, id: '', name: /tmp/f, cluster: '', role: conn_matrix, disposition: created, host: n2 }
+          - { type: host_state, id: '', name: 'fenced:n1', cluster: '', role: vm-ha, disposition: created, host: fe1 }
+        validation: { cleanup: { keep_exported_images: false } }
+
+    - name: sweep plan — compute (keep flag off)
+      ansible.builtin.include_role:
+        name: validation_sweep
+        tasks_from: lib/plan.yml
+
+    - name: assert plan (keep flag off)
+      ansible.builtin.assert:
+        that:
+          - _sweep_plan | length == 5                       # host_state excluded, tpl-x deduped, /tmp/f kept per host
+          - (_sweep_plan | selectattr('name','equalto','odv-a') | first).action == 'delete'
+          - (_sweep_plan | selectattr('name','equalto','tpl-x') | first).action == 'delete'
+          - (_sweep_plan | selectattr('name','equalto','tpl-x') | first).id == '7'
+          - (_sweep_plan | selectattr('name','equalto','img-y') | first).action == 'keep-reused'
+          - _sweep_plan | selectattr('name','equalto','/tmp/f') | list | length == 2
+        fail_msg: "plan produced {{ _sweep_plan }}"
+
+    - name: sweep plan — compute (keep flag on)
+      ansible.builtin.set_fact:
+        validation: { cleanup: { keep_exported_images: true } }
+    - name: sweep plan — recompute
+      ansible.builtin.include_role:
+        name: validation_sweep
+        tasks_from: lib/plan.yml
+    - name: assert plan (keep flag on)
+      ansible.builtin.assert:
+        that:
+          - (_sweep_plan | selectattr('name','equalto','tpl-x') | first).action == 'keep-by-flag'
+          - (_sweep_plan | selectattr('name','equalto','odv-a') | first).action == 'delete'
+        fail_msg: "plan produced {{ _sweep_plan }}"
+
+    - name: conn_matrix derive_bridge_cleanup — manifest x live-bridge intersection
+      vars:
+        validation: {}
+        odv_manifest:
+          - { type: ip_addr, id: '', name: '192.168.150.9/32:dev:br-conn-matrix', cluster: '', role: conn_matrix, disposition: created, host: localhost }
+          - { type: ip_addr, id: '', name: '192.168.150.5/32:dev:br-conn-matrix', cluster: '', role: conn_matrix, disposition: created, host: localhost }
+          - { type: ip_addr, id: '', name: '10.9.9.9/32:dev:br-other', cluster: '', role: conn_matrix, disposition: created, host: localhost }
+          - { type: ip_addr, id: '', name: '172.16.0.4/32:dev:br-conn-matrix', cluster: '', role: conn_matrix, disposition: created, host: some-other-node }
+          - { type: file, id: '', name: '/tmp/conn-matrix-results', cluster: '', role: conn_matrix, disposition: created, host: localhost }
+        _cm_bridge_addr_lines:
+          - "7: br-conn-matrix    inet 192.168.150.100/24 brd 192.168.150.255 scope global br-conn-matrix\\       valid_lft forever preferred_lft forever"
+          - "7: br-conn-matrix    inet 192.168.150.9/32 scope global br-conn-matrix\\       valid_lft forever preferred_lft forever"
+          - "7: br-conn-matrix    inet6 fe80::5054:ff:fe12:3456/64 scope link \\       valid_lft forever preferred_lft forever"
+      ansible.builtin.include_role:
+        name: conn_matrix
+        tasks_from: derive_bridge_cleanup.yml
+
+    - name: assert derive_bridge_cleanup
+      ansible.builtin.assert:
+        that:
+          # every manifest cidr for THIS host and THIS bridge (route deletion list)
+          - _cm_manifest_cidrs == ['192.168.150.9/32', '192.168.150.5/32']
+          # only the one actually live on the bridge is an address to delete;
+          # the /24 and inet6 lines never match, other-bridge/other-host
+          # manifest entries are filtered out
+          - _cm_addrs_to_del == ['192.168.150.9/32']
+        fail_msg: "derive_bridge_cleanup produced cidrs={{ _cm_manifest_cidrs }} addrs={{ _cm_addrs_to_del }}"
+
+    - name: conn_matrix derive_bridge_cleanup — empty inputs stay empty
+      vars:
+        validation: {}
+        odv_manifest: []
+        _cm_bridge_addr_lines: []
+      ansible.builtin.include_role:
+        name: conn_matrix
+        tasks_from: derive_bridge_cleanup.yml
+
+    - name: assert derive_bridge_cleanup empty case
+      ansible.builtin.assert:
+        that:
+          - _cm_manifest_cidrs == []
+          - _cm_addrs_to_del == []
+        fail_msg: "empty-input case produced cidrs={{ _cm_manifest_cidrs }} addrs={{ _cm_addrs_to_del }}"
+
+    # --- Task 10: validation/core_services pure-logic checks ---------------
+    - name: core_services — one_version extraction falls back on empty stdout
+      vars:
+        _stdout_ok: "OpenNebula 6.10.0 (abcdef12)"
+        _stdout_bad: ""
+        _v_ok: "{{ _stdout_ok | regex_search('OpenNebula ([0-9]+\\.[0-9]+\\.[0-9]+)', '\\1') | d(['0.0.0'], true) | first }}"
+        _v_bad: "{{ _stdout_bad | regex_search('OpenNebula ([0-9]+\\.[0-9]+\\.[0-9]+)', '\\1') | d(['0.0.0'], true) | first }}"
+      ansible.builtin.assert:
+        that:
+          - _v_ok == '6.10.0'
+          - _v_bad == '0.0.0'
+        fail_msg: "one_version extraction produced {{ _v_ok }} / {{ _v_bad }}"
+
+    - name: core_services — single-item ONE pools normalize to lists
+      vars:
+        _single: {'NAME': 'default', 'FREE_MB': '1024'}
+        _multi: [{'NAME': 'a'}, {'NAME': 'b'}]
+        _none_pool: null
+        _norm_single: "{{ [_single] if _single is mapping else (_single | d([], true)) }}"
+        _norm_multi: "{{ [_multi] if _multi is mapping else (_multi | d([], true)) }}"
+        _norm_none: "{{ [_none_pool] if _none_pool is mapping else (_none_pool | d([], true)) }}"
+      ansible.builtin.assert:
+        that:
+          - _norm_single | length == 1
+          - _norm_single[0].NAME == 'default'
+          - _norm_multi | length == 2
+          - _norm_none == []
+        fail_msg: "pool normalization produced {{ _norm_single }} / {{ _norm_multi }} / {{ _norm_none }}"
+
+    - name: core_services — datastore min FREE_MB computation ignores the system DS
+      vars:
+        _pool: [{'NAME': 'system', 'FREE_MB': '-5'}, {'NAME': 'default', 'FREE_MB': '100'}, {'NAME': 'files', 'FREE_MB': '0'}]
+        _nonsys: "{{ _pool | selectattr('NAME', 'defined') | rejectattr('NAME', 'eq', 'system') | list }}"
+        _min_free: "{{ ((_nonsys | map(attribute='FREE_MB', default='0') | map('int') | list) + [0]) | min }}"
+      ansible.builtin.assert:
+        that:
+          - _nonsys | length == 2
+          - _min_free | int == 0
+        fail_msg: "datastore capacity logic produced {{ _nonsys }} / {{ _min_free }}"
+
+    - name: core_services — host offline/online cycle verdict from loop results
+      vars:
+        _cycle_results_ok: [{'rc': 0, 'stderr': ''}, {'rc': 0, 'stderr': ''}]
+        _cycle_results_bad: [{'rc': 0, 'stderr': ''}, {'rc': 1, 'stderr': "host 3 did not return to 'on' within 300s"}]
+        _bad_ok: "{{ _cycle_results_ok | selectattr('rc', 'defined') | selectattr('rc', 'ne', 0) | list }}"
+        _bad_bad: "{{ _cycle_results_bad | selectattr('rc', 'defined') | selectattr('rc', 'ne', 0) | list }}"
+      ansible.builtin.assert:
+        that:
+          - _bad_ok | length == 0
+          - _bad_bad | length == 1
+          - _bad_bad | map(attribute='stderr', default='') | join('; ') is search('did not return')
+        fail_msg: "cycle verdict logic produced {{ _bad_ok }} / {{ _bad_bad }}"
+
+    # Regression for the fix that scoped the aggregate rollup regex to THIS
+    # file's own keys only (mirrors the "Record core services aggregate
+    # result" task's _core_static_re / _core_svc_re / _core_failed_keys
+    # expressions exactly).
+    - name: core_services — aggregate rollup regex only flips on this file's own keys
+      vars:
+        _svc_list:
+          - {'name': 'opennebula.service', 'desc': 'OpenNebula core (oned)'}
+          - {'name': 'opennebula-gate.service', 'desc': 'OpenNebula gate'}
+        _core_static_re: >-
+          ^(XML-RPC API status|Oned version|Configured OpenNebula repository|OpenNebula scheduler|OpenNebula one-gate|Verify one-flow|Verify fireedge|Verify connection to a fireedge server|Status of the registered KVM hosts|Put hosts offline|Datastores list|Datastore capacity|Registered marketplaces)
+        _core_svc_descs: "{{ _svc_list | map(attribute='desc') | map('regex_escape') | list }}"
+        _core_svc_re: >-
+          {{ ('^(' ~ (_core_svc_descs | join('|')) ~ ')( is enabled| restarted| not installed)$') if _core_svc_descs | length > 0 else '^$' }}
+        # Case A: everything of THIS role's own is ok; the only failed key
+        # belongs to a foreign role ("Foo service restarted") — must NOT flip.
+        _vr_foreign:
+          'XML-RPC API status': 'ok'
+          'OpenNebula core (oned) is enabled': 'ok'
+          'Foo service restarted': 'failed'
+        # Case B: one of THIS file's own service keys (built from service_list
+        # descriptions) is failed — must flip.
+        _vr_own:
+          'XML-RPC API status': 'ok'
+          'OpenNebula core (oned) is enabled': 'failed'
+        _failed_all_foreign: "{{ _vr_foreign | dict2items | selectattr('value', 'string') | selectattr('value', 'match', 'failed') | map(attribute='key') | list }}"
+        _failed_keys_foreign: >-
+          {{ (_failed_all_foreign | select('search', _core_static_re) | list)
+             + (_failed_all_foreign | select('search', _core_svc_re) | list) }}
+        _failed_all_own: "{{ _vr_own | dict2items | selectattr('value', 'string') | selectattr('value', 'match', 'failed') | map(attribute='key') | list }}"
+        _failed_keys_own: >-
+          {{ (_failed_all_own | select('search', _core_static_re) | list)
+             + (_failed_all_own | select('search', _core_svc_re) | list) }}
+      ansible.builtin.assert:
+        that:
+          - _failed_keys_foreign | length == 0
+          - _failed_keys_own | length == 1
+          - "'OpenNebula core (oned) is enabled' in _failed_keys_own"
+        fail_msg: "aggregate rollup scoping produced foreign={{ _failed_keys_foreign }} own={{ _failed_keys_own }}"
+
+    - name: core_services — aggregate rollup service regex degrades safely when service_list is empty
+      vars:
+        _core_svc_descs_empty: "{{ [] | map(attribute='desc') | map('regex_escape') | list }}"
+        _core_svc_re_empty: >-
+          {{ ('^(' ~ (_core_svc_descs_empty | join('|')) ~ ')( is enabled| restarted| not installed)$') if _core_svc_descs_empty | length > 0 else '^$' }}
+        _vr_edge:
+          ' is enabled': 'failed'
+          'Foo restarted': 'failed'
+        _matched_edge: "{{ _vr_edge.keys() | list | select('search', _core_svc_re_empty) | list }}"
+      ansible.builtin.assert:
+        that:
+          - _core_svc_re_empty == '^$'
+          - _matched_edge | length == 0
+        fail_msg: "empty service_list guard produced re={{ _core_svc_re_empty }} matched={{ _matched_edge }}"
+
+    # --- storage-benchmark: naming.yml (Task 13) -------------------------
+    - name: storage-benchmark naming — default template, single cluster
+      ansible.builtin.include_role:
+        name: storage-benchmark
+        tasks_from: naming.yml
+      vars:
+        _sb_default_template_name: 'Alpine Linux 3.21'
+        _sb_pair:
+          - { name: 'default', name_suffix: '', report_suffix: '' }
+          - 'Alpine Linux 3.21'
+    - name: assert storage-benchmark naming (default, single cluster)
+      ansible.builtin.assert:
+        that:
+          - _sb_vm_name == 'odv-storage-bench-alpine-linux-3-21'
+          - _sb_report_key == 'Storage benchmark (Alpine Linux 3.21)'
+          - _sb_default_template | bool
+          - current_cluster.name == 'default'
+          - _sb_template == 'Alpine Linux 3.21'
+        fail_msg: >-
+          naming.yml produced vm_name='{{ _sb_vm_name }}'
+          report_key='{{ _sb_report_key }}' default='{{ _sb_default_template }}'
+
+    - name: storage-benchmark naming — non-default template, multi-cluster
+      ansible.builtin.include_role:
+        name: storage-benchmark
+        tasks_from: naming.yml
+      vars:
+        _sb_default_template_name: 'Alpine Linux 3.21'
+        _sb_pair:
+          - { name: 'kvm2', name_suffix: '-kvm2', report_suffix: ' — cluster kvm2' }
+          - 'Ubuntu 24.04 LTS'
+    - name: assert storage-benchmark naming (non-default, multi-cluster)
+      ansible.builtin.assert:
+        that:
+          - _sb_vm_name == 'odv-storage-bench-ubuntu-24-04-lts-kvm2'
+          - _sb_report_key == 'Storage benchmark (Ubuntu 24.04 LTS) — cluster kvm2'
+          - not (_sb_default_template | bool)
+        fail_msg: >-
+          naming.yml produced vm_name='{{ _sb_vm_name }}'
+          report_key='{{ _sb_report_key }}' default='{{ _sb_default_template }}'
+
+    # ---- Task 18: gpu-benchmark export -> manifest disposition tri-state ----
+    # Mirrors the manifest_disposition expression after both
+    # export_marketapp.yml call sites (roles/gpu-benchmark/tasks/per_cluster.yml
+    # and roles/gpu-benchmark/tasks/k8s/deploy_stack.yml). export_marketapp.yml
+    # semantics: export task SKIPPED when the precheck found the template;
+    # rc==0 when it actually exported; rc==255 tolerated when the image name
+    # was already taken.
+    - name: "gpu-benchmark disposition: fresh export (rc=0) is 'created'"
+      ansible.builtin.assert:
+        that:
+          - >-
+            ('created' if (_export_cmd is defined and _export_cmd is not skipped
+                           and (_export_cmd.rc | d(1) | int) == 0)
+             else 'reused') == 'created'
+      vars:
+        _export_cmd: {"rc": 0, "changed": true, "stdout": "IMAGE\n  ID: 7\nVMTEMPLATE\n  ID: 12"}
+
+    - name: "gpu-benchmark disposition: precheck hit (export skipped) is 'reused'"
+      ansible.builtin.assert:
+        that:
+          - >-
+            ('created' if (_export_cmd is defined and _export_cmd is not skipped
+                           and (_export_cmd.rc | d(1) | int) == 0)
+             else 'reused') == 'reused'
+      vars:
+        _export_cmd: {"skipped": true, "changed": false}
+
+    - name: "gpu-benchmark disposition: rc=255 name-taken race is 'reused'"
+      ansible.builtin.assert:
+        that:
+          - >-
+            ('created' if (_export_cmd is defined and _export_cmd is not skipped
+                           and (_export_cmd.rc | d(1) | int) == 0)
+             else 'reused') == 'reused'
+      vars:
+        _export_cmd: {"rc": 255, "changed": false, "stderr": "[one.marketapp.export] NAME is already taken by IMAGE 7."}
+
+    # ---------------------------------------------------------------
+    # Task 20 — report template: Execution & Cleanup Summary section
+    # ---------------------------------------------------------------
+    # Earlier tasks in this same play (manifest_add / record_result /
+    # record_failure harness tests above) accumulate host facts named
+    # 'verification_result' and 'verification_comments' via set_fact.
+    # Ansible's variable precedence ranks set_fact-produced facts ABOVE
+    # a task's own `vars:` block, so without this reset the fixture
+    # `vars:` on the render tasks below would be silently shadowed by
+    # the stale accumulated facts (e.g. 'Harness self-test' keys) rather
+    # than the fixture data. Pin the facts to the intended fixture
+    # values here so the template actually sees them.
+    - name: "Report template: reset accumulated verification_result/comments facts for the fixture render"
+      ansible.builtin.set_fact:
+        verification_result:
+          "Test VM validation — cluster default": "ok"
+          "Storage benchmark — cluster default": "failed"
+          "GPU benchmark — cluster default": "skipped — no NVIDIA GPUs discovered"
+          "Network benchmark iperf3 node1 -> node2": "warning - throughput below threshold"
+        verification_comments: {}
+
+    - name: "Report template: render fixture report (results + cleanup rows)"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../playbooks/templates/appendix-cloud-report.j2"
+        dest: "/tmp/odv_harness_report.html"
+      vars: &odv_report_fixture_vars
+        repo_version: "harness-test"
+        date: "2026-01-01 00:00:00"
+        report_date_only: "2026-01-01"
+        validation_vars:
+          run_test_vm: true
+          run_storage_benchmark: true
+        verification_result:
+          "Test VM validation — cluster default": "ok"
+          "Storage benchmark — cluster default": "failed"
+          "GPU benchmark — cluster default": "skipped — no NVIDIA GPUs discovered"
+          "Network benchmark iperf3 node1 -> node2": "warning - throughput below threshold"
+        verification_comments: {}
+        network_verification_results: {}
+        conn_results_matrix: {}
+        template_report_architecture: {}
+        template_report_customer: "harness"
+        template_report_document_version: "harness"
+        template_report_abstract: "harness"
+        template_report_default_abstract: "harness"
+        template_report_revision_comment: ""
+        template_report_revision_version: ""
+        report_manifest: []
+        report_sweep_results:
+          - {type: "vm", name: "odv-storage-bench", cluster: "default", role: "storage-benchmark", action: "removed", detail: "id 42"}
+          - {type: "image", name: "alpine-odv", cluster: "default", role: "test_vm", action: "kept (by flag)", detail: "validation.cleanup.keep_exported_images"}
+        report_leftovers:
+          - {type: "host_state", name: "node3", role: "vm_ha", host: "node3", detail: "host left offline by fencing"}
+
+    - name: "Report template: render fixture report (empty cleanup lists)"
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../playbooks/templates/appendix-cloud-report.j2"
+        dest: "/tmp/odv_harness_report_empty.html"
+      vars:
+        <<: *odv_report_fixture_vars
+        report_sweep_results: []
+        report_leftovers: []
+
+    - name: "Report template: read rendered fixtures"
+      ansible.builtin.slurp:
+        path: "{{ item }}"
+      loop:
+        - /tmp/odv_harness_report.html
+        - /tmp/odv_harness_report_empty.html
+      register: _odv_report_slurp
+
+    - name: "Report template: assert Execution & Cleanup Summary rendering"
+      vars:
+        _html: "{{ _odv_report_slurp.results[0].content | b64decode }}"
+        _html_empty: "{{ _odv_report_slurp.results[1].content | b64decode }}"
+      ansible.builtin.assert:
+        that:
+          - >-
+            '<div class="section-title">Execution &amp; Cleanup Summary</div>' in _html
+          - >-
+            '<td>Test VM</td><td><span class="badge bp">YES</span></td><td><span class="badge bp">OK</span></td>' in _html
+          - >-
+            '<td>Storage benchmark</td><td><span class="badge bp">YES</span></td><td><span class="badge bf">FAILED</span></td>' in _html
+          - >-
+            '<td>GPU benchmark</td><td><span class="badge bi">NO</span></td><td><span class="badge bw">SKIPPED</span></td>' in _html
+          - >-
+            '<td>Network benchmark</td><td><span class="badge bp">YES</span></td><td><span class="badge bw">WARNING</span></td>' in _html
+          - >-
+            '<td>Federation</td><td><span class="badge bi">NO</span></td><td><span class="badge bi">NO RESULT RECORDED</span></td>' in _html
+          - >-
+            '<td class="mono">vm</td><td class="mono">odv-storage-bench</td><td>default</td><td>storage-benchmark</td><td>removed</td><td>id 42</td>' in _html
+          - >-
+            '<td>kept (by flag)</td>' in _html
+          - >-
+            '<td class="matrix-bad">LEFTOVER</td><td>host left offline by fencing (host: node3)</td>' in _html
+          - >-
+            '<td colspan="6">(none)</td>' in _html_empty
+        fail_msg: "Execution & Cleanup Summary section did not render as expected"
+
+    # ---------------------------------------------------------------
+    # Regression: sweep_local.yml's pkill pattern must bracket the first
+    # character of the binary name, or the pattern string appears literally
+    # in the wrapper shell's own cmdline (the -c '<pattern>' shell argument)
+    # and pkill -f self-matches it, killing the shell with rc -15 and
+    # producing a false LEFTOVER on every default run. Mirrors the exact
+    # Jinja expression used by the "Sweep: kill leftover processes" task.
+    # ---------------------------------------------------------------
+    - name: "sweep_local pkill pattern — first character is bracketed so the pattern cannot self-match"
+      vars:
+        _sk_item_name: "iperf3:5201"
+        _sk_kill_pattern: "[{{ _sk_item_name.split(':')[0][:1] }}]{{ _sk_item_name.split(':')[0][1:] }} -s -p {{ _sk_item_name.split(':')[1] }}"
+      ansible.builtin.assert:
+        that:
+          - _sk_kill_pattern == '[i]perf3 -s -p 5201'
+        fail_msg: "pkill pattern built as {{ _sk_kill_pattern }}"
+
+    # ---------------------------------------------------------------
+    # terminate_vm_by_name.yml (Item 1, wave 1): the file itself shells out
+    # to onevm and can't run without a cloud, but its survivor-selection
+    # Jinja is pure logic — mirrors the "compute survivor list" task's
+    # expression exactly against a fixture _tvbn_term.results-shaped list.
+    # ---------------------------------------------------------------
+    - name: "terminate_vm_by_name survivor filter — keeps only non-zero rc entries, ignores skipped"
+      vars:
+        _tvbn_term:
+          results:
+            - { item: "12:odv-netval-a-c1", rc: 0, stdout: "GONE" }
+            - { item: "13:odv-netval-b-c1", rc: 1, stdout: "STUCK" }
+            - { item: "14:odv-netval-c-c1", skipped: true }
+        _tvbn_survivors: >-
+          {{ _tvbn_term.results | d([])
+             | selectattr('rc', 'defined')
+             | selectattr('rc', '!=', 0)
+             | map(attribute='item')
+             | list }}
+      ansible.builtin.assert:
+        that:
+          - _tvbn_survivors == ["13:odv-netval-b-c1"]
+        fail_msg: "survivor filter produced {{ _tvbn_survivors }}"
+
+    - name: "terminate_vm_by_name survivor filter — all converged is an empty list"
+      vars:
+        _tvbn_term:
+          results:
+            - { item: "1:odv-test-vm-fe1", rc: 0, stdout: "GONE" }
+        _tvbn_survivors: >-
+          {{ _tvbn_term.results | d([])
+             | selectattr('rc', 'defined')
+             | selectattr('rc', '!=', 0)
+             | map(attribute='item')
+             | list }}
+      ansible.builtin.assert:
+        that:
+          - _tvbn_survivors == []
+        fail_msg: "survivor filter produced {{ _tvbn_survivors }}"
+
+    - name: "terminate_vm_by_name leftover name extraction — splits 'id:name' on the first colon only"
+      vars:
+        _tvbn_item: "13:odv-netval-b-c1"
+        _tvbn_name: "{{ _tvbn_item.split(':', 1)[1] | d(_tvbn_item) }}"
+      ansible.builtin.assert:
+        that:
+          - _tvbn_name == 'odv-netval-b-c1'
+        fail_msg: "leftover name extraction produced {{ _tvbn_name }}"
+
+    # ---------------------------------------------------------------
+    # Regression: terminate_vm_by_name.yml's "list candidate VM(s)" task once
+    # shipped with its folded (>-) scalar's continuation lines indented
+    # DEEPER than the first content line. YAML only folds equally-indented
+    # lines into one space-joined line; a deeper-indented continuation keeps
+    # its literal newline instead. Since that value feeds
+    # ansible.builtin.shell, the split lines ran as separate (invalid) bash
+    # commands ("-v pat='...'" as its own "command") and every call site
+    # failed with rc=127, which the harness silently swallowed as a false
+    # 'onevm list failed during cleanup' leftover row (only the sweep's
+    # second net actually caught the real leftovers). Mirrors the exact
+    # folded-scalar shape from that task, at uniform indentation, with
+    # representative fixture vars, and asserts it renders as ONE line.
+    # ---------------------------------------------------------------
+    - name: "terminate_vm_by_name listing command — folded scalar renders as a single line (no embedded newline)"
+      vars:
+        tvbn_name: "odv-test-vm-fe1"
+        _tvbn_rendered_cmd: >-
+          onevm list --csv -l ID,NAME --no-header |
+          awk -F',' -v mode='{{ "regex" if (tvbn_regex is defined) else "exact" }}' -v pat='{{ tvbn_regex | d(tvbn_name) }}'
+          '(mode=="regex" && $2 ~ pat) || (mode=="exact" && $2==pat) {print $1":"$2}'
+      ansible.builtin.assert:
+        that:
+          - "'\n' not in _tvbn_rendered_cmd"
+          - "'onevm list --csv -l ID,NAME --no-header | awk' in _tvbn_rendered_cmd"
+          - "\"-v mode='exact' -v pat='odv-test-vm-fe1'\" in _tvbn_rendered_cmd"
+        fail_msg: "rendered listing command is multi-line or malformed: {{ _tvbn_rendered_cmd | to_json }}"
+
+    # ---------------------------------------------------------------
+    # validation_sweep/tasks/preclean.yml (Item 3): pure-logic pieces only —
+    # the split into actionable cluster-object types vs carry-through
+    # (local/host_state) entries, and the presence-recheck -> still-present
+    # computation. The delete/re-check shells themselves need a live
+    # cluster and can't run here.
+    # ---------------------------------------------------------------
+    - name: "preclean split — actionable cluster-object types vs carry-through (local/host_state)"
+      vars:
+        _preclean_actionable_types: [vm, service, service_template, vnet, template, image]
+        _pc_entries:
+          - { type: vm, id: '', name: 'odv-storage-bench-x', cluster: 'c1', role: storage-benchmark, disposition: created, host: fe1 }
+          - { type: image, id: '9', name: 'vLLM_Inference_Engine-c1', cluster: 'c1', role: gpu-benchmark, disposition: created, host: fe1 }
+          - { type: file, id: '', name: '/usr/local/bin/helm', cluster: '', role: gpu-benchmark, disposition: created, host: fe1 }
+          - { type: host_state, id: '', name: 'fenced:n1', cluster: '', role: vm-ha, disposition: created, host: fe1 }
+        _pc_actionable: "{{ _pc_entries | selectattr('type', 'in', _preclean_actionable_types) | list }}"
+        _pc_carry: "{{ _pc_entries | rejectattr('type', 'in', _preclean_actionable_types) | list }}"
+      ansible.builtin.assert:
+        that:
+          - _pc_actionable | length == 2
+          - _pc_actionable | map(attribute='type') | list == ['vm', 'image']
+          - _pc_carry | length == 2
+          - _pc_carry | map(attribute='type') | list == ['file', 'host_state']
+        fail_msg: "preclean split produced actionable={{ _pc_actionable }} carry={{ _pc_carry }}"
+
+    - name: "preclean still-present computation — mirrors the re-check task's for-loop exactly"
+      vars:
+        _preclean_presence:
+          results:
+            - { item: { type: 'vm', name: 'odv-storage-bench-x' }, stdout: '' }
+            - { item: { type: 'image', name: 'vLLM_Inference_Engine-c1' }, stdout: '9,vLLM_Inference_Engine-c1' }
+            - { item: { type: 'template', name: 'stale-tpl' }, stdout: '  ' }
+        _preclean_still_present: >-
+          {%- set out = [] -%}
+          {%- for r in _preclean_presence.results | d([]) -%}
+            {%- if (r.stdout | d('')) | trim | length > 0 -%}
+              {%- set _ = out.append(r.item) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+      ansible.builtin.assert:
+        that:
+          - _preclean_still_present | length == 1
+          - _preclean_still_present[0].name == 'vLLM_Inference_Engine-c1'
+        fail_msg: "preclean still-present computation produced {{ _preclean_still_present }}"

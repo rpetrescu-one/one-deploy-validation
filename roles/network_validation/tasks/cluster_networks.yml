@@ -1,12 +1,6 @@
 ---
-- name: "Reset per-cluster result lists (cluster '{{ current_cluster.name }}')"
-  set_fact:
-    gw_reachability_list: []
-    ext_host_reachability_list: []
-    dns_reachability_list: []
-    vm_ips_list: []
-  run_once: true
-
+# Per-cluster vNET discovery + per-vNET test dispatch.
+#
 # Vnets are queried live (not from discovery) so vnets created earlier in the
 # run (e.g. the test_vm vnet) are also covered.
 # For each vnet of the cluster we also count how many of its Address Ranges
@@ -63,109 +57,38 @@
   run_once: true
   when: _nv_networks | length == 0
 
-- name: "Run network tests for cluster '{{ current_cluster.name }}'"
+# The test VM template is ensured here (exported from the marketplace when
+# missing, reused when pre-existing) instead of assuming the test_vm role ran
+# earlier in the same play — network_validation no longer depends on it.
+# ensure_test_template.yml also registers the template + image in the run
+# manifest and produces _export_template_id.
+- name: "Ensure the test VM template for cluster '{{ current_cluster.name }}'"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: ensure_test_template.yml
+  vars:
+    ensure_app_name: "{{ validation.test_vm.vm.market_name | d('Alpine Linux 3.21') }}"
+    ensure_name: "{{ validation.test_vm.vm.market_name | d('Alpine Linux 3.21') }}{{ current_cluster.name_suffix }}"
+    ensure_ds_id: "{{ current_cluster.image_ds_id }}"
+    ensure_role: network_validation
+  # Primary-frontend gate: without it every frontend of an HA inventory would
+  # append its own manifest copy of the template/image (with divergent
+  # created/reused dispositions). _export_template_id then exists only on the
+  # primary — fine, the instantiate below is run_once and executes there.
+  when:
+    - _nv_networks | length > 0
+    - inventory_hostname == groups[frontend_group | d('frontend')][0]
+
+# Each vNET runs in its own block/rescue (per_vnet.yml): its report row is
+# saved the moment its tests finish, and a failing vNET marks only its own
+# row as failed — the loop continues with the remaining vNETs. This replaces
+# the old all-or-nothing flow where any task failure discarded every
+# gathered per-vNET result of the cluster.
+- name: "Run network tests per vNET in cluster '{{ current_cluster.name }}'"
+  ansible.builtin.include_tasks:
+    file: per_vnet.yml
+  loop: "{{ _nv_networks }}"
+  loop_control:
+    loop_var: current_vnet
+    label: "{{ current_vnet }}"
   when: _nv_networks | length > 0
-  block:
-    # We'll use the per-cluster VM template exported by the test_vm role
-    #
-    - name: Instantiate VM at each network
-      ansible.builtin.shell: >
-        onetemplate instantiate '{{ validation.test_vm.vm.market_name }}{{ current_cluster.name_suffix }}' --nic '{{ item }}'
-      register: vms
-      failed_when: "vms.rc != 0"
-      loop: "{{ _nv_networks }}"
-      run_once: true
-
-    - name: Wait for VM come up
-      ansible.builtin.shell: >
-        onevm list --f ID={{ item.stdout.split(':')[1] | trim}} -l STAT --no-header
-      register: vm_state
-      failed_when: "vm_state.rc != 0"
-      until: vm_state.stdout == "runn"
-      retries: 10
-      delay: 10
-      loop: "{{ vms.results }}"
-      run_once: true
-
-    - name: Get VM IP
-      ansible.builtin.shell: >
-        onevm list --f ID={{item.stdout.split(':')[1] | trim}} -l IP --no-header
-      register: vm_ip
-      loop: "{{ vms.results }}"
-      run_once: true
-
-    - name: Verify ssh connection to the test VM
-      ansible.builtin.shell: >
-        ssh -i ~oneadmin/.ssh/id_rsa -o StrictHostKeyChecking=no root@{{item.stdout}} hostname
-      register: vm_ssh_result
-      until: vm_ssh_result.rc == 0
-      retries: 30
-      delay: 20
-      loop: "{{ vm_ip.results }}"
-      run_once: true
-
-    - name: Save VM IPs to list
-      set_fact:
-        vm_ips_list: "{{ vm_ip.results | map(attribute='stdout') | list }}"
-
-    - name: Install required packages
-      ansible.builtin.shell: |
-        ssh -i ~oneadmin/.ssh/id_rsa -o StrictHostKeyChecking=no root@{{item.stdout}} apk update
-        ssh -i ~oneadmin/.ssh/id_rsa -o StrictHostKeyChecking=no root@{{item.stdout}} apk add bind-tools jq jc
-      register: installation_result
-      loop: "{{ vm_ip.results }}"
-      run_once: true
-
-    - name: Check GW reachability from VM
-      ansible.builtin.shell: |
-        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{item.stdout}} "ping -c 10 \$(ip route show default | awk '/default/ {print \$3}') | jc --ping --pretty"
-      register: gw_reachability
-      loop: "{{ vm_ip.results }}"
-      run_once: true
-
-    - name: Check DNS resolvation
-      ansible.builtin.shell: |
-        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{item.stdout}} "dig {{ validation.network.ext_host }} | jc --dig -p | jq '.[].answer[].data'"
-      register: dns_reachability
-      loop: "{{ vm_ip.results }}"
-      run_once: true
-
-    - name: Check external host reachability from the test VM
-      ansible.builtin.shell: |
-        ssh -i ~oneadmin/.ssh/id_rsa -q -oStrictHostKeyChecking=no root@{{item.stdout}} "ping -c 3 {{ validation.network.ext_host  }} | /usr/bin/jc --ping --pretty"
-      register: ext_host_reachability
-      loop: "{{ vm_ip.results }}"
-      run_once: true
-
-    - name: Save GW test results to list
-      set_fact:
-        gw_reachability_list: "{{ gw_reachability_list | default([]) + [item.stdout] }}"
-      loop: "{{ gw_reachability.results }}"
-      run_once: true
-
-    - name: Save ext host ping test results to list
-      set_fact:
-        ext_host_reachability_list: "{{ ext_host_reachability_list | default([]) + [item.stdout] }}"
-      loop: "{{ ext_host_reachability.results }}"
-      run_once: true
-
-    - name: Save DNS resolvation test results to list
-      set_fact:
-        dns_reachability_list: "{{ dns_reachability_list | default([]) + [item.stdout] }}"
-      loop: "{{ dns_reachability.results }}"
-      run_once: true
-
-    - name: Save VM IPs for report
-      vars:
-        _nv_prefix: "{{ (_one_clusters_multi | bool) | ternary(current_cluster.name ~ '/', '') }}"
-      set_fact:
-        network_verification_results: "{{ (network_verification_results | default({})) | combine({(_nv_prefix ~ item.0): {'Test VM IP': item.1, '\nNetwork GW ping, packet received': item.2, '\nExternal Host ping: ': item.3, '\nExternal host DNS resolvation':item.4}}) }}"
-      loop: "{{ _nv_networks | zip(vm_ips_list, gw_reachability_list, ext_host_reachability_list, dns_reachability_list) | list }}"
-
-    - name: Remove test VMs
-      ansible.builtin.shell: >
-        onevm terminate '{{ item.stdout.split(':')[1] | trim }}'
-      register: terminated_vms
-      failed_when: "terminated_vms.rc != 0"
-      loop: "{{ vms.results }}"
-      run_once: true

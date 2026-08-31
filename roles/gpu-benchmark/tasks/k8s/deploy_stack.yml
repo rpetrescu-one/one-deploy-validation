@@ -24,14 +24,23 @@
       '{{ _gpu_vnet_name | default(gpu_benchmark.vnet_name) }}' — set
       gpu_benchmark.k8s.one_xmlrpc_ip explicitly.
 
-- name: Export Service Capi from the marketplace (once per cluster)
+# Reuses the shared ensure_test_template.yml service (export + manifest
+# registration for template+image, created/reused disposition handled
+# internally). ensure_apply_extra: false — this is the Capi appliance
+# template, not the generic test-VM one: applying
+# validation.test_vm.vm.template_extra here would inject the test-VM
+# CONTEXT into the appliance, which is wrong.
+- name: Ensure the Service Capi template exists for this cluster
   ansible.builtin.include_role:
     name: validation_common
-    tasks_from: export_marketapp.yml
+    tasks_from: ensure_test_template.yml
   vars:
-    _export_app_name: "{{ gpu_benchmark.k8s.capi_app_name }}"
-    _export_name: "service_Capi{{ current_cluster.name_suffix }}"
-    _export_ds_id: "{{ current_cluster.image_ds_id }}"
+    ensure_app_name: "{{ gpu_benchmark.k8s.capi_app_name }}"
+    ensure_name: "service_Capi{{ current_cluster.name_suffix }}"
+    ensure_ds_id: "{{ current_cluster.image_ds_id }}"
+    ensure_role: gpu-benchmark
+    ensure_cluster: "{{ current_cluster.name | d('') }}"
+    ensure_apply_extra: false
 
 - name: Remember the Capi template and names
   ansible.builtin.set_fact:
@@ -138,21 +147,56 @@
 # timeout 300 around each install: the get-helm-3 script fetches its own
 # tarball with an unbounded curl — a stalled TCP session (seen on this
 # lab's throttled CDN paths) must fail, not hang the play.
+# HELM_INSTALLED/KUBECTL_INSTALLED markers: the manifest must record the
+# binary as 'created' ONLY when THIS run put it there — a pre-installed
+# tool is never manifest-owned and never removed by the sweep.
 - name: Install helm and kubectl on the frontend if missing
   become: true
   ansible.builtin.shell: |
     set -o errexit -o pipefail
     install -d -m 0755 /usr/local/bin
-    command -v helm >/dev/null 2>&1 || timeout 300 bash -c \
-      'curl -fsSL --connect-timeout 15 --max-time 120 https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash'
-    command -v kubectl >/dev/null 2>&1 || timeout 300 bash -c \
-      'curl -fsSL --connect-timeout 15 --max-time 240 "https://dl.k8s.io/release/$(curl -fsSL --connect-timeout 15 --max-time 30 https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" | install -o root -g root -m 0755 -D /dev/fd/0 /usr/local/bin/kubectl'
+    if ! command -v helm >/dev/null 2>&1; then
+      timeout 300 bash -c \
+        'curl -fsSL --connect-timeout 15 --max-time 120 https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash'
+      echo HELM_INSTALLED
+    fi
+    if ! command -v kubectl >/dev/null 2>&1; then
+      timeout 300 bash -c \
+        'curl -fsSL --connect-timeout 15 --max-time 240 "https://dl.k8s.io/release/$(curl -fsSL --connect-timeout 15 --max-time 30 https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" | install -o root -g root -m 0755 -D /dev/fd/0 /usr/local/bin/kubectl'
+      echo KUBECTL_INSTALLED
+    fi
     helm version --short
     kubectl version --client
   args:
     executable: /bin/bash
   register: _k8s_tools
-  changed_when: false
+  changed_when: "'HELM_INSTALLED' in _k8s_tools.stdout or 'KUBECTL_INSTALLED' in _k8s_tools.stdout"
+
+- name: "Manifest: register installed helm binary"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: manifest_add.yml
+  vars:
+    manifest_type: file
+    manifest_id: ""
+    manifest_name: /usr/local/bin/helm
+    manifest_cluster: "{{ current_cluster.name | d('') }}"
+    manifest_role: gpu-benchmark
+    manifest_disposition: created
+  when: "'HELM_INSTALLED' in _k8s_tools.stdout"
+
+- name: "Manifest: register installed kubectl binary"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: manifest_add.yml
+  vars:
+    manifest_type: file
+    manifest_id: ""
+    manifest_name: /usr/local/bin/kubectl
+    manifest_cluster: "{{ current_cluster.name | d('') }}"
+    manifest_role: gpu-benchmark
+    manifest_disposition: created
+  when: "'KUBECTL_INSTALLED' in _k8s_tools.stdout"
 
 # The k3s API inside the capi VM takes a while on first boot; the fetch is
 # retried as a whole (ssh + sed + kubectl smoke test). Runs as ROOT (the

@@ -1,14 +1,14 @@
 # Template for the test network
-NAME        = "{{ _cluster_vnet_name | d(validation.test_vm.vnet_name) }}"
+NAME        = "{{ _ensure_vnet_name | d(validation.test_vm.vnet_name) }}"
 DESCRIPTION = "{{ validation.test_vm.vnet.desc }}"
 
 VN_MAD = {{ validation.test_vm.vnet.vn_mad }}
 
-{% if validation.test_vm.vnet.bridge is not none %}
+{% if validation.test_vm.vnet.bridge | d(none) is not none %}
 BRIDGE = {{ validation.test_vm.vnet.bridge | d('br-test') }}
 {% endif %}
 
-{% if validation.test_vm.vnet.phydev is not none %}
+{% if validation.test_vm.vnet.phydev | d(none) is not none %}
 PHYDEV = {{ validation.test_vm.vnet.phydev }}
 {% endif %}
 

@@ -1,35 +1,120 @@
 ---
-# 1) Generate SSH key on node hosts
-- name: Generate SSH key and expose public key (node)
-  include_tasks: node_generate_key.yml
-  when: "(validation.run_conn_matrix | d(true)) and (node_group | d('node')) in group_names"
+# Connectivity matrix test. Runs in ONE play spanning node and frontend hosts
+# (playbooks/validation.yml); every step is routed to the right hosts via the
+# _cm_is_node / _cm_is_primary_frontend block vars. The primary-frontend
+# routing deliberately compares ansible_host (not inventory_hostname) to
+# match inventories where the same machine is listed under several names.
+#
+# Harness shape: block (test) / rescue (record failure) / always (record the
+# overall result, then state-independent cleanup on both host kinds).
 
-# 2) Collect all public keys to localhost (run once)
-- name: Collect all public keys into a dictionary (localhost)
-  include_tasks: collect_pubkeys.yml
-  when: "(validation.run_conn_matrix | d(true)) and hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host"
+- name: "Conn matrix: skip — cluster discovery failed"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "Connectivity matrix"
+    result_value: "skipped — cluster discovery failed"
+  when:
+    - validation.run_conn_matrix | d(false)
+    - hostvars[groups[frontend_group | d('frontend')][0]].odv_discovery_failed | d(false)
+    - hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host
 
-# 3) On frontend primary create VMs and build mapping
-- name: Create VMs and build host->VM mapping (frontend primary)
-  include_tasks: frontend_create_vms.yml
-  when: "(validation.run_conn_matrix | d(true)) and hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host"
+- name: Connectivity matrix
+  vars:
+    _cm_is_primary_frontend: "{{ hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host }}"
+    _cm_is_node: "{{ (node_group | d('node')) in group_names }}"
+  when:
+    - validation.run_conn_matrix | d(false)
+    - not (hostvars[groups[frontend_group | d('frontend')][0]].odv_discovery_failed | d(false))
+  block:
+    - name: "Debug: induced failure hook"
+      ansible.builtin.fail:
+        msg: "Induced failure (validation.debug.fail_in=conn_matrix)"
+      when: (odv_fail_in | d((validation.debug | d({})).fail_in | d(''))) == 'conn_matrix'
 
-# 4) On node hosts run the connectivity tests
-- name: Run connectivity tests from node hosts
-  include_tasks: node_run_tests.yml
-  when: "(validation.run_conn_matrix | d(true)) and (node_group | d('node')) in group_names"
+    - name: Generate SSH key and expose public key (node)
+      ansible.builtin.include_tasks: node_generate_key.yml
+      when: _cm_is_node
 
-# 5) Render report on localhost (run once)
-- name: Render the connection matrix report (localhost)
-  include_tasks: render_report.yml
-  when: "(validation.run_conn_matrix | d(true)) and hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host"
+    - name: Collect all public keys into a dictionary (frontend primary)
+      ansible.builtin.include_tasks: collect_pubkeys.yml
+      when: _cm_is_primary_frontend
 
-# 6) Cleanup on node hosts
-- name: Cleanup node-side artifacts
-  include_tasks: cleanup.yml
-  when: "(validation.run_conn_matrix | d(true)) and (node_group | d('node')) in group_names"
+    - name: Create VMs and build host->VM mapping (frontend primary)
+      ansible.builtin.include_tasks: frontend_create_vms.yml
+      when: _cm_is_primary_frontend
 
-# 7) Cleanup on frontend primary
-- name: Cleanup frontend-side artifacts (frontend primary)
-  include_tasks: frontend_cleanup.yml
-  when: "(validation.run_conn_matrix | d(true)) and hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host"
+    - name: Run connectivity tests from node hosts
+      ansible.builtin.include_tasks: node_run_tests.yml
+      when: _cm_is_node
+
+    - name: Render the connection matrix report (frontend primary)
+      ansible.builtin.include_tasks: render_report.yml
+      when: _cm_is_primary_frontend
+
+  rescue:
+    - name: Record connectivity matrix failure (frontend primary)
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_failure.yml
+      vars:
+        failure_key: "Connectivity matrix"
+      when: _cm_is_primary_frontend
+
+    # Only the failed host runs its rescue, so a node-side failure is
+    # invisible to the frontend here. Every failed host raises a flag that
+    # the frontend reads in `always` — the linear strategy runs all rescue
+    # task slots before any always task slot, so the flag is visible there.
+    - name: Flag this host as failed for the overall result
+      ansible.builtin.set_fact:
+        conn_matrix_failed: true
+
+  always:
+    - name: Compute hosts where the connectivity matrix failed (frontend primary)
+      ansible.builtin.set_fact:
+        _cm_failed_hosts: >-
+          {{ ansible_play_hosts_all
+             | map('extract', hostvars)
+             | selectattr('conn_matrix_failed', 'defined')
+             | selectattr('conn_matrix_failed', 'equalto', true)
+             | map(attribute='inventory_hostname')
+             | list }}
+      when: _cm_is_primary_frontend
+
+    # If the frontend itself failed, record_failure.yml already wrote the key
+    # (with error detail) — the 'not in verification_result' guard prevents
+    # overwriting it. Per-host VM-creation failures use their own keys and do
+    # not block an overall 'ok'.
+    - name: Record overall connectivity matrix success (frontend primary)
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Connectivity matrix"
+        result_value: "ok"
+      when:
+        - _cm_is_primary_frontend
+        - _cm_failed_hosts | d([]) | length == 0
+        - "'Connectivity matrix' not in (verification_result | d({}))"
+
+    - name: Record node-side connectivity matrix failure (frontend primary)
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Connectivity matrix"
+        result_value: "failed"
+        result_comment: "failed on: {{ _cm_failed_hosts | d([]) | join(', ') }}"
+      when:
+        - _cm_is_primary_frontend
+        - _cm_failed_hosts | d([]) | length > 0
+        - "'Connectivity matrix' not in (verification_result | d({}))"
+
+    - name: Cleanup node-side artifacts
+      ansible.builtin.include_tasks: cleanup.yml
+      when: _cm_is_node
+
+    - name: Cleanup frontend-side artifacts (frontend primary)
+      ansible.builtin.include_tasks: frontend_cleanup.yml
+      when: _cm_is_primary_frontend

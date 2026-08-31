@@ -40,7 +40,7 @@
     ansible.builtin.shell: >
       onevm list --f ID={{vm_id.stdout.split(':')[1] | trim}} -l IP --no-header
     register: vm_ip
-    failed_when: "vm_state.rc != 0"
+    failed_when: "vm_ip.rc != 0"
   
   - name: Verify connection to the test VM
     ansible.builtin.shell: >
@@ -51,8 +51,12 @@
     delay: 10
   
   - name: Record connection status to test VM
-    set_fact:
-      verification_result: "{{ verification_result | combine({'Connection to the test VM instance' ~ current_cluster.report_suffix : 'ok' }) }}"
+    ansible.builtin.include_role:
+      name: validation_common
+      tasks_from: record_result.yml
+    vars:
+      result_key: "Connection to the test VM instance{{ current_cluster.report_suffix }}"
+      result_value: "ok"
 
   #onevm ssh --cmd "onegate vm show" {{ vm_id.stdout.split(':')[1] | trim }}
   - name: Check if onegate is running OK on the VM
@@ -66,3 +70,12 @@
   - name: Show last result
     ansible.builtin.debug:
       var: vm_onegate_result
+
+- name: Record connection check skipped
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "Connection to the test VM instance{{ current_cluster.report_suffix }}"
+    result_value: "skipped — validation.test_vm.vm.check_connection is false"
+  when: not (validation.test_vm.vm.check_connection | bool)

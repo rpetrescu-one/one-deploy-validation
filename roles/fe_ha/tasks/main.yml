@@ -1,255 +1,469 @@
 ---
-
-- setup:
-    gather_subset:
-    - min
-
-- name: Install required task dependencies
-  ansible.builtin.package:
-    name:
-      - jq
-    state: present
-
-# Check VIP reachability from all the FE nodes
-- name: Check connection to API through a VIP from all FEs
-  ansible.builtin.wait_for:
-    host: "{{ one_vip }}"
-    port: 2633
-  register: vip_reachability
-   
-- name: Verify VIP reachability from all FEs
-  debug:
-    msg: "{{ vip_reachability.state }}"
-
-- name: Save VIP reachability from all FEs
-  set_fact:
-    verification_result: "{{ (verification_result | default({})) | combine({'VIP connectivity from all FEs': 'ok'}) }}"
-
-
-# Get zone details from the first FE, Assuming state set to 3 is the leader state
-- name: Get Zone
-  ansible.builtin.shell:
-    cmd: onezone show "{{ validation.fe_ha.one_zone_name }}" -j | jq -r '.ZONE.SERVER_POOL.SERVER | .[] |select(.STATE == "3") | .NAME'
-  register: zone_details 
-  ignore_errors: true
-  when: hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host 
-  run_once: true    
-
-# Test to verify that content of /etc/one directory is the same at all FE nodes
-- name: Check content of the config directories
-  find:
-    path: "{{ item }}"
-    file_type: file
-    recurse: true 
-  register: found_files
-  loop: "{{ validation.fe_ha.one_config_path }}"
-
-- name: Set combined list 
-  set_fact:
-    combined_file_list: "{{ combined_file_list | default([]) + item.files }}"
-  loop: "{{ found_files.results }}"
-
-- name: Set config diff exclude patterns
-  ansible.builtin.set_fact:
-    config_diff_exclude_patterns: "{{ validation.fe_ha.config_diff_exclude_patterns | default(['\\.bak$']) }}"
-
-- name: Exclude configured files from config diff
-  ansible.builtin.set_fact:
-    combined_file_list: "{{ combined_file_list | rejectattr('path', 'search', item) | list }}"
-  loop: "{{ config_diff_exclude_patterns }}"
-  when: config_diff_exclude_patterns | length > 0
-
-- name: Read config files without changing disk
-  ansible.builtin.slurp:
-    src: "{{ item.path }}"
-  loop: "{{ combined_file_list }}"
-  register: config_file_contents_raw
-  no_log: true
-
-- name: Save sanitized config file content per host
-  ansible.builtin.set_fact:
-    config_file_contents: >-
-      {{
-        config_file_contents | default({}) | combine({
-          item.item.path: (
-            (item.content | b64decode)
-            | regex_replace('(?m)^\s*SERVER_ID\s*=.*(?:\n|$)', '')
-            if item.item.path == '/etc/one/oned.conf'
-            else (item.content | b64decode)
-          )
-        })
-      }}
-  loop: "{{ config_file_contents_raw.results }}"
-  when:
-    - item.content is defined
-    - not item.failed | default(false)
-  no_log: true
-
-- name: Build complete config file list across FE nodes
-  ansible.builtin.set_fact:
-    all_config_files: >-
-      {{
-        groups[frontend_group | d('frontend')]
-        | map('extract', hostvars, 'config_file_contents')
-        | map('default', {})
-        | map('dict2items')
-        | flatten
-        | map(attribute='key')
-        | unique
-        | sort
-      }}
-    config_reference_host: "{{ groups[frontend_group | d('frontend')][0] }}"
-    config_differences: {}
-  run_once: true
-
-- name: Compare sanitized config file contents across all FE nodes
-  ansible.builtin.set_fact:
-    config_differences: >-
-      {{
-        config_differences | combine({
-          item.0: (
-            config_differences.get(item.0, {}) | combine({
-              item.1: {
-                'status': 'file presence differs' if not (ref_has_file | bool and host_has_file | bool) else 'content differs',
-                'reference_host': config_reference_host,
-                'reference_present': ref_has_file | bool,
-                'host_present': host_has_file | bool,
-                'reference_line_count': (reference_files[item.1].splitlines() | length) if ref_has_file | bool else 0,
-                'host_line_count': (host_files[item.1].splitlines() | length) if host_has_file | bool else 0,
-                'reference_sha256': (reference_files[item.1] | hash('sha256')) if ref_has_file | bool else '',
-                'host_sha256': (host_files[item.1] | hash('sha256')) if host_has_file | bool else '',
-                'reference_only_lines': (reference_files[item.1].splitlines() | difference(host_files[item.1].splitlines())) if ref_has_file | bool and host_has_file | bool else (reference_files[item.1].splitlines() if ref_has_file | bool else []),
-                'host_only_lines': (host_files[item.1].splitlines() | difference(reference_files[item.1].splitlines())) if ref_has_file | bool and host_has_file | bool else (host_files[item.1].splitlines() if host_has_file | bool else [])
-              }
-            })
-          )
-        }, recursive=True)
-      }}
-  loop: "{{ (groups[frontend_group | d('frontend')] | difference([config_reference_host])) | product(all_config_files) | list }}"
-  vars:
-    reference_files: "{{ hostvars[config_reference_host].config_file_contents | default({}) }}"
-    host_files: "{{ hostvars[item.0].config_file_contents | default({}) }}"
-    ref_has_file: "{{ item.1 in reference_files }}"
-    host_has_file: "{{ item.1 in host_files }}"
-  when: >-
-    not (ref_has_file | bool and host_has_file | bool)
-    or reference_files[item.1] != host_files[item.1]
-  no_log: true
-  run_once: true
-
-- name: Build config comparison report
-  ansible.builtin.set_fact:
-    config_diff_report:
-      status: "{{ 'error - config file differences found' if config_differences | length > 0 else 'ok' }}"
-      reference_host: "{{ config_reference_host }}"
-      exclude_patterns: "{{ config_diff_exclude_patterns }}"
-      differences: "{{ config_differences }}"
-  no_log: true
-  run_once: true
-
-- name: Save file content checks
-  ansible.builtin.set_fact:
-    verification_result: >-
-      {{
-        verification_result | combine({
-          'Check content of the config directory for file diffs at all FE nodes':
-            config_diff_report.status
-        })
-      }}
-    verification_comments: >-
-      {{
-        verification_comments | default({}) | combine({
-          'Check content of the config directory for file diffs at all FE nodes':
-            config_diff_report
-        })
-      }}
-  run_once: true
-
-### Leader failover tests
+# FE HA validation — always-clean / run-to-completion harness.
 #
-- name: Set initial leader node
-  set_fact:
-    initial_leader: "{{ zone_details.stdout }}"
-  run_once: true
+# Shape:
+#   entry guards -> record 'skipped — <reason>' and do nothing else
+#   block        -> VIP check, leader discovery, config-dir diff, leader failover
+#   rescue       -> record 'FE HA validation: failed' (+ error detail)
+#   always       -> 1) restart oned on the initial leader (idempotent, tolerant)
+#                   2) odv_leftovers row if that restart did not work
+#                   3) render the standalone /tmp/fe_ha_report.html (run_once)
+#
+# Leadership/VIP migration is deliberately NOT reverted — a migrated leader is
+# a valid HA state; the report documents the before/after leaders.
 
-- name: Display current leder node
-  debug:
-    msg: "Current leader node is {{ initial_leader }}"
-
-- name: Save Initial Leader node
-  set_fact:
-    verification_result: "{{ verification_result | combine({'Initial FE leader node': initial_leader }) }}"
-
-
-- name: Stop OpenNebula oned service on the current leader to simulate failure
-  systemd:
-    name: opennebula
-    state: stopped
-  delegate_to: "{{ initial_leader }}" # Stop service on the identified leader
-  #when: ansible_host  == initial_leader
-  run_once: true
-
-  # Give OpenNebula's internal HA mechanism time to elect a new leader  
-- name: Wait for leader failover
-  pause:
-    seconds: 20 
-  run_once: true 
-  
-- name: Check that one VIP was migrated and reachable from all FE nodes
-  ansible.builtin.wait_for:
-    host: "{{ one_vip }}"
-    port: 2633
-  register: vip_reachability
-
-- name: Save VIP reachability post migration
-  set_fact:
-    verification_result: "{{ verification_result | combine({'VIP reachability after leader migration': 'ok' }) }}" 
-  
-- name: Verify VIP reachability from all FEs
-  debug:
-    msg: "{{ vip_reachability.state }}"
-
-
-- name: Get a new leader id
-  ansible.builtin.shell:
-    cmd: onezone show "{{ one_zone_name }}" -j | jq -r '.ZONE.SERVER_POOL.SERVER | .[] |select(.STATE == "3") | .NAME'
-  register: migrated_leader
-  ignore_errors: true
-  when: initial_leader != ansible_host
-  run_once: true
-  
-- name: Set a new leader node
-  set_fact:
-    migrated_leader: "{{ migrated_leader.stdout }}"
-  #delegate_to: 
-  #when: hostvars[groups[frontend_group | d('frontend')][1]]['ansible_host'] == ansible_host    
-  run_once: true
-
-- name: Save a new Leader node
-  set_fact:
-    verification_result: "{{ verification_result | combine({'A new FE leader node after the failover': migrated_leader }) }}"
-
-- name: Check that a leader indeed new
-  debug:
-    msg: "Original leader: {{ initial_leader }} a new leader is: {{ migrated_leader }}"
-  when: initial_leader != migrated_leader
-  run_once: true
-
-  # Start OpenNebula service on the original leader
-- name: Recover stopped leader
-  systemd:
-    name: opennebula
-    state: started
-  delegate_to: "{{ initial_leader }}"
-  run_once: true
-
-- name: Render results template
-  delegate_to: localhost
-  become: false
+- name: "FE HA: skip — cluster discovery failed"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
   vars:
-    date: "{{ '%Y-%m-%d %H:%M:%S' | strftime(ansible_date_time.epoch) }}"
-  template:
-    src: report_template.j2
-    dest: /tmp/fe_ha_report.html
-  ignore_errors: True
+    result_key: "FE HA validation"
+    result_value: "skipped — cluster discovery failed"
+  when: hostvars[groups[frontend_group | d('frontend')][0]].odv_discovery_failed | d(false)
 
+- name: "FE HA: skip — one_vip not defined"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "FE HA validation"
+    result_value: "skipped — one_vip is not defined in the inventory (HA frontend deployment required)"
+  when:
+    - not (hostvars[groups[frontend_group | d('frontend')][0]].odv_discovery_failed | d(false))
+    - one_vip is not defined
+
+- name: "FE HA validation"
+  when:
+    - not (hostvars[groups[frontend_group | d('frontend')][0]].odv_discovery_failed | d(false))
+    - one_vip is defined
+  block:
+    - name: "Debug: induced failure hook"
+      ansible.builtin.fail:
+        msg: "Induced failure (validation.debug.fail_in=fe_ha)"
+      when: (odv_fail_in | d((validation.debug | d({})).fail_in | d(''))) == 'fe_ha'
+
+    - name: "FE HA: gather minimal facts"
+      ansible.builtin.setup:
+        gather_subset:
+          - min
+
+    # One resolved value used by BOTH onezone lookups (old main.yml:32 vs :215
+    # used two different variables — that inconsistency is the bug being fixed).
+    - name: "FE HA: resolve effective zone name and VIP timeout"
+      ansible.builtin.set_fact:
+        fe_ha_zone_name: "{{ (validation.fe_ha | d({})).one_zone_name | d(one_zone_name) }}"
+        fe_ha_vip_timeout: "{{ (validation.fe_ha | d({})).vip_timeout | d(one_vip_timeout) }}"
+
+    - name: "FE HA: install required task dependencies (jq)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: install_packages_tracked.yml
+      vars:
+        pkg_names: [jq]
+        pkg_role: fe-ha
+
+    # ---------- Check 1: VIP reachability from every FE -------------------
+    - name: "FE HA: check API reachability through the VIP from all FEs"
+      ansible.builtin.wait_for:
+        host: "{{ one_vip }}"
+        port: 2633
+        timeout: "{{ fe_ha_vip_timeout }}"
+      register: vip_check_initial
+      failed_when: false
+
+    # wait_for returns state == 'started' on success; on timeout (masked by
+    # failed_when: false) 'state' is absent. Aggregate across all FEs so the
+    # single report row reflects every frontend.
+    - name: "FE HA: collect FEs where the VIP is unreachable"
+      ansible.builtin.set_fact:
+        fe_ha_vip_failed_initial: >-
+          {%- set failed = [] -%}
+          {%- for fe in groups[frontend_group | d('frontend')] -%}
+            {%- if ((hostvars[fe].vip_check_initial | d({})).state | d('')) != 'started' -%}
+              {%- set _ = failed.append(fe) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ failed }}
+
+    - name: "FE HA: record VIP connectivity from all FEs (ok)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "VIP connectivity from all FEs"
+        result_value: "ok"
+      when: fe_ha_vip_failed_initial | length == 0
+
+    - name: "FE HA: record VIP connectivity from all FEs (failed)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "VIP connectivity from all FEs"
+        result_value: "failed"
+        result_comment: "VIP {{ one_vip }}:2633 not reachable within {{ fe_ha_vip_timeout }}s from: {{ fe_ha_vip_failed_initial | join(', ') }}"
+      when: fe_ha_vip_failed_initial | length > 0
+
+    # Deliberate abort into rescue: stopping the leader on a cloud whose VIP is
+    # already down would only make things worse. always still runs (restore+report).
+    - name: "FE HA: abort — VIP dead before the failover test"
+      ansible.builtin.fail:
+        msg: >-
+          VIP {{ one_vip }}:2633 unreachable from {{ fe_ha_vip_failed_initial | join(', ') }} —
+          refusing to stop the leader while the VIP is already down
+      when: fe_ha_vip_failed_initial | length > 0
+
+    # ---------- Leader discovery ------------------------------------------
+    # Replaces the old run_once + ansible_host-comparison when (main.yml:30-36):
+    # explicit delegation to the first frontend, no ordering fragility, no
+    # ignore_errors (a real failure lands in rescue, always restores nothing
+    # because initial_leader is still undefined at that point).
+    - name: "FE HA: query the current zone leader"
+      ansible.builtin.shell:
+        cmd: onezone show "{{ fe_ha_zone_name }}" -j | jq -r '.ZONE.SERVER_POOL.SERVER | .[] | select(.STATE == "3") | .NAME'
+      register: zone_details
+      delegate_to: "{{ groups[frontend_group | d('frontend')][0] }}"
+      run_once: true
+      changed_when: false
+
+    - name: "FE HA: fail if no zone leader was found"
+      ansible.builtin.fail:
+        msg: "onezone show '{{ fe_ha_zone_name }}' reported no server with STATE 3 (leader); stdout='{{ zone_details.stdout | d('') }}'"
+      when: (zone_details.stdout | d('') | trim) == ''
+
+    - name: "FE HA: set initial leader node"
+      ansible.builtin.set_fact:
+        initial_leader: "{{ zone_details.stdout | trim }}"
+      run_once: true
+
+    - name: "FE HA: display current leader node"
+      ansible.builtin.debug:
+        msg: "Current leader node is {{ initial_leader }}"
+
+    - name: "FE HA: record initial FE leader node"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Initial FE leader node"
+        result_value: "{{ initial_leader }}"
+
+    # ---------- Check 2: /etc/one config parity across FEs ----------------
+    - name: "FE HA: reset config comparison accumulators"
+      ansible.builtin.set_fact:
+        combined_file_list: []
+        config_file_contents: {}
+
+    - name: Check content of the config directories
+      ansible.builtin.find:
+        path: "{{ item }}"
+        file_type: file
+        recurse: true
+      register: found_files
+      loop: "{{ (validation.fe_ha | d({})).one_config_path | d(one_config_path) }}"
+
+    - name: Set combined list
+      ansible.builtin.set_fact:
+        combined_file_list: "{{ combined_file_list + item.files }}"
+      loop: "{{ found_files.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Set config diff exclude patterns
+      ansible.builtin.set_fact:
+        config_diff_exclude_patterns: "{{ (validation.fe_ha | d({})).config_diff_exclude_patterns | default(['\\.bak$']) }}"
+
+    - name: Exclude configured files from config diff
+      ansible.builtin.set_fact:
+        combined_file_list: "{{ combined_file_list | rejectattr('path', 'search', item) | list }}"
+      loop: "{{ config_diff_exclude_patterns }}"
+      when: config_diff_exclude_patterns | length > 0
+
+    - name: Read config files without changing disk
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      loop: "{{ combined_file_list }}"
+      register: config_file_contents_raw
+      no_log: true
+
+    - name: Save sanitized config file content per host
+      ansible.builtin.set_fact:
+        config_file_contents: >-
+          {{
+            config_file_contents | default({}) | combine({
+              item.item.path: (
+                (item.content | b64decode)
+                | regex_replace('(?m)^\s*SERVER_ID\s*=.*(?:\n|$)', '')
+                if item.item.path == '/etc/one/oned.conf'
+                else (item.content | b64decode)
+              )
+            })
+          }}
+      loop: "{{ config_file_contents_raw.results }}"
+      when:
+        - item.content is defined
+        - not item.failed | default(false)
+      no_log: true
+
+    - name: Build complete config file list across FE nodes
+      ansible.builtin.set_fact:
+        all_config_files: >-
+          {{
+            groups[frontend_group | d('frontend')]
+            | map('extract', hostvars, 'config_file_contents')
+            | map('default', {})
+            | map('dict2items')
+            | flatten
+            | map(attribute='key')
+            | unique
+            | sort
+          }}
+        config_reference_host: "{{ groups[frontend_group | d('frontend')][0] }}"
+        config_differences: {}
+      run_once: true
+
+    - name: Compare sanitized config file contents across all FE nodes
+      ansible.builtin.set_fact:
+        config_differences: >-
+          {{
+            config_differences | combine({
+              item.0: (
+                config_differences.get(item.0, {}) | combine({
+                  item.1: {
+                    'status': 'file presence differs' if not (ref_has_file | bool and host_has_file | bool) else 'content differs',
+                    'reference_host': config_reference_host,
+                    'reference_present': ref_has_file | bool,
+                    'host_present': host_has_file | bool,
+                    'reference_line_count': (reference_files[item.1].splitlines() | length) if ref_has_file | bool else 0,
+                    'host_line_count': (host_files[item.1].splitlines() | length) if host_has_file | bool else 0,
+                    'reference_sha256': (reference_files[item.1] | hash('sha256')) if ref_has_file | bool else '',
+                    'host_sha256': (host_files[item.1] | hash('sha256')) if host_has_file | bool else '',
+                    'reference_only_lines': (reference_files[item.1].splitlines() | difference(host_files[item.1].splitlines())) if ref_has_file | bool and host_has_file | bool else (reference_files[item.1].splitlines() if ref_has_file | bool else []),
+                    'host_only_lines': (host_files[item.1].splitlines() | difference(reference_files[item.1].splitlines())) if ref_has_file | bool and host_has_file | bool else (host_files[item.1].splitlines() if host_has_file | bool else [])
+                  }
+                })
+              )
+            }, recursive=True)
+          }}
+      loop: "{{ (groups[frontend_group | d('frontend')] | difference([config_reference_host])) | product(all_config_files) | list }}"
+      vars:
+        reference_files: "{{ hostvars[config_reference_host].config_file_contents | default({}) }}"
+        host_files: "{{ hostvars[item.0].config_file_contents | default({}) }}"
+        ref_has_file: "{{ item.1 in reference_files }}"
+        host_has_file: "{{ item.1 in host_files }}"
+      when: >-
+        not (ref_has_file | bool and host_has_file | bool)
+        or reference_files[item.1] != host_files[item.1]
+      no_log: true
+      run_once: true
+
+    - name: Build config comparison report
+      ansible.builtin.set_fact:
+        config_diff_report:
+          status: "{{ 'error - config file differences found' if config_differences | length > 0 else 'ok' }}"
+          reference_host: "{{ config_reference_host }}"
+          exclude_patterns: "{{ config_diff_exclude_patterns }}"
+          differences: "{{ config_differences }}"
+      no_log: true
+      run_once: true
+
+    - name: "FE HA: record config directory diff check"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Check content of the config directory for file diffs at all FE nodes"
+        result_value: "{{ config_diff_report.status }}"
+        result_comment: "{{ config_diff_report }}"
+
+    # ---------- Check 3: leader failover ----------------------------------
+    - name: "FE HA: stop oned on the current leader to simulate failure"
+      ansible.builtin.systemd:
+        name: opennebula
+        state: stopped
+      delegate_to: "{{ initial_leader }}"
+      become: true
+      run_once: true
+
+    - name: "FE HA: wait for leader failover"
+      ansible.builtin.pause:
+        seconds: 20
+      run_once: true
+
+    - name: "FE HA: check the VIP migrated and is reachable from all FEs"
+      ansible.builtin.wait_for:
+        host: "{{ one_vip }}"
+        port: 2633
+        timeout: "{{ fe_ha_vip_timeout }}"
+      register: vip_check_migrated
+      failed_when: false
+
+    - name: "FE HA: collect FEs where the VIP is unreachable after migration"
+      ansible.builtin.set_fact:
+        fe_ha_vip_failed_migrated: >-
+          {%- set failed = [] -%}
+          {%- for fe in groups[frontend_group | d('frontend')] -%}
+            {%- if ((hostvars[fe].vip_check_migrated | d({})).state | d('')) != 'started' -%}
+              {%- set _ = failed.append(fe) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ failed }}
+
+    # Post-migration VIP failure is recorded but does NOT abort: we still want
+    # the new-leader query attempt and, above all, the always-block restore.
+    - name: "FE HA: record VIP reachability after leader migration (ok)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "VIP reachability after leader migration"
+        result_value: "ok"
+      when: fe_ha_vip_failed_migrated | length == 0
+
+    - name: "FE HA: record VIP reachability after leader migration (failed)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "VIP reachability after leader migration"
+        result_value: "failed"
+        result_comment: "after stopping oned on {{ initial_leader }}, VIP {{ one_vip }}:2633 not reachable within {{ fe_ha_vip_timeout }}s from: {{ fe_ha_vip_failed_migrated | join(', ') }}"
+      when: fe_ha_vip_failed_migrated | length > 0
+
+    # Query a frontend that is NOT the stopped leader (its local oned is down).
+    - name: "FE HA: query the new zone leader from a surviving FE"
+      ansible.builtin.shell:
+        cmd: onezone show "{{ fe_ha_zone_name }}" -j | jq -r '.ZONE.SERVER_POOL.SERVER | .[] | select(.STATE == "3") | .NAME'
+      register: migrated_leader_cmd
+      vars:
+        fe_ha_survivors: "{{ groups[frontend_group | d('frontend')] | difference([initial_leader]) }}"
+      delegate_to: "{{ fe_ha_survivors | first | d(groups[frontend_group | d('frontend')][0]) }}"
+      run_once: true
+      changed_when: false
+
+    - name: "FE HA: set the new leader node"
+      ansible.builtin.set_fact:
+        migrated_leader: "{{ migrated_leader_cmd.stdout | trim }}"
+      run_once: true
+
+    - name: "FE HA: display leader change"
+      ansible.builtin.debug:
+        msg: "Original leader: {{ initial_leader }} — new leader: {{ migrated_leader }}"
+
+    - name: "FE HA: record the new FE leader after the failover (ok)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "A new FE leader node after the failover"
+        result_value: "{{ migrated_leader }}"
+      when:
+        - migrated_leader != ''
+        - migrated_leader != initial_leader
+
+    - name: "FE HA: record the new FE leader after the failover (failed)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "A new FE leader node after the failover"
+        result_value: "failed"
+        result_comment: "no new leader elected after stopping oned on {{ initial_leader }} (onezone leader query returned '{{ migrated_leader }}')"
+      when: migrated_leader == '' or migrated_leader == initial_leader
+
+    # ---------- Overall verdict -------------------------------------------
+    - name: "FE HA: compute failed sub-checks"
+      ansible.builtin.set_fact:
+        fe_ha_failed_subchecks: >-
+          {{ (['VIP reachability after leader migration'] if fe_ha_vip_failed_migrated | length > 0 else [])
+             + (['A new FE leader node after the failover'] if (migrated_leader == '' or migrated_leader == initial_leader) else [])
+             + (['Check content of the config directory for file diffs at all FE nodes'] if config_diff_report.status != 'ok' else []) }}
+
+    - name: "FE HA: record overall result (ok)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "FE HA validation"
+        result_value: "ok"
+      when: fe_ha_failed_subchecks | length == 0
+
+    - name: "FE HA: record overall result (failed sub-checks)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "FE HA validation"
+        result_value: "failed"
+        result_comment: "failed sub-checks: {{ fe_ha_failed_subchecks | join('; ') }}"
+      when: fe_ha_failed_subchecks | length > 0
+
+  rescue:
+    - name: "Record FE HA validation failure"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_failure.yml
+      vars:
+        failure_key: "FE HA validation"
+
+  always:
+    # 1) Restore oned on the original leader FIRST. Idempotent (state: started
+    #    on a running unit is a no-op), tolerant (failed_when: false masks a
+    #    start failure, ignore_unreachable a dead leader) — an always task must
+    #    never abort the run. Skipped only when the block failed before the
+    #    leader was even identified (nothing was stopped in that case).
+    - name: "FE HA always: ensure oned is started on the initial leader"
+      ansible.builtin.systemd:
+        name: opennebula
+        state: started
+      register: fe_ha_leader_restore
+      delegate_to: "{{ initial_leader }}"
+      run_once: true
+      become: true
+      failed_when: false
+      ignore_unreachable: true
+      when: initial_leader is defined
+
+    # 2) Read back the real unit state (failed_when: false above hides the
+    #    module's own failure flag, so verify explicitly).
+    - name: "FE HA always: check oned state on the initial leader"
+      ansible.builtin.command: systemctl is-active opennebula
+      register: fe_ha_leader_state
+      delegate_to: "{{ initial_leader }}"
+      run_once: true
+      become: true
+      changed_when: false
+      failed_when: false
+      ignore_unreachable: true
+      when: initial_leader is defined
+
+    # 3) Leftover row ONLY when the restore did not take. Recorded on the first
+    #    frontend (the host whose facts the final report reads) exactly once.
+    - name: "FE HA always: record unrestored leader as a leftover"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_leftover.yml
+      vars:
+        leftover_type: host_state
+        leftover_name: "{{ initial_leader }}"
+        leftover_role: fe-ha
+        leftover_detail: "systemd unit 'opennebula' (oned) on the original FE leader {{ initial_leader }} could not be restarted; systemctl is-active reports '{{ fe_ha_leader_state.stdout | d('unreachable') }}' (restore msg: {{ fe_ha_leader_restore.msg | d('n/a') }})"
+      when:
+        - initial_leader is defined
+        - inventory_hostname == groups[frontend_group | d('frontend')][0]
+        - (fe_ha_leader_state.stdout | d('')) != 'active'
+
+    # 4) Standalone report renders exactly once, from the first frontend's
+    #    facts, in every outcome (success, rescue, partial run).
+    - name: "FE HA always: render standalone FE HA report"
+      ansible.builtin.template:
+        src: report_template.j2
+        dest: /tmp/fe_ha_report.html
+      delegate_to: localhost
+      become: false
+      run_once: true
+      failed_when: false
+      vars:
+        date: "{{ lookup('pipe', 'date +%Y-%m-%d\\ %H:%M:%S') }}"
+        verification_result: "{{ hostvars[groups[frontend_group | d('frontend')][0]].verification_result | d({}) }}"
+        verification_comments: "{{ hostvars[groups[frontend_group | d('frontend')][0]].verification_comments | d({}) }}"

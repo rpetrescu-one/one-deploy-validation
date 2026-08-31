@@ -1,0 +1,23 @@
+---
+# Symmetric counterpart to manifest_add.yml: appends one row to the per-host
+# odv_leftovers fact. Call it whenever a cleanup step could not confirm that
+# a resource it knowingly could not restore/remove was actually gone.
+#
+# Inputs (include vars):
+#   leftover_type   - vm|vnet|image|template|service|service_template|
+#                      vm_group|file|package|process|ip_addr|host_state
+#   leftover_name   - resource name / path / package / process pattern
+#   leftover_role   - role slug that owns the resource
+#   leftover_detail - free-text explanation of why it is being recorded
+#   leftover_host   - host attribution (optional, default inventory_hostname)
+
+- name: "Leftover: {{ leftover_type }} '{{ leftover_name }}' ({{ leftover_role }})"
+  ansible.builtin.set_fact:
+    odv_leftovers: >-
+      {{ (odv_leftovers | d([])) + [{
+           'type': leftover_type,
+           'name': leftover_name | string,
+           'role': leftover_role,
+           'host': leftover_host | d(inventory_hostname),
+           'detail': leftover_detail | d('')
+         }] }}

@@ -8,8 +8,29 @@
     hostname_cmd: "{{ hostname_cmd.stdout }}"
 
 - name: Discover OpenNebula clusters
-  ansible.builtin.include_tasks:
-    file: cluster_discovery.yml
   when:
     - (groups[frontend_group | d('frontend')] | d([])) | length > 0
     - hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host
+  block:
+    - name: Initialize discovery status
+      ansible.builtin.set_fact:
+        odv_discovery_failed: false
+
+    - name: Run cluster discovery
+      ansible.builtin.include_tasks:
+        file: cluster_discovery.yml
+
+    - name: Build ONE host name map
+      ansible.builtin.include_tasks:
+        file: host_map.yml
+  rescue:
+    # Discovery failing must not kill the run: tests self-skip on this fact
+    # and the report still renders with the error below.
+    - name: Mark discovery as failed
+      ansible.builtin.set_fact:
+        odv_discovery_failed: true
+
+    - name: Record cluster discovery failure
+      ansible.builtin.include_tasks: record_failure.yml
+      vars:
+        failure_key: "Cluster discovery"

@@ -1,0 +1,22 @@
+---
+# Standard rescue helper: records <failure_key> = failed plus a truncated
+# error detail extracted from the failed task. Meaningful inside rescue:
+# blocks, where ansible_failed_task/ansible_failed_result are defined.
+# Inputs: failure_key
+
+- name: "Extract failure detail: {{ failure_key }}"
+  ansible.builtin.set_fact:
+    _odv_failure_detail: >-
+      {{ (((ansible_failed_task | d({})).name | d('unknown task'))
+          ~ ' — '
+          ~ ((ansible_failed_result | d({})).msg
+             | d((ansible_failed_result | d({})).stderr
+             | d(ansible_failed_result | d({}) | string), true)))
+         | truncate(800) }}
+
+- name: "Record failure: {{ failure_key }}"
+  ansible.builtin.include_tasks: record_result.yml
+  vars:
+    result_key: "{{ failure_key }}"
+    result_value: failed
+    result_comment: "{{ _odv_failure_detail }}"

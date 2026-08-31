@@ -1,20 +1,68 @@
 ---
+# set_fact facts persist across the per-cluster loop: reset the IDs BEFORE the
+# block so a failure early in this iteration (e.g. the induced-failure hook)
+# can never run the always-cleanup with a previous cluster's IDs.
+- name: OneFlow | Init OneFlow IDs
+  ansible.builtin.set_fact:
+    flow_template_id: ""
+    flow_service_id: ""
+    flow_failed: false
+    flow_error_msg: ""
+    # Also neutralise the state/count registers: set_fact and register share
+    # precedence, so a later register still wins within the iteration, but a
+    # failure BEFORE those registers no longer reports the previous cluster's
+    # state in the always report task (its default(..., true) chains then
+    # correctly yield UNKNOWN/0).
+    flow_state_chk: {}
+    flow_vm_count: {}
+    flow_last_log: {}
+
 - name: "OneFlow | validation block (cluster '{{ current_cluster.name }}')"
   vars:
     _flow_svc_name: "flow-smoke-svc{{ current_cluster.name_suffix }}"
   block:
-    - name: OneFlow | Init OneFlow IDs
-      set_fact:
-        flow_template_id: ""
-        flow_service_id: ""
-        flow_failed: false
-        flow_error_msg: ""
+    - name: "Debug: induced failure hook"
+      ansible.builtin.fail:
+        msg: "Induced failure (validation.debug.fail_in=one_flow)"
+      when: (odv_fail_in | d((validation.debug | d({})).fail_in | d(''))) == 'one_flow'
 
     - name: Init report maps on localhost
       set_fact:
         verification_result: "{{ verification_result | default({}) }}"
         verification_comments: "{{ verification_comments | default({}) }}"
-#
+
+    # Template dependency: reuse test_vm's per-cluster template when test_vm
+    # already exported one; otherwise export it ourselves via the shared
+    # ensure_test_template.yml service (idempotent, manifest-registered).
+    - name: OneFlow | Reuse test_vm's template for this cluster when available
+      ansible.builtin.set_fact:
+        _flow_vm_template_id: "{{ _test_vm_template_ids_map.get(current_cluster.name) or '' }}"
+
+    - name: OneFlow | Ensure a test VM template exists (test_vm did not run)
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: ensure_test_template.yml
+      vars:
+        ensure_app_name: "{{ _flow_marketapp_name }}"
+        ensure_name: "{{ _flow_marketapp_name }}{{ current_cluster.name_suffix }}"
+        ensure_ds_id: "{{ current_cluster.image_ds_id }}"
+        ensure_role: oneflow_validation
+      when: _flow_vm_template_id | trim | length == 0
+
+    - name: OneFlow | Adopt the ensured template ID
+      ansible.builtin.set_fact:
+        _flow_vm_template_id: "{{ _export_template_id }}"
+      when: _flow_vm_template_id | trim | length == 0
+
+    # Guarantees the rendered JSON below is never invalid (the old code could
+    # emit "vm_template: " with an empty value when test_vm had not run).
+    - name: OneFlow | Assert a usable VM template ID
+      ansible.builtin.assert:
+        that: _flow_vm_template_id | trim is match('^[0-9]+$')
+        fail_msg: >-
+          No usable VM template for cluster '{{ current_cluster.name }}'
+          (got '{{ _flow_vm_template_id }}').
+
     - name: OneFlow | Render temporary service template
       ansible.builtin.copy:
         dest: "/tmp/flow-smoke-tpl{{ current_cluster.name_suffix }}.json"
@@ -29,16 +77,41 @@
                 "name": "app",
                 "cardinality": 2,
                 "min_vms": 2,
-                "vm_template": {{ _test_vm_template_ids_map.get(current_cluster.name) or (test_vm_template_id | d('')) }}
+                "vm_template": {{ _flow_vm_template_id | trim }}
               }
             ]
           }
 
+    # Registered BEFORE creation with id '' so the sweep can resolve it by its
+    # deterministic name even when the create or the ID parse below fails.
+    - name: "Manifest: register service template"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: manifest_add.yml
+      vars:
+        manifest_type: service_template
+        manifest_id: ""
+        manifest_name: "{{ _flow_svc_name }}"
+        manifest_cluster: "{{ current_cluster.name | d('') }}"
+        manifest_role: oneflow_validation
+        manifest_disposition: created
+
+    # Retry transient CLI failures (e.g. '[one.document.info] Error getting
+    # document', observed on an HA lab right after core_services restarts
+    # oned/opennebula-flow). failed_when: false means an exhausted retry
+    # loop does NOT abort the play with this ansible version — 'until'
+    # leaves flow_tpl_create.rc non-zero and the resolve/store steps below
+    # degrade to an empty ID exactly as before, so a genuinely persistent
+    # failure still shows up as a failed smoke test instead of crashing
+    # the harness.
     - name: OneFlow | Create service template
       ansible.builtin.shell: oneflow-template create /tmp/flow-smoke-tpl{{ current_cluster.name_suffix }}.json
       args: { executable: /bin/bash }
       register: flow_tpl_create
       changed_when: true
+      retries: 5
+      delay: 5
+      until: flow_tpl_create.rc == 0
       failed_when: false
 
     - name: OneFlow | Resolve template ID (primary stdout + fallback by name)
@@ -59,11 +132,31 @@
       set_fact:
         flow_template_id: "{{ flow_template_id_cmd.stdout | default('', true) | trim }}"
 
+    # Same rationale as the service template: id '' + deterministic name means
+    # the sweep's second net catches the service even if ID parsing fails and
+    # the role's own cleanup skips.
+    - name: "Manifest: register service"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: manifest_add.yml
+      vars:
+        manifest_type: service
+        manifest_id: ""
+        manifest_name: "{{ _flow_svc_name }}"
+        manifest_cluster: "{{ current_cluster.name | d('') }}"
+        manifest_role: oneflow_validation
+        manifest_disposition: created
+      when: flow_template_id | length > 0
+
+    # Same transient-failure tolerance as 'Create service template' above.
     - name: OneFlow | Instantiate the service
       ansible.builtin.shell: oneflow-template instantiate {{ flow_template_id }}
       args: { executable: /bin/bash }
       register: flow_svc_instantiate
       changed_when: true
+      retries: 5
+      delay: 5
+      until: flow_svc_instantiate.rc == 0
       failed_when: false
       when: flow_template_id | length > 0
 
@@ -94,8 +187,10 @@
       args: { executable: /bin/bash }
       register: flow_state_chk
       changed_when: false
-      retries: 10
-      delay: 10
+      # Configurable poll window (validation.one_flow.state_retries/state_delay,
+      # default 30x10s = 300s) — see group_vars/all.yml for when to raise it.
+      retries: "{{ (validation.one_flow | d({})).state_retries | d(30) }}"
+      delay: "{{ (validation.one_flow | d({})).state_delay | d(10) }}"
       until: (flow_state_chk.stdout | trim) == 'RUNNING'
       failed_when: false
       when:
@@ -155,21 +250,39 @@
         flow_state_rep: "{{ (flow_state_chk.stdout | default('UNKNOWN', true)) | trim | default('UNKNOWN', true) }}"
         flow_vm_qty_rep: "{{ (flow_vm_count.stdout | default('0', true)) | trim | default('0', true) }}"
 
+    # The comment now also carries the captured error detail: flow_error_msg is
+    # filled by the rescue (task failure) or by 'Mark as failed by state'
+    # (service never reached RUNNING). `select` drops empty parts; [:800]
+    # truncates like record_failure.yml does.
     - name: OneFlow | Store smoke test result + comment (on localhost)
+      vars:
+        _flow_report_key: "OneFlow smoke test (service/state/vms){{ current_cluster.report_suffix }}"
+        _flow_state_comment: "{{ (flow_state_rep != 'RUNNING') | ternary('service state=' ~ flow_state_rep, '') }}"
+        _flow_comment: "{{ ([_flow_state_comment, flow_error_msg | d('')] | select | join(' — '))[:800] }}"
       set_fact:
         verification_result: >-
           {{ verification_result | combine({
-            'OneFlow smoke test (service/state/vms)' ~ current_cluster.report_suffix:
+            _flow_report_key:
               'service=' ~ flow_service_id_rep ~
               ', state=' ~ flow_state_rep ~
               ', vms_qty=' ~ flow_vm_qty_rep
           }) }}
-        verification_comments: >-
-          {{ verification_comments | combine({
-            'OneFlow smoke test (service/state/vms)' ~ current_cluster.report_suffix:
-              ((flow_state_rep != 'RUNNING')
-                | ternary('service state=' ~ flow_state_rep, ''))
-          }) }}
+        verification_comments: "{{ verification_comments | combine({_flow_report_key: _flow_comment}) }}"
+
+    # Additive: the key above carries a free-string value
+    # ('service=..., state=..., vms_qty=...') that the report's exec_worst_of
+    # macro buckets as ok regardless of outcome — the failure signal lives
+    # only in flow_failed / the comment, so a failed smoke test renders OK in
+    # the Execution & Cleanup Summary. Record a second, explicit pass/fail
+    # key (does not touch the key/value above) so the summary sees it; the
+    # 'OneFlow' prefix already matches this key too.
+    - name: "OneFlow | Record smoke test pass/fail result"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "OneFlow smoke test result{{ current_cluster.report_suffix }}"
+        result_value: "{{ 'failed' if (flow_failed | d(false) | bool) else 'ok' }}"
 
     - name: OneFlow | Cleanup service (detect state)
       ansible.builtin.shell: |
@@ -202,6 +315,38 @@
         - not ((flow_state_for_cleanup.stdout | default('') | lower) is search('failed'))
       ignore_errors: yes
 
+    # oneflow delete is asynchronous: without this wait a stalled delete leaks
+    # the service (and its 2 VMs) silently. Poll until 'oneflow show' errors
+    # out, which means the service is gone. failed_when: false keeps an
+    # exhausted poll from aborting the cleanup — the leftover record below is
+    # the reporting channel for that case.
+    - name: OneFlow | Wait until the service is gone
+      ansible.builtin.shell: oneflow show {{ flow_service_id }}
+      args: { executable: /bin/bash }
+      register: flow_svc_gone_chk
+      changed_when: false
+      failed_when: false
+      retries: 10
+      delay: 6
+      until: flow_svc_gone_chk.rc != 0
+      when:
+        - flow_service_id is defined
+        - (flow_service_id | trim) is match('^[0-9]+$')
+
+    - name: OneFlow | Record leftover service (delete did not complete)
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_leftover.yml
+      vars:
+        leftover_type: service
+        leftover_name: "{{ _flow_svc_name }}"
+        leftover_role: oneflow_validation
+        leftover_detail: "oneflow delete {{ flow_service_id }} still present after 10x6s wait"
+      when:
+        - flow_service_id is defined
+        - (flow_service_id | trim) is match('^[0-9]+$')
+        - (flow_svc_gone_chk.rc | d(1)) == 0
+
     - name: OneFlow | Cleanup temporary template
       ansible.builtin.shell: oneflow-template delete {{ flow_template_id }}
       args: { executable: /bin/bash }
@@ -209,3 +354,36 @@
         - flow_template_id is defined
         - (flow_template_id | trim) is match('^[0-9]+$')
       ignore_errors: yes
+
+    - name: OneFlow | Wait until the service template is gone
+      ansible.builtin.shell: oneflow-template show {{ flow_template_id }}
+      args: { executable: /bin/bash }
+      register: flow_tpl_gone_chk
+      changed_when: false
+      failed_when: false
+      retries: 10
+      delay: 6
+      until: flow_tpl_gone_chk.rc != 0
+      when:
+        - flow_template_id is defined
+        - (flow_template_id | trim) is match('^[0-9]+$')
+
+    - name: OneFlow | Record leftover service template (delete did not complete)
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_leftover.yml
+      vars:
+        leftover_type: service_template
+        leftover_name: "{{ _flow_svc_name }}"
+        leftover_role: oneflow_validation
+        leftover_detail: "oneflow-template delete {{ flow_template_id }} still present after 10x6s wait"
+      when:
+        - flow_template_id is defined
+        - (flow_template_id | trim) is match('^[0-9]+$')
+        - (flow_tpl_gone_chk.rc | d(1)) == 0
+
+    # state: absent is idempotent — safe when the render never ran.
+    - name: OneFlow | Remove temporary service template file
+      ansible.builtin.file:
+        path: "/tmp/flow-smoke-tpl{{ current_cluster.name_suffix }}.json"
+        state: absent

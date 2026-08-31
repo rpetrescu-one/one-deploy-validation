@@ -1,10 +1,32 @@
 ---
+# Kill the stale-register hazard: `vm_id` survives across cluster iterations,
+# so any consumer seeing a previous iteration's value would act on the wrong
+# VM. Reset before anything in this iteration can fail.
+- name: "Reset per-iteration registers for cluster '{{ current_cluster.name }}'"
+  ansible.builtin.set_fact:
+    vm_id: ""
+    vm_ip: ""
+
 - name: "Test VM validation for cluster '{{ current_cluster.name }}'"
+  vars:
+    # create_vm.yml runs on EVERY frontend host (multi-FE HA inventories create
+    # one test VM per frontend). Embedding the host name makes each VM's name
+    # unique, so the always below can terminate THIS host's VM by name —
+    # never via a register that may be stale or lost.
+    _odv_test_vm_name: "odv-test-vm-{{ inventory_hostname }}{{ current_cluster.name_suffix }}"
   block:
+    - name: "Debug: induced failure hook"
+      ansible.builtin.fail:
+        msg: "Induced failure (validation.debug.fail_in=test_vm)"
+      when: (odv_fail_in | d((validation.debug | d({})).fail_in | d(''))) == 'test_vm'
+
+    # Primary frontend only: produces the per-cluster template/image id maps
+    # that all hosts read back through vars/main.yml
+    # (_test_vm_template_ids_map / _test_vm_template_image_ids_map).
     - name: "Preparation tasks"
       ansible.builtin.include_tasks:
         file: prepare.yml
-      when: validation.run_test_vm | default(true) and hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host
+      when: inventory_hostname == groups[frontend_group | d('frontend')][0]
 
     - name: Network related tasks
       ansible.builtin.include_tasks:
@@ -18,25 +40,47 @@
       ansible.builtin.include_tasks:
         file: connect.yml
 
-    - name: Cleanup things
-      ansible.builtin.include_tasks:
-        file: cleanup.yml
   rescue:
-    - name: Best-effort cleanup of a leaked test VM
-      ansible.builtin.shell: >
-        onevm terminate --hard {{ vm_id.stdout.split(':')[1] | trim }}
-      failed_when: false
-      when:
-        - vm_id is defined
-        - vm_id.stdout is defined
-        - "':' in (vm_id.stdout | string)"
-
-    - name: "Record test VM validation failure for cluster '{{ current_cluster.name }}'"
-      ansible.builtin.set_fact:
-        verification_result: >-
-          {{ (verification_result | d({}))
-             | combine({'Test VM validation' ~ current_cluster.report_suffix: 'failed'}) }}
+    - name: "Record test VM validation failure"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_failure.yml
+      vars:
+        failure_key: "Test VM validation{{ current_cluster.report_suffix }}"
 
     - name: "Show failure"
       ansible.builtin.debug:
         msg: "Test VM validation failed in cluster '{{ current_cluster.name }}', continuing with the next cluster."
+
+  always:
+    # State-independent cleanup: re-discover THIS host's VM by its
+    # deterministic name. Runs on success (replacing the old cleanup.yml,
+    # which as the last block step never ran on failure), on failure, and
+    # when nothing was created (empty listing -> no-op).
+    - name: "Cleanup: terminate this host's test VM by name"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: terminate_vm_by_name.yml
+      vars:
+        tvbn_name: "{{ _odv_test_vm_name }}"
+        tvbn_role: test_vm
+
+    # /var/tmp/vnet_*.template is rendered by ensure_test_vnet.yml (removed
+    # there on success, leaked on failure); /tmp/test_vm_template_extra.txt is
+    # written by prepare.yml and was previously only removed by the retired
+    # cleanup_test_vm role.
+    - name: "Cleanup: find rendered vnet template files"
+      ansible.builtin.find:
+        paths: /var/tmp
+        patterns: "vnet_*.template"
+      register: _vnet_render_files
+      failed_when: false
+
+    - name: "Cleanup: remove rendered vnet templates and the template-extra file"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: >-
+        {{ (_vnet_render_files.files | d([]) | map(attribute='path') | list)
+           + ['/tmp/test_vm_template_extra.txt'] }}
+      failed_when: false

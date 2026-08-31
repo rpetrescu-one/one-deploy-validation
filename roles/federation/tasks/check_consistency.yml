@@ -43,4 +43,13 @@
         verification_result: "{{ verification_result | combine({'Federation ACLs consistency across zones on ' ~ inventory_hostname: 'ok - consistent' if acls_consistent else 'warning - inconsistent counts: ' ~ (all_acl_counts | unique | join(', '))}) }}"
       when: acls_consistent is defined
 
-  when: groups[_federation_zone_group] | length > 1
+  when: (groups[_federation_zone_group] | d([]) | length) > 1
+
+- name: "Record result: cross-zone consistency skipped"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "Federation cross-zone consistency on {{ inventory_hostname }}"
+    result_value: "skipped — fewer than two hosts in zone group '{{ _federation_zone_group }}'"
+  when: (groups[_federation_zone_group] | d([]) | length) <= 1

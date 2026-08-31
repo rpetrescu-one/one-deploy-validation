@@ -1,0 +1,259 @@
+---
+# Pre-run sweep: clean up the PREVIOUS run's unresolved leftovers before this
+# run creates anything of its own. Motivation (empirically observed): a
+# leftover err-state image from an aborted/failed previous sweep blocks the
+# NEXT run's marketplace export — export_marketapp.yml's precheck finds the
+# broken template/image by name and "reuses" it instead of creating a fresh
+# one — and the existing end-of-run retry sweep only fires AFTER that same
+# run has already failed on it once. Runs once, on the primary frontend,
+# before any test role gets a chance to run (wired in playbooks/validation.yml
+# right after the first, validation_common play).
+#
+# The manifest mirror on disk at this point holds either:
+#  - the previous run's unresolved leftovers only (normal completion:
+#    validation_sweep/tasks/main.yml rewrites the mirror to just those), or
+#  - the full manifest accumulated up to an abort point (that run never
+#    reached the final sweep play) — some of those entries may already be
+#    gone (cleaned by their own role's own always: block before the abort).
+# Either way every delete below is tolerant of an already-absent resource,
+# mirroring sweep_one_objects.yml's ABSENT/GONE/STUCK style (become_user
+# oneadmin, failed_when: false, converge-wait where the object supports it).
+# This is NOT a call to sweep_one_objects.yml itself: that file works off
+# _sweep_plan (lib/plan.yml's created/reused dedup computed across ALL play
+# hosts' current-run manifests), which doesn't apply here — every entry in
+# the mirror at this point is already known-unresolved from last time, with
+# nothing to dedup against.
+#
+# Local types (file/package/process/ip_addr) and host_state are left alone
+# entirely here (not even re-checked): they are cheap, host-local, and
+# remain this SAME run's own end-of-run sweep's responsibility. They are
+# folded straight into THIS host's odv_manifest FACT (not just the file)
+# right after the split below — the fact is what actually survives the
+# rest of the run: the first manifest_add.yml call anywhere later in this
+# run OVERWRITES /tmp/odv_manifest.json from the fact (not merges), so a
+# carry-through entry that only lived in the file would silently drop out
+# of tracking the moment any test role registers its own first resource.
+# Folding into the fact is safe for these five types specifically: unlike
+# templates/images (see the NOTE below), a stale file/package/process/
+# ip_addr/host_state entry from a prior run can never collide with a
+# 'reused' entry this run creates for the same (type, name) —
+# sweep_local.yml dedupes local types by (type, name, host), and
+# host_state is excluded from the sweep plan entirely (lib/plan.yml) — so
+# there is no created-wins-over-reused risk to guard against here.
+#
+# NOTE: actionable (cluster-object) entries still present after this
+# file's own best-effort cleanup are rewritten back into the FILE only,
+# NOT folded into the odv_manifest FACT like the carry-through entries
+# above. Folding them into the fact too (so the end-of-run sweep would
+# retry them again this same run) was considered and rejected: a stale
+# 'created' disposition surviving from a PRIOR run WOULD collide with this
+# run's own legitimate 'reused' entry for the same (type, name) if a test
+# role ends up reusing that exact resource (templates/images are looked up
+# and reused by name via export_marketapp.yml's precheck), and
+# lib/plan.yml's created-wins dedup would then delete a resource this run
+# is actively depending on. The narrow gap this leaves — an object neither
+# this task's cleanup (incl. the image --force fallback) nor a later run's
+# own preclean could remove, and that also doesn't block anything
+# downstream — needs a human to look at it anyway.
+
+- name: Load persisted manifest mirror
+  ansible.builtin.slurp:
+    src: /tmp/odv_manifest.json
+  register: _preclean_mirror
+  failed_when: false
+
+# Guarded exactly like validation_sweep/tasks/main.yml's own merge guard: a
+# missing or corrupt mirror (no previous run, or one killed mid-write)
+# degrades to a clean no-op instead of failing this play.
+- name: Parse the manifest mirror
+  block:
+    - name: Parse the manifest mirror
+      ansible.builtin.set_fact:
+        _preclean_entries: >-
+          {{ (_preclean_mirror.content | b64decode | from_json)
+             if (_preclean_mirror.content is defined) else [] }}
+  rescue:
+    - name: Manifest mirror parse failed
+      ansible.builtin.set_fact:
+        _preclean_entries: []
+
+    - name: Mirror parse failed
+      ansible.builtin.debug:
+        msg: "WARNING: /tmp/odv_manifest.json is corrupt — pre-run cleanup skipped"
+
+- name: Split the mirror into actionable (cluster-object) and carry-through entries
+  vars:
+    _preclean_actionable_types: [vm, service, service_template, vnet, template, image]
+  ansible.builtin.set_fact:
+    _preclean_actionable: "{{ _preclean_entries | d([]) | selectattr('type', 'in', _preclean_actionable_types) | list }}"
+    _preclean_carry: "{{ _preclean_entries | d([]) | rejectattr('type', 'in', _preclean_actionable_types) | list }}"
+
+# Fold carry-through entries into THIS run's live manifest fact so they
+# survive the file being overwritten by this run's own first
+# manifest_add.yml call — see the header comment above for why this is
+# safe for these five types (and NOT done for still-stuck actionable
+# entries below).
+- name: Fold carry-through entries into this run's manifest fact
+  ansible.builtin.set_fact:
+    odv_manifest: "{{ (odv_manifest | d([])) + _preclean_carry }}"
+
+# --- vm: reuse the shared cleanup helper (wave 1) ---------------------------
+- name: "Pre-run sweep: terminate leftover VMs"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: terminate_vm_by_name.yml
+  vars:
+    tvbn_name: "{{ item.name }}"
+    tvbn_role: "sweep (pre-run)"
+  loop: "{{ _preclean_actionable | selectattr('type', 'equalto', 'vm') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# --- service / service_template / vnet / template / image ------------------
+# Same tolerant delete-shell style as sweep_one_objects.yml (id-or-name
+# resolve, ABSENT when there is nothing to do, converge-wait where the
+# object supports polling, GONE/STUCK sentinels).
+- name: "Pre-run sweep: delete leftover OneFlow services"
+  ansible.builtin.shell: |
+    ID="{{ item.id }}"
+    if [ -z "$ID" ]; then
+      ID=$(oneflow list 2>/dev/null | awk -v n='{{ item.name }}' '$0 ~ n {print $1; exit}')
+    fi
+    [ -z "$ID" ] && { echo ABSENT; exit 0; }
+    oneflow delete "$ID" 2>/dev/null || oneflow recover --delete "$ID" 2>/dev/null || true
+    for i in $(seq 1 20); do
+      oneflow show "$ID" >/dev/null 2>&1 || { echo GONE; exit 0; }
+      sleep 6
+    done
+    echo STUCK; exit 1
+  become: true
+  become_user: oneadmin
+  register: _preclean_svc
+  failed_when: false
+  loop: "{{ _preclean_actionable | selectattr('type', 'equalto', 'service') | list }}"
+  loop_control: { label: "{{ item.name }}" }
+
+- name: "Pre-run sweep: delete leftover OneFlow service templates"
+  ansible.builtin.shell: |
+    ID="{{ item.id }}"
+    if [ -z "$ID" ]; then
+      ID=$(oneflow-template list 2>/dev/null | awk -v n='{{ item.name }}' '$0 ~ n {print $1; exit}')
+    fi
+    [ -z "$ID" ] && { echo ABSENT; exit 0; }
+    oneflow-template delete "$ID"
+  become: true
+  become_user: oneadmin
+  register: _preclean_svctpl
+  failed_when: false
+  loop: "{{ _preclean_actionable | selectattr('type', 'equalto', 'service_template') | list }}"
+  loop_control: { label: "{{ item.name }}" }
+
+- name: "Pre-run sweep: delete leftover vnets"
+  ansible.builtin.shell: |
+    onevnet show '{{ item.name }}' >/dev/null 2>&1 || { echo ABSENT; exit 0; }
+    onevnet delete '{{ item.name }}'
+    for i in $(seq 1 10); do
+      onevnet show '{{ item.name }}' >/dev/null 2>&1 || { echo GONE; exit 0; }
+      sleep 3
+    done
+    echo STUCK; exit 1
+  become: true
+  become_user: oneadmin
+  register: _preclean_vnet
+  failed_when: false
+  loop: "{{ _preclean_actionable | selectattr('type', 'equalto', 'vnet') | list }}"
+  loop_control: { label: "{{ item.name }}" }
+
+- name: "Pre-run sweep: delete leftover VM templates"
+  ansible.builtin.shell: |
+    ID="{{ item.id }}"
+    [ -z "$ID" ] && ID=$(onetemplate list --csv -f NAME='{{ item.name }}' -l ID --no-header 2>/dev/null | head -1)
+    [ -z "$ID" ] && { echo ABSENT; exit 0; }
+    onetemplate show "$ID" >/dev/null 2>&1 || { echo ABSENT; exit 0; }
+    onetemplate delete "$ID"
+  become: true
+  become_user: oneadmin
+  register: _preclean_tpl
+  failed_when: false
+  loop: "{{ _preclean_actionable | selectattr('type', 'equalto', 'template') | list }}"
+  loop_control: { label: "{{ item.name }}" }
+
+# Images get an extra --force fallback (7.4 CLI) after the normal delete +
+# converge-wait: a DS-driver failure surfacing after an HA frontend failover
+# can leave an image stuck in a state that only --force clears — exactly
+# the leftover err image that motivates this whole file (left alone, it
+# gets silently "reused" — broken — by the next run's marketplace export).
+- name: "Pre-run sweep: delete leftover images"
+  ansible.builtin.shell: |
+    ID="{{ item.id }}"
+    [ -z "$ID" ] && ID=$(oneimage list --csv -f NAME='{{ item.name }}' -l ID --no-header 2>/dev/null | head -1)
+    [ -z "$ID" ] && { echo ABSENT; exit 0; }
+    oneimage show "$ID" >/dev/null 2>&1 || { echo ABSENT; exit 0; }
+    oneimage delete "$ID" 2>/dev/null
+    for i in $(seq 1 20); do
+      oneimage show "$ID" >/dev/null 2>&1 || { echo GONE; exit 0; }
+      sleep 6
+    done
+    oneimage delete --force "$ID" 2>/dev/null
+    for i in $(seq 1 20); do
+      oneimage show "$ID" >/dev/null 2>&1 || { echo GONE_FORCED; exit 0; }
+      sleep 6
+    done
+    echo STUCK; exit 1
+  become: true
+  become_user: oneadmin
+  register: _preclean_img
+  failed_when: false
+  loop: "{{ _preclean_actionable | selectattr('type', 'equalto', 'image') | list }}"
+  loop_control: { label: "{{ item.name }}" }
+
+# --- re-check presence (uniform, by type/name) ------------------------------
+# Drives both the removed-count below and the manifest rewrite. Simpler and
+# more tolerant than trusting each delete task's own sentinel above: it
+# doesn't matter WHY an entry is still there (STUCK, a listing hiccup, a
+# concurrent operator action, ...), only whether it still is.
+- name: "Pre-run sweep: re-check whether each leftover is still present"
+  ansible.builtin.shell: |
+    case '{{ item.type }}' in
+      vm)               onevm list --csv -f NAME='{{ item.name }}' -l ID --no-header ;;
+      service)          oneflow list 2>/dev/null | awk -v n='{{ item.name }}' '$0 ~ n {print $1; exit}' ;;
+      service_template) oneflow-template list 2>/dev/null | awk -v n='{{ item.name }}' '$0 ~ n {print $1; exit}' ;;
+      vnet)             onevnet list --csv -f NAME='{{ item.name }}' -l ID --no-header ;;
+      template)         onetemplate list --csv -f NAME='{{ item.name }}' -l ID --no-header ;;
+      image)            oneimage list --csv -f NAME='{{ item.name }}' -l ID --no-header ;;
+    esac
+  become: true
+  become_user: oneadmin
+  register: _preclean_presence
+  changed_when: false
+  failed_when: false
+  loop: "{{ _preclean_actionable }}"
+  loop_control: { label: "{{ item.type }}:{{ item.name }}" }
+
+- name: "Pre-run sweep: compute which leftovers are still present"
+  ansible.builtin.set_fact:
+    _preclean_still_present: >-
+      {%- set out = [] -%}
+      {%- for r in _preclean_presence.results | d([]) -%}
+        {%- if (r.stdout | d('')) | trim | length > 0 -%}
+          {%- set _ = out.append(r.item) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: "Pre-run sweep: rewrite the manifest mirror to what is still unresolved"
+  ansible.builtin.copy:
+    dest: /tmp/odv_manifest.json
+    content: "{{ (_preclean_carry + _preclean_still_present) | to_nice_json }}"
+    mode: "0644"
+  failed_when: false
+
+- name: "Pre-run sweep: record how many leftovers were removed"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    _preclean_removed_count: "{{ (_preclean_actionable | length) - (_preclean_still_present | length) }}"
+    result_key: "Pre-run leftover cleanup"
+    result_value: "removed {{ _preclean_removed_count }} leftover(s) from a previous run"
+  when: (_preclean_actionable | length) > (_preclean_still_present | length)

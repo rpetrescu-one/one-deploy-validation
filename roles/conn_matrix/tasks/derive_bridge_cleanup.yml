@@ -1,0 +1,36 @@
+---
+# Pure logic, no side effects — unit-tested in test/harness/test_logic.yml.
+# Computes which /32 entries to remove from the conn-matrix bridge.
+#
+# Inputs (vars/facts):
+#   _cm_bridge_addr_lines    - stdout_lines of `ip -o addr show dev <bridge>`
+#                              ([] when the device does not exist)
+#   odv_manifest             - this host's run manifest (may be undefined)
+#   _conn_matrix_bridge_name - role default
+# Outputs (facts):
+#   _cm_manifest_cidrs - every '<ip>/32' this host manifest-registered for the
+#                        bridge (addresses AND routes share the
+#                        '<cidr>:dev:<bridge>' name format)
+#   _cm_addrs_to_del   - the subset currently present as an address on the
+#                        bridge (safe to `ip addr del`)
+
+- name: Compute manifest-recorded /32 entries for the bridge
+  ansible.builtin.set_fact:
+    _cm_manifest_cidrs: >-
+      {{ odv_manifest | d([])
+         | selectattr('type', 'equalto', 'ip_addr')
+         | selectattr('host', 'equalto', inventory_hostname)
+         | map(attribute='name')
+         | select('search', ':dev:' ~ _conn_matrix_bridge_name ~ '$')
+         | map('regex_replace', ':dev:.*$', '')
+         | unique | list }}
+
+- name: Compute /32 addresses to delete from the bridge
+  ansible.builtin.set_fact:
+    _cm_addrs_to_del: >-
+      {{ _cm_bridge_addr_lines | d([])
+         | map('regex_search', 'inet ([0-9.]+/32)', '\1')
+         | select()
+         | map('first')
+         | select('in', _cm_manifest_cidrs)
+         | unique | list }}

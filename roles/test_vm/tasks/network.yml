@@ -1,81 +1,42 @@
 ---
-- name: Get existing vnets
-  ansible.builtin.shell:
-    cmd: "onevnet list -j"
-  become: true
-  become_user: oneadmin
-  register: exec_onevnet_list_json
+# The vnet lifecycle (render/create/update/onecluster addvnet+delvnet and the
+# manifest entry) lives in the shared service
+# roles/validation_common/tasks/ensure_test_vnet.yml so other tests can
+# provision the test vnet even when run_test_vm is disabled. This file keeps
+# only what is test_vm-specific: the gateway reachability probe and the
+# 'Test network creation' report row.
 
-# A pool with a single vnet arrives as a mapping instead of a list.
-- name: Set full resource facts
-  ansible.builtin.set_fact:
-    vnet_names: "{{ ([_vp] if _vp is mapping else (_vp or [])) | map(attribute='NAME') | list }}"
+# Runs on every frontend host, as before: each FE independently proves it can
+# reach the test network's gateway.
+- name: Verify connection to the VNET default gateway
+  ansible.builtin.shell: >
+    ping -c 1 {{ validation.test_vm.vnet.gateway }}
+  register: gw_ping_result
+  until: gw_ping_result.rc == 0
+  retries: 3
+  delay: 10
+  when:
+    - validation.test_vm.create_vnet
+    - validation.test_vm.vm.check_connection
+
+# Primary frontend only: all FEs share one oned, and concurrent `onevnet
+# create` from several FEs is a race (pre-existing bug in the old network.yml).
+- name: Ensure the test vnet exists for this cluster
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: ensure_test_vnet.yml
   vars:
-    _vp: "{{ (exec_onevnet_list_json.stdout | from_json).VNET_POOL.VNET | d([]) }}"
+    ensure_vnet_cluster: "{{ current_cluster }}"
+    ensure_role: test_vm
+  when: inventory_hostname == groups[frontend_group | d('frontend')][0]
 
-- name: Create vnet
-  when: validation.test_vm.create_vnet
+- name: Record test network creation result
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
   vars:
-    _cluster_vnet_name: "{{ validation.test_vm.vnet_name }}{{ current_cluster.name_suffix }}"
-  block:
-    - name: Render vnet config
-      template:
-        src: test_vnet.j2
-        dest: /var/tmp/vnet_{{ _cluster_vnet_name }}.template
-
-    - name: Verify connection to the VNET default gateway
-      ansible.builtin.shell: >
-        ping -c 1 {{ validation.test_vm.vnet.gateway }}
-      register: gw_ping_result
-      until: gw_ping_result.rc == 0
-      retries: 3
-      delay: 10
-      when: validation.test_vm.vm.check_connection
-
-    - name: Update network
-      ansible.builtin.shell: >
-        cat /var/tmp/vnet_{{ _cluster_vnet_name }}.template | onevnet update {{ _cluster_vnet_name }}
-      register: test_network
-      failed_when: "test_network.rc != 0"
-      become: true
-      become_user: oneadmin
-      when: _cluster_vnet_name in vnet_names
-
-    - name: Create network
-      ansible.builtin.shell: >
-        onevnet create /var/tmp/vnet_{{ _cluster_vnet_name }}.template
-      register: test_network
-      failed_when: "test_network.rc != 0"
-      become: true
-      become_user: oneadmin
-      when: _cluster_vnet_name not in vnet_names
-
-    - name: Assign the test network to the cluster
-      ansible.builtin.shell: >
-        onecluster addvnet {{ current_cluster.id }} '{{ _cluster_vnet_name }}'
-      register: addvnet_result
-      # Re-runs find the vnet already in the cluster; tolerate that.
-      failed_when: addvnet_result.rc != 0 and 'already' not in (addvnet_result.stderr | lower)
-      become: true
-      become_user: oneadmin
-      when: current_cluster.id != '0'
-
-    # New vnets land in the default cluster; remove them from it so the
-    # scheduler only matches hosts of the target cluster.
-    - name: Remove the test network from the default cluster
-      ansible.builtin.shell: >
-        onecluster delvnet 0 '{{ _cluster_vnet_name }}'
-      register: delvnet_result
-      failed_when: false
-      become: true
-      become_user: oneadmin
-      when: current_cluster.id != '0'
-
-    - name: Delete vnet definition
-      file:
-        path: /var/tmp/vnet_{{ _cluster_vnet_name }}.template
-        state: absent
-
-    - name: Verify test network creation
-      set_fact:
-        verification_result: "{{ (verification_result | default({})) | combine({'Test network creation' ~ current_cluster.report_suffix : 'ok'}) }}"
+    result_key: "Test network creation{{ current_cluster.report_suffix }}"
+    result_value: >-
+      {{ 'ok' if (validation.test_vm.create_vnet | bool)
+         else 'skipped — create_vnet disabled, reusing vnet ' ~ current_cluster.vnet_name }}
+  when: inventory_hostname == groups[frontend_group | d('frontend')][0]

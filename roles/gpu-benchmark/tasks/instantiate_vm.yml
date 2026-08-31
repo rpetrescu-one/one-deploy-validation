@@ -8,6 +8,21 @@
     mode: "0600"
   no_log: true
 
+# Registered BEFORE the instantiate so even a crash mid-instantiation
+# leaves a manifest entry the sweep can resolve by name (id still '').
+- name: "Manifest: register benchmark VM {{ _ctx.vm_name | d('') }}"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: manifest_add.yml
+  vars:
+    manifest_type: vm
+    manifest_id: ""
+    manifest_name: "{{ _ctx.vm_name }}"
+    manifest_cluster: "{{ current_cluster.name | d('') }}"
+    manifest_role: gpu-benchmark
+    manifest_disposition: created
+  when: _ctx.vm_name is defined
+
 - name: Instantiate VM
   become: true
   become_user: oneadmin

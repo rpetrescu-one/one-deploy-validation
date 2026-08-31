@@ -6,6 +6,7 @@
   become_user: oneadmin
   changed_when: false
   failed_when: false
+  when: _federation_check_vdc_sync | bool
 
 - name: Save VDC count to verification results
   set_fact:
@@ -19,6 +20,7 @@
   become_user: oneadmin
   changed_when: false
   failed_when: false
+  when: _federation_check_marketplace_apps | bool
 
 - name: Save marketplace apps count to verification results
   set_fact:
@@ -59,6 +61,7 @@
   become_user: oneadmin
   changed_when: false
   failed_when: false
+  when: _federation_check_datastores | bool
 
 - name: Save datastore count to verification results
   set_fact:
@@ -72,11 +75,21 @@
   become_user: oneadmin
   changed_when: false
   failed_when: false
+  when: _federation_check_vnets | bool
 
 - name: Save virtual network count to verification results
   set_fact:
     verification_result: "{{ verification_result | combine({'Federation vnets count on ' ~ inventory_hostname: vnet_count.stdout | int}) }}"
   when: vnet_count.stdout is defined
+
+- name: "Record result: server pool check skipped"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "Federation server pool on {{ inventory_hostname }}"
+    result_value: "skipped — no ZONE_ID (federation config check failed or disabled)"
+  when: (one_federation_zone_id | d('')) == ''
 
 - name: Verify federation server pool (HA zones only)
   block:
@@ -103,7 +116,7 @@
         verification_result: "{{ verification_result | combine({'Federation server pool size in zone ' ~ one_federation_zone_id ~ ' on ' ~ inventory_hostname: server_pool_count | int}) }}"
       when: server_pool_count is defined
 
-  when: one_federation_zone_id is defined
+  when: (one_federation_zone_id | d('')) != ''
 
 - name: Check federation database replication lag (MySQL only)
   block:
@@ -166,12 +179,13 @@
     - name: Check time drift warning threshold
       set_fact:
         verification_result: "{{ verification_result | combine({'Federation time on ' ~ inventory_hostname: 'ok - timestamp ' ~ zone_timestamp}) }}"
+  when: _federation_check_time_sync | bool
 
 - name: Verify federation authentication (slave zones only)
   block:
     - name: Extract master IP from endpoint
       set_fact:
-        master_auth_ip: "{{ one_federation_master_oned | regex_search('://([0-9.]+):', '\\1') | first }}"
+        master_auth_ip: "{{ one_federation_master_oned | regex_search('://([0-9.]+):', '\\1') | d([''], true) | first }}"
 
     - name: Check network connectivity to master for auth test
       ansible.builtin.shell: |

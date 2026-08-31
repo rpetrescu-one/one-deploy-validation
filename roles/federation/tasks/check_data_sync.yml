@@ -5,6 +5,7 @@
   become: true
   become_user: oneadmin
   changed_when: false
+  failed_when: false
 
 - name: Get group count
   ansible.builtin.shell: onegroup list --no-header | wc -l
@@ -12,6 +13,7 @@
   become: true
   become_user: oneadmin
   changed_when: false
+  failed_when: false
 
 - name: Get VDC count
   ansible.builtin.shell: onevdc list --no-header | wc -l
@@ -24,24 +26,52 @@
 - name: Display federated data counts
   ansible.builtin.debug:
     msg:
-      - "Users: {{ user_count.stdout }}"
-      - "Groups: {{ group_count.stdout }}"
+      - "Users: {{ user_count.stdout | d('0') }}"
+      - "Groups: {{ group_count.stdout | d('0') }}"
       - "VDCs: {{ vdc_count.stdout | default('N/A') }}"
 
-- name: Verify basic federated data exists
-  ansible.builtin.assert:
-    that:
-      - user_count.stdout | int > 0
-      - group_count.stdout | int > 0
-    fail_msg: "No users or groups found, federation data may not be synchronized"
-    success_msg: "Federated data present: {{ user_count.stdout }} users, {{ group_count.stdout }} groups"
-
-- name: Save federated data counts to verification results
+- name: Evaluate federated data counts
   set_fact:
-    verification_result: "{{ verification_result | combine({
-      'Federation users count on ' ~ inventory_hostname: user_count.stdout | int,
-      'Federation groups count on ' ~ inventory_hostname: group_count.stdout | int
-    }) }}"
+    _fed_user_count: "{{ user_count.stdout | d('0') | trim | int }}"
+    _fed_group_count: "{{ group_count.stdout | d('0') | trim | int }}"
+
+- name: "Record result: users count (ok)"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "Federation users count on {{ inventory_hostname }}"
+    result_value: "{{ _fed_user_count }}"
+  when: (_fed_user_count | int) > 0
+
+- name: "Record result: users count (failed)"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "Federation users count on {{ inventory_hostname }}"
+    result_value: "failed"
+    result_comment: "No users listed — federation data may not be synchronized (oneuser list rc={{ user_count.rc | d('n/a') }} {{ (user_count.stderr | d(''))[:400] }})"
+  when: (_fed_user_count | int) == 0
+
+- name: "Record result: groups count (ok)"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "Federation groups count on {{ inventory_hostname }}"
+    result_value: "{{ _fed_group_count }}"
+  when: (_fed_group_count | int) > 0
+
+- name: "Record result: groups count (failed)"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "Federation groups count on {{ inventory_hostname }}"
+    result_value: "failed"
+    result_comment: "No groups listed — federation data may not be synchronized (onegroup list rc={{ group_count.rc | d('n/a') }} {{ (group_count.stderr | d(''))[:400] }})"
+  when: (_fed_group_count | int) == 0
 
 - name: Verify oneadmin user exists
   block:
@@ -51,22 +81,44 @@
       become: true
       become_user: oneadmin
       changed_when: false
+      failed_when: false
 
-    - name: Parse oneadmin user ID and auth driver
-      set_fact:
-        oneadmin_user_id: "{{ (oneadmin_user_json.stdout | from_json).USER.ID }}"
-        oneadmin_auth_driver: "{{ (oneadmin_user_json.stdout | from_json).USER.AUTH_DRIVER }}"
+    - name: "Record result: oneadmin lookup failed"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Federation oneadmin user"
+        result_value: "failed"
+        result_comment: "oneuser show oneadmin failed (rc={{ oneadmin_user_json.rc | d('n/a') }}): {{ (oneadmin_user_json.stderr | d(''))[:800] }}"
+      when: (oneadmin_user_json.rc | d(1)) != 0 or (oneadmin_user_json.stdout | d('') | trim) == ''
 
-    - name: Verify oneadmin user ID is 0
-      ansible.builtin.assert:
-        that:
-          - oneadmin_user_id == "0"
-        fail_msg: "oneadmin user ID is {{ oneadmin_user_id }}, expected 0"
-        success_msg: "oneadmin user is properly configured (ID: {{ oneadmin_user_id }})"
+    - name: Evaluate oneadmin user
+      block:
+        - name: Parse oneadmin user ID and auth driver
+          set_fact:
+            oneadmin_user_id: "{{ (oneadmin_user_json.stdout | from_json).USER.ID }}"
+            oneadmin_auth_driver: "{{ (oneadmin_user_json.stdout | from_json).USER.AUTH_DRIVER }}"
 
-    - name: Save oneadmin verification to results
-      set_fact:
-        verification_result: "{{ verification_result | combine({'Federation oneadmin user': 'ok'}) }}"
+        - name: "Record result: oneadmin user (ok)"
+          ansible.builtin.include_role:
+            name: validation_common
+            tasks_from: record_result.yml
+          vars:
+            result_key: "Federation oneadmin user"
+            result_value: "ok"
+          when: oneadmin_user_id == "0"
+
+        - name: "Record result: oneadmin user (failed)"
+          ansible.builtin.include_role:
+            name: validation_common
+            tasks_from: record_result.yml
+          vars:
+            result_key: "Federation oneadmin user"
+            result_value: "failed"
+            result_comment: "oneadmin user ID is {{ oneadmin_user_id }}, expected 0"
+          when: oneadmin_user_id != "0"
+      when: (oneadmin_user_json.rc | d(1)) == 0 and (oneadmin_user_json.stdout | d('') | trim) != ''
   when: _federation_verify_oneadmin | bool
 
 - name: Check database backend type

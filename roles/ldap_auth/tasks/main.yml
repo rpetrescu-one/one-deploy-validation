@@ -24,7 +24,7 @@
             'fireedge_host': validation.ldap_auth.fireedge_host | default(''),
             'fireedge_port': validation.ldap_auth.fireedge_port | default(''),
             'fireedge_proto': validation.ldap_auth.fireedge_proto | default('https'),
-            'fireedge_login_endpoint': validation.ldap_auth.fireedge_login_endpoint | default('/api/login'),
+            'fireedge_login_endpoint': validation.ldap_auth.fireedge_login_endpoint | default('/fireedge/api/auth/'),
             'fireedge_skip_tls_verify': validation.ldap_auth.fireedge_skip_tls_verify | default(true),
             'rpc2_host': validation.ldap_auth.rpc2_host | default(''),
             'rpc2_port': validation.ldap_auth.rpc2_port | default(''),
@@ -35,11 +35,29 @@
         }, recursive=True)
       }}
 
+- name: "LDAP auth: skip — cluster discovery failed"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "LDAP authentication validation"
+    result_value: "skipped — cluster discovery failed"
+  when:
+    - validation.run_ldap_auth | d(false)
+    - hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host
+    - hostvars[groups[frontend_group | d('frontend')][0]].odv_discovery_failed | d(false)
+
 - name: LDAP authentication checks (primary frontend only)
   when:
     - validation.run_ldap_auth | d(false)
     - hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host
+    - not (hostvars[groups[frontend_group | d('frontend')][0]].odv_discovery_failed | d(false))
   block:
+    - name: "Debug: induced failure hook"
+      ansible.builtin.fail:
+        msg: "Induced failure (validation.debug.fail_in=ldap_auth)"
+      when: (odv_fail_in | d((validation.debug | d({})).fail_in | d(''))) == 'ldap_auth'
+
     - name: Gather minimal facts for OS family
       ansible.builtin.setup:
         gather_subset:
@@ -56,9 +74,12 @@
           }}
 
     - name: Install LDAP client dependencies
-      ansible.builtin.package:
-        name: "{{ _ldap_packages }}"
-        state: present
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: install_packages_tracked.yml
+      vars:
+        pkg_names: "{{ _ldap_packages }}"
+        pkg_role: ldap-auth
 
     - name: Parse LDAP server host and port
       ansible.builtin.set_fact:
@@ -70,29 +91,45 @@
             | ternary((validation.ldap_auth.server | default('127.0.0.1')).split(':')[1], validation.ldap_auth.port | default(389))
           }}
 
+    # --- LDAP bind (comparison: recorded, never aborts the block) ---
     - name: Verify LDAP bind to server
       ansible.builtin.shell: >
         ldapsearch -x -H ldap://{{ _ldap_host }}:{{ _ldap_port }} -D "{{ validation.ldap_auth.bind_dn }}" -w "{{ validation.ldap_auth.bind_pass }}" -b "{{ validation.ldap_auth.base_dn }}" -s base "(objectClass=*)" -z 1
       register: ldap_bind_check
-      no_log: true
+      no_log: true  # command line embeds bind_pass — keep hidden
       changed_when: false
-      failed_when: ldap_bind_check.rc != 0
+      failed_when: false
 
-    - name: Save LDAP bind result
-      ansible.builtin.set_fact:
-        verification_result: "{{ (verification_result | default({})) | combine({'LDAP bind to server': 'ok'}) }}"
+    - name: "Record LDAP bind result"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        _raw_err: "rc={{ ldap_bind_check.rc | d('?') }} stderr={{ ldap_bind_check.stderr | d('') | trim }}"
+        _san1: "{{ (_raw_err | replace(validation.ldap_auth.bind_pass, '***')) if (validation.ldap_auth.bind_pass | length > 0) else _raw_err }}"
+        _san2: "{{ (_san1 | replace(validation.ldap_auth.ldap_pass, '***')) if (validation.ldap_auth.ldap_pass | length > 0) else _san1 }}"
+        result_key: "LDAP bind to server"
+        result_value: "{{ 'ok' if ldap_bind_check.rc == 0 else 'failed' }}"
+        result_comment: "{{ '' if ldap_bind_check.rc == 0 else (_san2 | truncate(300)) }}"
 
+    # --- oned.conf AUTH_MAD check (comparison: recorded) ---
     - name: Verify OpenNebula LDAP auth driver is configured
       ansible.builtin.shell: >
         awk 'BEGIN{in_auth=0} /^AUTH_MAD/ {in_auth=1} in_auth && /AUTHN/ && /ldap/ {found=1} in_auth && /\]/ {if (found) exit 0; in_auth=0} END{exit (found?0:1)}' /etc/one/oned.conf
       register: oned_ldap_auth
       changed_when: false
-      failed_when: oned_ldap_auth.rc != 0
+      failed_when: false
 
-    - name: Save OpenNebula LDAP auth config check
-      ansible.builtin.set_fact:
-        verification_result: "{{ verification_result | combine({'OpenNebula LDAP auth driver configured': 'ok'}) }}"
+    - name: "Record OpenNebula LDAP auth driver check"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "OpenNebula LDAP auth driver configured"
+        result_value: "{{ 'ok' if oned_ldap_auth.rc == 0 else 'failed' }}"
+        result_comment: "{{ '' if oned_ldap_auth.rc == 0 else 'no ldap AUTHN entry found in the AUTH_MAD section of /etc/one/oned.conf' }}"
 
+    # --- Temporary credentials file (genuine env failure: throws into rescue) ---
     - name: Create temporary auth file for LDAP user
       ansible.builtin.tempfile:
         state: file
@@ -102,115 +139,240 @@
         - validation.ldap_auth.ldap_user | length > 0
         - validation.ldap_auth.ldap_pass | length > 0
 
+    # A register on a skipped task is still "defined" — .path is the reliable signal.
+    - name: Determine LDAP credential availability
+      ansible.builtin.set_fact:
+        _ldap_creds_ok: "{{ ldap_auth_file.path is defined }}"
+
+    - name: "Manifest: register temporary LDAP auth file"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: manifest_add.yml
+      vars:
+        manifest_type: file
+        manifest_id: ""
+        manifest_name: "{{ ldap_auth_file.path }}"
+        manifest_cluster: ""
+        manifest_role: ldap-auth
+        manifest_disposition: created
+      when: _ldap_creds_ok | bool
+
     - name: Write LDAP auth credentials
       ansible.builtin.copy:
         dest: "{{ ldap_auth_file.path }}"
         content: "{{ validation.ldap_auth.ldap_user }}:{{ validation.ldap_auth.ldap_pass }}"
         mode: "0600"
-      no_log: true
-      when: ldap_auth_file is defined
+      no_log: true  # content is the plaintext password
+      when: _ldap_creds_ok | bool
 
+    # --- LDAP user login via oneuser (comparison: recorded) ---
     - name: Validate OpenNebula login with LDAP user
       ansible.builtin.shell: >
         ONE_AUTH="{{ ldap_auth_file.path }}" oneuser show "{{ validation.ldap_auth.ldap_user }}"
       register: ldap_login_check
       changed_when: false
-      no_log: true
-      failed_when: ldap_login_check.rc != 0
-      when: ldap_auth_file is defined
+      failed_when: false  # no_log removed — args hold a file path, not the password
+      when:
+        - _ldap_creds_ok | bool
+        - oned_ldap_auth.rc == 0
 
-    - name: Save LDAP user login result
-      ansible.builtin.set_fact:
-        verification_result: "{{ verification_result | combine({'LDAP user login to XML-RPC': 'ok'}) }}"
-      when: ldap_auth_file is defined
+    - name: "Record LDAP user login result"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "LDAP user login to XML-RPC"
+        result_value: "{{ 'ok' if ldap_login_check.rc == 0 else 'failed' }}"
+        result_comment: "{{ '' if ldap_login_check.rc == 0 else (('rc=' ~ ldap_login_check.rc ~ ' stderr=' ~ (ldap_login_check.stderr | d('') | trim)) | truncate(300)) }}"
+      when:
+        - _ldap_creds_ok | bool
+        - oned_ldap_auth.rc == 0
 
+    - name: "Record LDAP user login skipped (auth driver not configured)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "LDAP user login to XML-RPC"
+        result_value: "skipped — OpenNebula LDAP auth driver configured failed"
+      when:
+        - _ldap_creds_ok | bool
+        - oned_ldap_auth.rc != 0
+
+    - name: Report missing LDAP user credentials
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "LDAP user login to XML-RPC"
+        result_value: "skipped (missing ldap_user/ldap_pass)"
+      when: not (_ldap_creds_ok | bool)
+
+    # --- LDAP group membership in the directory (comparison: recorded) ---
     - name: Read LDAP group membership for user
       ansible.builtin.shell: >
         ldapsearch -x -H ldap://{{ _ldap_host }}:{{ _ldap_port }} -D "{{ validation.ldap_auth.bind_dn }}" -w "{{ validation.ldap_auth.bind_pass }}" -b "{{ validation.ldap_auth.group_mapping.ldap_group_dn }}" "(objectClass=posixGroup)" {{ validation.ldap_auth.group_mapping.ldap_group_member_attr }}
       register: ldap_group_lookup
-      no_log: true
+      no_log: true  # command line embeds bind_pass — keep hidden
       changed_when: false
-      failed_when: ldap_group_lookup.rc != 0
+      failed_when: false
       when:
-        - ldap_auth_file is defined
+        - _ldap_creds_ok | bool
+        - validation.ldap_auth.group_mapping.ldap_group_dn | length > 0
+        - ldap_bind_check.rc == 0
+
+    - name: "Record LDAP group membership (directory) result"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        _member_hit: >-
+          {{ (ldap_group_lookup.stdout | d(''))
+             is search(validation.ldap_auth.group_mapping.ldap_group_member_attr ~ ': ' ~ validation.ldap_auth.ldap_user) }}
+        _raw_err: "rc={{ ldap_group_lookup.rc | d('?') }} stderr={{ ldap_group_lookup.stderr | d('') | trim }}"
+        _san1: "{{ (_raw_err | replace(validation.ldap_auth.bind_pass, '***')) if (validation.ldap_auth.bind_pass | length > 0) else _raw_err }}"
+        _san2: "{{ (_san1 | replace(validation.ldap_auth.ldap_pass, '***')) if (validation.ldap_auth.ldap_pass | length > 0) else _san1 }}"
+        result_key: "LDAP group membership (directory)"
+        result_value: "{{ 'ok' if (ldap_group_lookup.rc == 0 and (_member_hit | bool)) else 'failed' }}"
+        result_comment: >-
+          {{ '' if (ldap_group_lookup.rc == 0 and (_member_hit | bool))
+             else (('user ' ~ validation.ldap_auth.ldap_user ~ ' not present in '
+                    ~ validation.ldap_auth.group_mapping.ldap_group_member_attr ~ ' of '
+                    ~ validation.ldap_auth.group_mapping.ldap_group_dn)
+                   if ldap_group_lookup.rc == 0 else (_san2 | truncate(300))) }}
+      when:
+        - _ldap_creds_ok | bool
+        - validation.ldap_auth.group_mapping.ldap_group_dn | length > 0
+        - ldap_bind_check.rc == 0
+
+    - name: "Record LDAP group membership skipped (bind failed)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "LDAP group membership (directory)"
+        result_value: "skipped — LDAP bind to server failed"
+      when:
+        - _ldap_creds_ok | bool
+        - validation.ldap_auth.group_mapping.ldap_group_dn | length > 0
+        - ldap_bind_check.rc != 0
+
+    - name: "Record LDAP group membership skipped (no group DN configured)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "LDAP group membership (directory)"
+        result_value: "skipped — no ldap_group_dn configured"
+      when: validation.ldap_auth.group_mapping.ldap_group_dn | length == 0
+
+    - name: "Record LDAP group membership skipped (missing credentials)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "LDAP group membership (directory)"
+        result_value: "skipped — missing ldap_user/ldap_pass"
+      when:
+        - not (_ldap_creds_ok | bool)
         - validation.ldap_auth.group_mapping.ldap_group_dn | length > 0
 
-    - name: Validate LDAP group membership contains user
-      ansible.builtin.set_fact:
-        verification_result: >-
-          {{
-            verification_result
-            | combine({
-                'LDAP group membership (directory)':
-                (ldap_group_lookup.stdout is search(validation.ldap_auth.group_mapping.ldap_group_member_attr ~ ': ' ~ validation.ldap_auth.ldap_user))
-                | ternary('ok', 'failed')
-              })
-          }}
-      when:
-        - ldap_auth_file is defined
-        - validation.ldap_auth.group_mapping.ldap_group_dn | length > 0
-
+    # --- OpenNebula group mapping (comparison: recorded) ---
     - name: Lookup OpenNebula group by name
       ansible.builtin.shell: >
         onegroup show -j "{{ validation.ldap_auth.group_mapping.expected_group_name }}"
       register: onegroup_show
       changed_when: false
-      failed_when: onegroup_show.rc != 0
+      failed_when: false
       when:
-        - ldap_auth_file is defined
+        - _ldap_creds_ok | bool
         - validation.ldap_auth.group_mapping.expected_group_name | length > 0
-
-    - name: Normalize expected OpenNebula group id
-      ansible.builtin.set_fact:
-        _expected_group_id: >-
-          {{
-            (validation.ldap_auth.group_mapping.expected_group_id | string | length > 0)
-            | ternary(validation.ldap_auth.group_mapping.expected_group_id, (onegroup_show.stdout | from_json).GROUP.ID | default(''))
-          }}
-      when:
-        - ldap_auth_file is defined
-        - validation.ldap_auth.group_mapping.expected_group_name | length > 0
+        - oned_ldap_auth.rc == 0
+        - (ldap_login_check.rc | d(1)) == 0
 
     - name: Read OpenNebula user info (JSON)
       ansible.builtin.shell: >
         ONE_AUTH="{{ ldap_auth_file.path }}" oneuser show -j "{{ validation.ldap_auth.ldap_user }}"
       register: oneuser_show_json
       changed_when: false
-      no_log: true
-      failed_when: oneuser_show_json.rc != 0
+      failed_when: false  # no_log removed — args hold a file path, not the password
       when:
-        - ldap_auth_file is defined
+        - _ldap_creds_ok | bool
+        - validation.ldap_auth.group_mapping.expected_group_name | length > 0
+        - oned_ldap_auth.rc == 0
+        - (ldap_login_check.rc | d(1)) == 0
+
+    - name: "Record OpenNebula group mapping result"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        _grp_json: "{{ (onegroup_show.stdout | from_json) if (onegroup_show.rc | d(1)) == 0 else {} }}"
+        _usr_json: "{{ (oneuser_show_json.stdout | from_json) if (oneuser_show_json.rc | d(1)) == 0 else {} }}"
+        _expected_gid: >-
+          {{ (validation.ldap_auth.group_mapping.expected_group_id | string)
+             if (validation.ldap_auth.group_mapping.expected_group_id | string | length > 0)
+             else (_grp_json.GROUP.ID | default('')) }}
+        _usr_groups: "{{ _usr_json.USER.GROUPS.ID | default([]) }}"
+        _lookups_ok: "{{ (onegroup_show.rc | d(1)) == 0 and (oneuser_show_json.rc | d(1)) == 0 }}"
+        _mapping_ok: >-
+          {{ ((_usr_json.USER.GNAME | default('')) == validation.ldap_auth.group_mapping.expected_group_name)
+             or (_usr_groups is string and (_usr_groups == _expected_gid))
+             or (_usr_groups is sequence and (_expected_gid in _usr_groups)) }}
+        result_key: "OpenNebula group mapping"
+        result_value: "{{ 'ok' if ((_lookups_ok | bool) and (_mapping_ok | bool)) else 'failed' }}"
+        result_comment: >-
+          {{ '' if ((_lookups_ok | bool) and (_mapping_ok | bool))
+             else (('onegroup show rc=' ~ (onegroup_show.rc | d('skipped'))
+                    ~ ', oneuser show rc=' ~ (oneuser_show_json.rc | d('skipped')))
+                   if not (_lookups_ok | bool)
+                   else ('user GNAME=' ~ (_usr_json.USER.GNAME | default('?'))
+                         ~ ' GROUPS=' ~ (_usr_groups | string)
+                         ~ ' do not match expected group '
+                         ~ validation.ldap_auth.group_mapping.expected_group_name
+                         ~ ' (id ' ~ (_expected_gid | string) ~ ')')) }}
+      when:
+        - _ldap_creds_ok | bool
+        - validation.ldap_auth.group_mapping.expected_group_name | length > 0
+        - oned_ldap_auth.rc == 0
+        - (ldap_login_check.rc | d(1)) == 0
+
+    - name: "Record OpenNebula group mapping skipped (login unavailable)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "OpenNebula group mapping"
+        result_value: >-
+          skipped — {{ 'OpenNebula LDAP auth driver configured'
+                       if oned_ldap_auth.rc != 0
+                       else 'LDAP user login to XML-RPC' }} failed
+      when:
+        - _ldap_creds_ok | bool
+        - validation.ldap_auth.group_mapping.expected_group_name | length > 0
+        - (oned_ldap_auth.rc != 0) or ((ldap_login_check.rc | d(1)) != 0)
+
+    - name: "Record OpenNebula group mapping skipped (no expected group configured)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "OpenNebula group mapping"
+        result_value: "skipped — no expected_group_name configured"
+      when: validation.ldap_auth.group_mapping.expected_group_name | length == 0
+
+    - name: "Record OpenNebula group mapping skipped (missing credentials)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "OpenNebula group mapping"
+        result_value: "skipped — missing ldap_user/ldap_pass"
+      when:
+        - not (_ldap_creds_ok | bool)
         - validation.ldap_auth.group_mapping.expected_group_name | length > 0
 
-    - name: Validate OpenNebula group mapping for user
-      ansible.builtin.set_fact:
-        verification_result: >-
-          {{
-            verification_result
-            | combine({
-                'OpenNebula group mapping':
-                (
-                  ((oneuser_show_json.stdout | from_json).USER.GNAME | default('') == validation.ldap_auth.group_mapping.expected_group_name)
-                  or
-                  (
-                    (oneuser_show_json.stdout | from_json).USER.GROUPS.ID | default([])
-                    is string
-                    and ((oneuser_show_json.stdout | from_json).USER.GROUPS.ID | default('') == _expected_group_id)
-                  )
-                  or
-                  (
-                    (oneuser_show_json.stdout | from_json).USER.GROUPS.ID | default([])
-                    is sequence
-                    and (_expected_group_id in ((oneuser_show_json.stdout | from_json).USER.GROUPS.ID | default([])))
-                  )
-                )
-                | ternary('ok', 'failed')
-              })
-          }}
-      when:
-        - ldap_auth_file is defined
-        - validation.ldap_auth.group_mapping.expected_group_name | length > 0
-
+    # --- XML-RPC (RPC2) login (comparison: recorded) ---
     - name: Read oned XML-RPC port from config
       ansible.builtin.shell: "awk -F '=' '/^PORT/ {gsub(/ /, \"\", $2); print $2; exit}' /etc/one/oned.conf"
       register: oned_port_cmd
@@ -263,27 +425,53 @@
         status_code: [200]
         return_content: true
       register: rpc2_login_result
-      no_log: true
-      failed_when:
-        - rpc2_login_result.status != 200
-        - rpc2_login_result.content is search('<fault>')
-      when: ldap_auth_file is defined
+      no_log: true  # request body embeds ldap_pass — keep hidden
+      failed_when: false
+      when:
+        - _ldap_creds_ok | bool
+        - oned_ldap_auth.rc == 0
 
-    - name: Save XML-RPC (RPC2) login result
-      ansible.builtin.set_fact:
-        verification_result: "{{ verification_result | combine({'XML-RPC (RPC2) login (LDAP)': 'ok'}) }}"
-      when: ldap_auth_file is defined
+    - name: "Record XML-RPC (RPC2) login result"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        _rpc2_ok: >-
+          {{ (rpc2_login_result.status | d(-1)) == 200
+             and ((rpc2_login_result.content | d('')) is not search('<fault>')) }}
+        result_key: "XML-RPC (RPC2) login (LDAP)"
+        result_value: "{{ 'ok' if (_rpc2_ok | bool) else 'failed' }}"
+        result_comment: >-
+          {{ '' if (_rpc2_ok | bool)
+             else ('status=' ~ (rpc2_login_result.status | d(-1)) ~ '; '
+                   ~ ('XML-RPC fault element in response'
+                      if ((rpc2_login_result.content | d('')) is search('<fault>'))
+                      else (rpc2_login_result.msg | d('no response') | truncate(200)))) }}
+      when:
+        - _ldap_creds_ok | bool
+        - oned_ldap_auth.rc == 0
 
-    - name: Report missing LDAP user credentials
-      ansible.builtin.set_fact:
-        verification_result: "{{ verification_result | combine({'LDAP user login to XML-RPC': 'skipped (missing ldap_user/ldap_pass)'}) }}"
-      when: ldap_auth_file is not defined
+    - name: "Record XML-RPC (RPC2) login skipped (auth driver not configured)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "XML-RPC (RPC2) login (LDAP)"
+        result_value: "skipped — OpenNebula LDAP auth driver configured failed"
+      when:
+        - _ldap_creds_ok | bool
+        - oned_ldap_auth.rc != 0
 
     - name: Report skipped XML-RPC (RPC2) login
-      ansible.builtin.set_fact:
-        verification_result: "{{ verification_result | combine({'XML-RPC (RPC2) login (LDAP)': 'skipped (missing ldap_user/ldap_pass)'}) }}"
-      when: ldap_auth_file is not defined
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "XML-RPC (RPC2) login (LDAP)"
+        result_value: "skipped (missing ldap_user/ldap_pass)"
+      when: not (_ldap_creds_ok | bool)
 
+    # --- FireEdge UI login (comparison: recorded) ---
     - name: Read FireEdge port from config
       ansible.builtin.shell: "awk '/^port:/ {print $2; exit}' /etc/one/fireedge-server.conf"
       register: fireedge_port_cmd
@@ -336,9 +524,11 @@
         validate_certs: "{{ not validation.ldap_auth.fireedge_skip_tls_verify }}"
       loop: "{{ _fireedge_login_endpoints }}"
       register: fireedge_login_attempts
-      no_log: true
+      no_log: true  # request body embeds ldap_pass — keep hidden
       failed_when: false
-      when: ldap_auth_file is defined
+      when:
+        - _ldap_creds_ok | bool
+        - oned_ldap_auth.rc == 0
 
     - name: Select first successful FireEdge login attempt
       ansible.builtin.set_fact:
@@ -350,33 +540,49 @@
               | list
               | first) | default({})
           }}
-      when: ldap_auth_file is defined
-
-    - name: Fail when FireEdge UI login failed
-      ansible.builtin.fail:
-        msg: "FireEdge UI login failed for endpoints {{ _fireedge_login_endpoints }}"
       when:
-        - ldap_auth_file is defined
-        - fireedge_login_result is not defined or fireedge_login_result == {}
+        - _ldap_creds_ok | bool
+        - oned_ldap_auth.rc == 0
 
-    - name: Save FireEdge UI login result
-      ansible.builtin.set_fact:
-        verification_result: >-
-          {{
-            verification_result
-            | combine({
-                'FireEdge UI login (LDAP)':
-                (fireedge_login_result.status is defined and fireedge_login_result.status in [200, 201])
-                | ternary('ok', 'failed')
-              })
-          }}
-      when: ldap_auth_file is defined
+    - name: "Record FireEdge UI login result"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        _fe_ok: "{{ fireedge_login_result.status is defined and fireedge_login_result.status in [200, 201] }}"
+        _fe_statuses: "{{ fireedge_login_attempts.results | d([]) | map(attribute='status', default=-1) | map('string') | list }}"
+        result_key: "FireEdge UI login (LDAP)"
+        result_value: "{{ 'ok' if (_fe_ok | bool) else 'failed' }}"
+        result_comment: >-
+          {{ '' if (_fe_ok | bool)
+             else ('no endpoint accepted the login; endpoints='
+                   ~ (_fireedge_login_endpoints | join(', '))
+                   ~ ' statuses=' ~ (_fe_statuses | join(', '))) }}
+      when:
+        - _ldap_creds_ok | bool
+        - oned_ldap_auth.rc == 0
+
+    - name: "Record FireEdge UI login skipped (auth driver not configured)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "FireEdge UI login (LDAP)"
+        result_value: "skipped — OpenNebula LDAP auth driver configured failed"
+      when:
+        - _ldap_creds_ok | bool
+        - oned_ldap_auth.rc != 0
 
     - name: Report skipped FireEdge UI login
-      ansible.builtin.set_fact:
-        verification_result: "{{ verification_result | combine({'FireEdge UI login (LDAP)': 'skipped (missing ldap_user/ldap_pass)'}) }}"
-      when: ldap_auth_file is not defined
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "FireEdge UI login (LDAP)"
+        result_value: "skipped (missing ldap_user/ldap_pass)"
+      when: not (_ldap_creds_ok | bool)
 
+    # --- Local auth fallback (comparison: recorded) ---
     - name: Check local auth file exists
       ansible.builtin.stat:
         path: "{{ validation.ldap_auth.local_auth_file }}"
@@ -387,21 +593,40 @@
         ONE_AUTH="{{ validation.ldap_auth.local_auth_file }}" oneuser show "{{ validation.ldap_auth.local_user }}"
       register: local_auth_check
       changed_when: false
-      failed_when: local_auth_check.rc != 0
+      failed_when: false
       when: local_auth_file.stat.exists
 
-    - name: Save local auth fallback result
-      ansible.builtin.set_fact:
-        verification_result: "{{ verification_result | combine({'Local auth fallback': 'ok'}) }}"
+    - name: "Record local auth fallback result"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Local auth fallback"
+        result_value: "{{ 'ok' if local_auth_check.rc == 0 else 'failed' }}"
+        result_comment: "{{ '' if local_auth_check.rc == 0 else (('rc=' ~ local_auth_check.rc ~ ' stderr=' ~ (local_auth_check.stderr | d('') | trim)) | truncate(300)) }}"
       when: local_auth_file.stat.exists
 
     - name: Report missing local auth file
-      ansible.builtin.set_fact:
-        verification_result: "{{ verification_result | combine({'Local auth fallback': 'skipped (missing local auth file)'}) }}"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Local auth fallback"
+        result_value: "skipped (missing local auth file)"
       when: not local_auth_file.stat.exists
 
+  rescue:
+    - name: "Record LDAP authentication validation failure"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_failure.yml
+      vars:
+        failure_key: "LDAP authentication validation"
+
+  always:
     - name: Remove temporary LDAP auth file
       ansible.builtin.file:
         path: "{{ ldap_auth_file.path }}"
         state: absent
-      when: ldap_auth_file is defined
+      failed_when: false  # cleanup must never abort the run
+      when: (ldap_auth_file | d({})).path is defined

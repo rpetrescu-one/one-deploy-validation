@@ -1,9 +1,19 @@
 ---
 - when: (hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host)
   block:
+    - name: "VM HA: skip — cluster discovery failed"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "VM HA validation"
+        result_value: "skipped — cluster discovery failed"
+      when: hostvars[groups[frontend_group | d('frontend')][0]].odv_discovery_failed | d(false)
+
     - name: Run VM HA validation per cluster
       ansible.builtin.include_tasks: per_cluster.yml
       loop: "{{ _one_clusters }}"
       loop_control:
         loop_var: current_cluster
         label: "{{ current_cluster.name }}"
+      when: not (hostvars[groups[frontend_group | d('frontend')][0]].odv_discovery_failed | d(false))

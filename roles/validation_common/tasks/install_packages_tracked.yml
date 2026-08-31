@@ -1,0 +1,38 @@
+---
+# Shared "install these packages one at a time (so the manifest can record
+# exactly which ones THIS run added) and register the newly-created ones"
+# primitive. Installed per-package rather than as one batch call: a batch
+# install's aggregate 'changed' would mark pre-installed packages as ours,
+# and the sweep would then try to uninstall packages this run never touched.
+#
+# Inputs (include vars):
+#   pkg_names - list of package names to ensure present
+#   pkg_role  - role slug used for the manifest_role attribution
+#
+# failed_when: false on the install itself, per the core-services precedent:
+# a transient package-manager failure here must not kill the calling block —
+# it only means that package's manifest entry (and its presence) can't be
+# assumed, never that the block should abort.
+
+- name: "install_packages_tracked ({{ pkg_role }}): install {{ pkg_names | join(', ') }}"
+  ansible.builtin.package:
+    name: "{{ item }}"
+    state: present
+  register: _ipt_install
+  failed_when: false
+  loop: "{{ pkg_names }}"
+
+- name: "install_packages_tracked ({{ pkg_role }}): register newly-installed packages"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: manifest_add.yml
+  vars:
+    manifest_type: package
+    manifest_id: ""
+    manifest_name: "{{ item.item }}"
+    manifest_cluster: ""
+    manifest_role: "{{ pkg_role }}"
+    manifest_disposition: created
+  loop: "{{ _ipt_install.results | d([]) | selectattr('changed') | list }}"
+  loop_control:
+    label: "{{ item.item }}"

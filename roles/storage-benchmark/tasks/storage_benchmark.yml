@@ -1,32 +1,114 @@
 ---
-# Storage benchmarking. Execute the block below only when validation.storage_benchmark is enabled.
-- name: Resolve benchmark cluster and template
-  ansible.builtin.set_fact:
-    current_cluster: "{{ _sb_pair.0 }}"
-    _sb_template: "{{ _sb_pair.1 }}"
+# Storage benchmark for one (cluster, template) pair. Included from main.yml
+# with loop_var _sb_pair = [cluster_entry, template_name].
+#
+# Harness shape: block (test) / rescue (record_failure) / always (terminate
+# the benchmark VM by its deterministic name). Cleanup never depends on
+# variables registered inside the failed block.
 
+- name: Resolve benchmark cluster, template and naming
+  ansible.builtin.include_tasks: naming.yml
+
+# Non-default templates (extra entries in validation.storage_benchmark.templates)
+# must pre-exist, cluster-suffixed, exactly as the previous lookup expected.
+# rc != 0 (broken CLI/frontend) is NOT treated as "missing": the harness block
+# below then fails into rescue with the real error instead of recording a
+# bogus skip.
+- name: "Check that non-default template '{{ _sb_template }}{{ current_cluster.name_suffix }}' exists"
+  ansible.builtin.shell: >
+    onetemplate list --csv -f NAME='{{ _sb_template }}{{ current_cluster.name_suffix }}' -l ID --no-header
+  register: _sb_tpl_precheck
+  failed_when: false
+  changed_when: false
+  when: not (_sb_default_template | bool)
+
+- name: Flag a missing non-default template
+  ansible.builtin.set_fact:
+    _sb_tpl_missing: >-
+      {{ (not (_sb_default_template | bool))
+         and ((_sb_tpl_precheck.rc | d(1)) == 0)
+         and (((_sb_tpl_precheck.stdout | d('')) | trim) == '') }}
+
+- name: "Record skip — template not found"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "{{ _sb_report_key }}"
+    result_value: "skipped — template not found"
+  when: _sb_tpl_missing | bool
+
+# The when: at the bottom of this block is inherited by rescue and always too:
+# a skipped pair created nothing, so nothing runs.
 - name: Run Storage benchmark test
   block:
-  - name: Get VM template as JSON
+  - name: "Debug: induced failure hook"
+    ansible.builtin.fail:
+      msg: "Induced failure (validation.debug.fail_in=storage_benchmark)"
+    when: (odv_fail_in | d((validation.debug | d({})).fail_in | d(''))) == 'storage_benchmark'
+
+  # Default template: reuse the image test_vm exported for this cluster when
+  # available; otherwise (validation.run_test_vm=false, or test_vm skipped
+  # this cluster) export/reuse it ourselves. ensure_test_template.yml is
+  # idempotent and registers template+image in the run manifest.
+  - name: "Ensure default test template exists in cluster '{{ current_cluster.name }}'"
+    ansible.builtin.include_role:
+      name: validation_common
+      tasks_from: ensure_test_template.yml
+    vars:
+      ensure_app_name: "{{ _sb_default_template_name }}"
+      ensure_name: "{{ _sb_default_template_name }}{{ current_cluster.name_suffix }}"
+      ensure_ds_id: "{{ current_cluster.image_ds_id }}"
+      ensure_role: storage-benchmark
+    when:
+      - _sb_default_template | bool
+      - current_cluster.name not in _test_vm_template_image_ids_map
+
+  - name: Get non-default VM template as JSON
     ansible.builtin.shell: >
       onetemplate show "{{ _sb_template }}{{ current_cluster.name_suffix }}" -j
     register: image_output
     failed_when: "image_output.rc != 0 and image_output.stdout == ''"
-    when: >-
-      (_sb_template != validation.test_vm.vm.market_name)
-      or (current_cluster.name not in _test_vm_template_image_ids_map)
+    when: not (_sb_default_template | bool)
 
   - name: Set benchmark image ID for this cluster
     ansible.builtin.set_fact:
       _sb_image_id: >-
         {{ _test_vm_template_image_ids_map[current_cluster.name]
-           if (_sb_template == validation.test_vm.vm.market_name
+           if ((_sb_default_template | bool)
                and current_cluster.name in _test_vm_template_image_ids_map)
-           else (image_output.stdout | from_json | json_query('VMTEMPLATE.TEMPLATE.DISK.IMAGE_ID')) }}
+           else (_export_image_id
+                 if (_sb_default_template | bool)
+                 else (image_output.stdout | from_json | json_query('VMTEMPLATE.TEMPLATE.DISK.IMAGE_ID'))) }}
 
+  - name: Assert the benchmark disk image was resolved
+    ansible.builtin.assert:
+      that: _sb_image_id | string | length > 0
+      fail_msg: >-
+        Could not resolve a disk image for template
+        '{{ _sb_template }}{{ current_cluster.name_suffix }}'
+        in cluster '{{ current_cluster.name }}'.
+
+  - name: "Manifest: register benchmark VM '{{ _sb_vm_name }}'"
+    ansible.builtin.include_role:
+      name: validation_common
+      tasks_from: manifest_add.yml
+    vars:
+      manifest_type: vm
+      manifest_id: ""
+      manifest_name: "{{ _sb_vm_name }}"
+      manifest_cluster: "{{ current_cluster.name | d('') }}"
+      manifest_role: storage-benchmark
+      manifest_disposition: created
+
+  # retries kept from the original task: if a failed attempt still created
+  # the VM, the retry fails on the already-taken name and the always:
+  # cleanup below removes the leftover by name.
   - name: Instantiate benchmark VM
     ansible.builtin.shell: >
-      onetemplate instantiate "{{ _sb_template }}{{ current_cluster.name_suffix }}" --nic '{{ current_cluster.storage_vnet_name }}' --disk {{ _sb_image_id }}:size=8000 --mem 1g
+      onetemplate instantiate "{{ _sb_template }}{{ current_cluster.name_suffix }}"
+      --name '{{ _sb_vm_name }}'
+      --nic '{{ current_cluster.storage_vnet_name }}' --disk {{ _sb_image_id }}:size=8000 --mem 1g
     register: benchmarkvm_id
     failed_when: "benchmarkvm_id.rc != 0"
     retries: 3
@@ -232,35 +314,38 @@
           }, recursive=True)
         }}
 
-  - name: Delete benchmark VM
-    ansible.builtin.shell: |
-      onevm terminate --hard {{ benchmarkvm_id.stdout.split(':')[1] }}
-    register: cleanup_result
-    failed_when: "cleanup_result.rc != 0"
-
   - name: "Record storage benchmark success for cluster '{{ current_cluster.name }}'"
-    ansible.builtin.set_fact:
-      verification_result: >-
-        {{ (verification_result | d({}))
-           | combine({'Storage benchmark' ~ current_cluster.report_suffix: 'ok'}) }}
+    ansible.builtin.include_role:
+      name: validation_common
+      tasks_from: record_result.yml
+    vars:
+      result_key: "{{ _sb_report_key }}"
+      result_value: "ok"
 
-  when: validation.run_storage_benchmark | d(true)
+  when: not (_sb_tpl_missing | bool)
   rescue:
-    - name: Best-effort cleanup of a leaked benchmark VM
-      ansible.builtin.shell: >
-        onevm terminate --hard {{ benchmarkvm_id.stdout.split(':')[1] | trim }}
-      failed_when: false
-      when:
-        - benchmarkvm_id is defined
-        - benchmarkvm_id.stdout is defined
-        - "':' in (benchmarkvm_id.stdout | string)"
+    - name: Record storage benchmark failure
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_failure.yml
+      vars:
+        failure_key: "{{ _sb_report_key }}"
 
-    - name: "Record storage benchmark failure for cluster '{{ current_cluster.name }}'"
-      ansible.builtin.set_fact:
-        verification_result: >-
-          {{ (verification_result | d({}))
-             | combine({'Storage benchmark (' ~ _sb_template ~ ')' ~ current_cluster.report_suffix: 'failed'}) }}
-
-    - name: "Show failure"
+    - name: Show failure
       ansible.builtin.debug:
-        msg: "Storage benchmark failed in cluster '{{ current_cluster.name }}', continuing with the next cluster."
+        msg: >-
+          Storage benchmark ({{ _sb_template }}) failed in cluster
+          '{{ current_cluster.name }}', continuing with the next pair.
+
+  always:
+    # Role-owned cleanup: state-independent (finds the VM by its deterministic
+    # name, never via variables registered in the block), idempotent, and
+    # never aborts the run (failed_when: false throughout).
+    - name: "Cleanup: terminate benchmark VM(s) named '{{ _sb_vm_name }}'"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: terminate_vm_by_name.yml
+      vars:
+        tvbn_name: "{{ _sb_vm_name }}"
+        tvbn_role: storage-benchmark
+        tvbn_retries: 30

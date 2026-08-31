@@ -4,14 +4,19 @@
   register: host_ids_and_names
   changed_when: false
 
+# ensure_test_template.yml wraps export_marketapp.yml and registers the
+# template+image in the run manifest (created when the export ran, reused
+# when pre-existing). The role never deletes them itself: the sweep play
+# removes manifest entries with disposition=created at the end of the run.
 - name: Ensure the conn matrix template exists in every cluster
   ansible.builtin.include_role:
     name: validation_common
-    tasks_from: export_marketapp.yml
+    tasks_from: ensure_test_template.yml
   vars:
-    _export_app_name: "{{ validation.conn_matrix.market_name }}"
-    _export_name: "{{ validation.conn_matrix.market_name }}{{ cm_cluster.name_suffix }}"
-    _export_ds_id: "{{ cm_cluster.image_ds_id }}"
+    ensure_app_name: "{{ validation.conn_matrix.market_name }}"
+    ensure_name: "{{ validation.conn_matrix.market_name }}{{ cm_cluster.name_suffix }}"
+    ensure_ds_id: "{{ cm_cluster.image_ds_id }}"
+    ensure_role: conn_matrix
   loop: "{{ _one_clusters }}"
   loop_control:
     loop_var: cm_cluster
@@ -28,24 +33,14 @@
   loop: "{{ host_ids_and_names.stdout_lines }}"
   when: item.split(',')[0] in _host_id_to_cluster
 
-# A failing host/cluster must not abort the play: downstream tasks tolerate a
-# partial VM map, so record the failure and continue.
-- name: Create the per-host VM groups and VMs
-  block:
-    - name: Create a dedicated VM group and VM for each host
-      ansible.builtin.include_tasks: conn_matrix_per_host.yml
-      loop: "{{ host_ids_and_names.stdout_lines }}"
-      when: item.split(',')[0] in _host_id_to_cluster
-  rescue:
-    - name: Record connectivity matrix VM creation failure
-      ansible.builtin.set_fact:
-        verification_result: >-
-          {{ (verification_result | d({}))
-             | combine({'Connectivity matrix VM creation (host id ' ~ (host_id | d('?')) ~ ')': 'failed'}) }}
-
-    - name: Show failure
-      ansible.builtin.debug:
-        msg: "Connectivity matrix VM creation failed (host id {{ host_id | d('?') }}); continuing with the VMs that were created."
+# A failing host/cluster must not abort the play: each iteration of
+# conn_matrix_per_host.yml carries its OWN rescue, records
+# 'Connectivity matrix VM creation (host id N)' and lets the loop continue
+# with the NEXT host. Downstream tasks tolerate a partial VM map.
+- name: Create a dedicated VM group and VM for each host
+  ansible.builtin.include_tasks: conn_matrix_per_host.yml
+  loop: "{{ host_ids_and_names.stdout_lines }}"
+  when: item.split(',')[0] in _host_id_to_cluster
 
 - name: Get VM host to VM IP mapping
   shell: onevm list -f NAME~conn-mtx-vm-on-host -l HOST,IP --csv --no-header

@@ -1,23 +1,38 @@
 ---
+# One iteration of the frontend cleanup loop (`item` = 'HOSTID,HOSTNAME').
+# State-independent: tolerates a VM / VM group that was never created or is
+# already gone. Must never abort the run (called from the always section) —
+# unexpected CLI failures become odv_leftovers entries.
+
 - name: Set host_id for this iteration
   ansible.builtin.set_fact:
     host_id: "{{ item.split(',')[0] }}"
 
-- name: "Host id: {{ host_id }} -- Fetch VM ID for this host"
-  ansible.builtin.command: onevm list -l ID --csv --filter NAME=conn-mtx-vm-on-host-{{ host_id }} --no-header
-  register: vm_id_result
-  failed_when: vm_id_result.rc != 0
-  changed_when: false
-
-# The VM may not exist when its creation failed earlier and was rescued.
 - name: "Host id: {{ host_id }} -- Terminate VM for this host"
-  ansible.builtin.command: onevm terminate {{ vm_id_result.stdout }}
-  register: terminate_result
-  failed_when: terminate_result.rc != 0
-  when: vm_id_result.stdout | trim | length > 0
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: terminate_vm_by_name.yml
+  vars:
+    tvbn_name: "conn-mtx-vm-on-host-{{ host_id }}"
+    tvbn_role: conn_matrix
+    tvbn_detail_suffix: "; VM may remain"
 
 - name: "Host id: {{ host_id }} -- Delete VM Group"
   ansible.builtin.command: onevmgroup delete only-host-{{ host_id }}
   register: vmgroup_delete
-  # Tolerate a VM group that was never created (failed/rescued earlier runs).
-  failed_when: vmgroup_delete.rc != 0 and 'rror getting' not in vmgroup_delete.stderr
+  changed_when: vmgroup_delete.rc == 0
+  failed_when: false
+
+# 'rror getting' (Error getting ...) = the group never existed: benign.
+- name: "Host id: {{ host_id }} -- Record VM group that could not be deleted"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_leftover.yml
+  vars:
+    leftover_type: vm_group
+    leftover_name: "only-host-{{ host_id }}"
+    leftover_role: conn_matrix
+    leftover_detail: "{{ ((vmgroup_delete.stderr | d('')) | trim)[:200] }}"
+  when:
+    - (vmgroup_delete.rc | d(0)) != 0
+    - "'rror getting' not in (vmgroup_delete.stderr | d(''))"

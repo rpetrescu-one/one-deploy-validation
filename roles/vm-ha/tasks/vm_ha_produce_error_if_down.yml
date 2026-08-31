@@ -1,4 +1,10 @@
 ---
+# Downs an interface on the target node to trigger host fencing. The interface
+# is intentionally NEVER restored by the suite: it may be the node's only SSH
+# path, and the HA hook powers the host off anyway. per_cluster.yml's always
+# block re-enables the host in OpenNebula (best effort) and records an
+# odv_leftovers host_state entry when the host does not come back — recovery
+# is out-of-band by design.
 - name: Set fact for interface name to bring down
   set_fact:
     _target_if_name: "{{ validation.vm_ha.if_down_params.interface_name }}"

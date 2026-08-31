@@ -1,3 +1,4 @@
+---
 - name: Verify that VM image is in ready state
   ansible.builtin.shell: >
     oneimage list --f ID={{ _test_vm_template_image_ids_map[current_cluster.name] }} -l STAT --no-header
@@ -6,15 +7,31 @@
   retries: 10
   delay: 10
 
+# Registered BEFORE instantiate: if anything fails between here and the VM
+# reaching RUNNING, the sweep play still knows the name to look for.
+- name: "Manifest: register test VM"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: manifest_add.yml
+  vars:
+    manifest_type: vm
+    manifest_id: ""
+    manifest_name: "{{ _odv_test_vm_name }}"
+    manifest_cluster: "{{ current_cluster.name | d('') }}"
+    manifest_role: test_vm
+    manifest_disposition: created
+
 # --nic anchors the VM to the cluster: the scheduler only considers hosts of
-# the cluster the vnet belongs to.
+# the cluster the vnet belongs to. --name makes cleanup deterministic: one VM
+# per frontend host in HA inventories, each cleaned by its own host's always.
 - name: Instantiate test VM
   vars:
     _connect_vnet_name: >-
       {{ ((validation.cluster_overrides | d({})).get(current_cluster.name, {})).vnet_name
          | d(current_cluster.vnet_name) }}
   ansible.builtin.shell: >
-    onetemplate instantiate {{ _test_vm_template_ids_map[current_cluster.name] }} --nic '{{ _connect_vnet_name }}'
+    onetemplate instantiate {{ _test_vm_template_ids_map[current_cluster.name] }}
+    --nic '{{ _connect_vnet_name }}' --name '{{ _odv_test_vm_name }}'
   register: vm_id
   failed_when: "vm_id.rc != 0"
 
@@ -28,5 +45,9 @@
   delay: 10
 
 - name: Verify test VM
-  set_fact:
-    verification_result: "{{ (verification_result | default({})) | combine({'Test VM instantiation' ~ current_cluster.report_suffix : 'ok' }) }}"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "Test VM instantiation{{ current_cluster.report_suffix }}"
+    result_value: "ok"

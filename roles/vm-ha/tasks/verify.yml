@@ -1,5 +1,54 @@
 ---
 # Only execute these steps on a single frontend host AND when VM HA validation is enabled
+
+# The host_error hook runs on the RAFT LEADER, so /var/log/one/host_error.log
+# exists only there — on an FE-HA zone that is usually NOT the primary
+# frontend this role runs on (reading it locally made every hook/fencing
+# check fail while fencing had actually succeeded). Resolve the leader once
+# and delegate every host_error.log read to it; single-frontend deployments
+# resolve to this same host.
+- name: Resolve the RAFT leader that runs the host_error hook
+  ansible.builtin.shell: >
+    onezone show 0 -j
+  register: _vm_ha_zone_json
+  changed_when: false
+  failed_when: false
+  become: true
+  become_user: oneadmin
+
+- name: Read each frontend's RAFT SERVER_ID
+  ansible.builtin.shell: >
+    awk -F= '/^[[:space:]]*SERVER_ID[[:space:]]*=/{gsub(/[^0-9]/,"",$2); print $2; exit}'
+    {{ validation.vm_ha.oned_conf | d('/etc/one/oned.conf') }}
+  register: _vm_ha_server_ids
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ item }}"
+  loop: "{{ groups[frontend_group | d('frontend')] | d([]) }}"
+
+- name: Map the leader's SERVER_ID to an inventory host
+  ansible.builtin.set_fact:
+    _vm_ha_log_host: "{{ (_matches | first) | d(inventory_hostname, true) }}"
+  vars:
+    _servers: >-
+      {{ ((_vm_ha_zone_json.stdout | d('{}') | from_json).ZONE | d({})).SERVER_POOL | d({}) }}
+    _server_raw: "{{ _servers.SERVER | d([]) }}"
+    _server_list: "{{ [_server_raw] if (_server_raw is mapping) else _server_raw }}"
+    _leader_id: >-
+      {{ (_server_list | selectattr('STATE', 'equalto', '3') | map(attribute='ID')
+          | list | first) | d('', true) }}
+    _matches: >-
+      {{ _vm_ha_server_ids.results | d([])
+         | selectattr('stdout', 'defined')
+         | selectattr('stdout', 'equalto', _leader_id | string)
+         | map(attribute='item') | list }}
+
+- name: Show which frontend holds the hook log
+  ansible.builtin.debug:
+    msg: >-
+      host_error.log will be read on '{{ _vm_ha_log_host }}' (RAFT leader;
+      falls back to this host when the leader cannot be resolved).
+
 - name: Get last timestamp from host_error.log before test
   ansible.builtin.shell: |
     if [ -s /var/log/one/host_error.log ]; then
@@ -8,6 +57,7 @@
       echo ""
     fi
   register: last_host_error_timestamp
+  delegate_to: "{{ _vm_ha_log_host }}"
   changed_when: false
 
 - name: Force status update to notice the error quicker
@@ -39,6 +89,7 @@
         if($2==last_ts) found=1; else if(found && $0 ~ /Hook launched/) print $0
       }' /var/log/one/host_error.log | grep "Hook launched"
   register: hook_log_check
+  delegate_to: "{{ _vm_ha_log_host }}"
   failed_when: hook_log_check.rc != 0
   changed_when: false
   retries: 10
@@ -56,6 +107,7 @@
         if($2==last_ts) found=1; else if(found && $0 ~ /Fencing enabled/) print $0
       }' /var/log/one/host_error.log | grep "Fencing enabled"
   register: fencing_log_check
+  delegate_to: "{{ _vm_ha_log_host }}"
   failed_when: fencing_log_check.rc != 0
   changed_when: false
   retries: "{{ _fencing_check_retries }}"
@@ -74,6 +126,7 @@
         if($2==last_ts) found=1; else if(found && $0 ~ /Fencing success/) print $0
       }' /var/log/one/host_error.log | grep "Fencing success"
   register: fencing_success_log_check
+  delegate_to: "{{ _vm_ha_log_host }}"
   failed_when: fencing_success_log_check.rc != 0
   changed_when: false
   retries: 5
@@ -92,6 +145,7 @@
         if($2==last_ts) found=1; else if(found && $0 ~ /Hook finished/) print $0
       }' /var/log/one/host_error.log | grep "Hook finished"
   register: hook_finished_log_check
+  delegate_to: "{{ _vm_ha_log_host }}"
   failed_when: hook_finished_log_check.rc != 0
   changed_when: false
   retries: 5
@@ -102,14 +156,36 @@
   set_fact:
     verification_result: "{{ verification_result | combine({'VM HA: error hook successful' ~ current_cluster.report_suffix: 'ok'}) }}"
 
-- name: Wait for VM to be in running state on a new host
-  ansible.builtin.shell: >
-    onevm list --f ID={{ test_vm_ha_id }} -l STAT --no-header
-  register: vm_state
-  failed_when: "vm_state.rc != 0 or vm_state.stdout != 'runn'"
-  until: vm_state.stdout == "runn"
-  retries: 10
-  delay: 10
+# The -r recreate makes the surviving node PROLOG-clone the image from
+# scratch (local TM) — 100s is not enough on slow labs; window configurable.
+# The delete-recreate can also WEDGE in CLEANUP_RESUBMIT forever: when the
+# cleanup driver command races the fencing power-off, oned cancels it and no
+# completion callback ever arrives (observed live: "Driver command for <id>
+# cancelled" then silence; the good case fails fast with "No route to host"
+# -> "Host successfully cleaned" -> resubmit in seconds). After the VM sits
+# in clea* for cleanup_wedge_polls consecutive polls, apply OpenNebula's
+# documented operator remedy ONCE — `onevm recover --failure`, which marks
+# the in-flight cleanup as failed (true: the host is dead) so the VM
+# resubmits. A nudged recovery is reported as WARNING, never silent ok.
+- name: Wait for VM to be in running state on a new host (unwedge stalled cleanup)
+  ansible.builtin.shell: |
+    nudged=""
+    stuck=0
+    st=""
+    for i in $(seq 1 {{ (validation.vm_ha | d({})).recovery_retries | d(60) }}); do
+      st=$(onevm list --f ID={{ test_vm_ha_id }} -l STAT --no-header | tr -d ' ')
+      if [ "$st" = "runn" ]; then echo "STAT=runn${nudged}"; exit 0; fi
+      case "$st" in clea*) stuck=$((stuck+1)) ;; *) stuck=0 ;; esac
+      if [ -z "$nudged" ] && [ "$stuck" -ge {{ (validation.vm_ha | d({})).cleanup_wedge_polls | d(12) }} ]; then
+        onevm recover --failure {{ test_vm_ha_id }} && nudged=" NUDGED"
+      fi
+      sleep {{ (validation.vm_ha | d({})).recovery_delay | d(10) }}
+    done
+    echo "STAT=${st:-?}${nudged}"
+    exit 1
+  register: vm_recovery
+  changed_when: false
+  failed_when: vm_recovery.rc != 0
 
 - name: Get new VM hostname after recovery
   ansible.builtin.shell: >
@@ -119,18 +195,9 @@
 
 - name: Save VM recovery success on new host
   set_fact:
-    verification_result: "{{ verification_result | combine({'VM HA: VM recovered successfully on host' ~ current_cluster.report_suffix: new_vm_hostname.stdout}) }}"
-
-- name: Delete test VM
-  ansible.builtin.shell: |
-    onevm terminate --hard {{ test_vm_ha_id }}
-  register: cleanup_result
-  failed_when: "cleanup_result.rc != 0"
-
-- name: Wait until the test VM is deleted
-  ansible.builtin.shell: >
-    onevm show -j {{ test_vm_ha_id }} | jq -r .VM.STATE  
-  register: vm_state_result
-  until: vm_state_result.stdout is search('6')
-  retries: 10
-  delay: 10
+    verification_result: "{{ verification_result | combine({'VM HA: VM recovered successfully on host' ~ current_cluster.report_suffix: _vm_ha_recovery_value}) }}"
+  vars:
+    _vm_ha_recovery_value: >-
+      {{ new_vm_hostname.stdout if 'NUDGED' not in (vm_recovery.stdout | d(''))
+         else 'warning — recovered on ' ~ new_vm_hostname.stdout
+              ~ " only after 'onevm recover --failure': the hook's delete-recreate wedged in CLEANUP_RESUBMIT against the fenced host (cleanup driver command cancelled by oned, no callback)" }}

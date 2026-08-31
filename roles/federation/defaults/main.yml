@@ -42,3 +42,12 @@ _federation_check_vnets: "{{ validation.federation.check_vnets | d(true) }}"
 _federation_check_time_sync: "{{ validation.federation.check_time_sync | d(true) }}"
 _federation_max_time_drift: "{{ validation.federation.max_time_drift | d(60) }}"  # seconds
 _federation_max_replication_lag: "{{ validation.federation.max_replication_lag | d(300) }}"  # 5 minutes
+
+# Per-include sub-check toggles (consumed by tasks/main.yml; names match the
+# tasks/check_*.yml file names)
+_federation_check_federation_config: "{{ validation.federation.check_federation_config | d(true) }}"
+_federation_check_zones: "{{ validation.federation.check_zones | d(true) }}"
+_federation_check_endpoints: "{{ validation.federation.check_endpoints | d(true) }}"
+_federation_check_data_sync: "{{ validation.federation.check_data_sync | d(true) }}"
+_federation_check_advanced_sync: "{{ validation.federation.check_advanced_sync | d(true) }}"
+_federation_check_consistency: "{{ validation.federation.check_consistency | d(true) }}"

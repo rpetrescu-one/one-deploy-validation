@@ -1,13 +1,21 @@
 ---
 - name: "VM HA validation for cluster '{{ current_cluster.name }}'"
   block:
-    # Each cluster iteration must resolve its own target node and VM.
+    # FIRST, before anything can fail (including the hook below): host_id is
+    # also set as a fact by conn_matrix on this same host — the always-block
+    # must never see a stale cross-role value.
     - name: Reset target node and VM facts for this cluster
       ansible.builtin.set_fact:
         target_node_for_error: ""
         test_vm_ha_id: ""
         host_name: ""
         host_id: ""
+        _vm_ha_ds_id: ""
+
+    - name: "Debug: induced failure hook"
+      ansible.builtin.fail:
+        msg: "Induced failure (validation.debug.fail_in=vm_ha)"
+      when: (odv_fail_in | d((validation.debug | d({})).fail_in | d(''))) == 'vm_ha'
 
     - name: Setup VM for HA test
       ansible.builtin.include_tasks: setup_vm.yml
@@ -38,18 +46,171 @@
         _fencing_check_retries: "{{ validation.vm_ha.fencing_check_retries | default(8) }}"
         _fencing_check_delay: "{{ validation.vm_ha.fencing_check_delay | default(60) }}"
   rescue:
-    - name: Best-effort cleanup of a leaked HA test VM
-      ansible.builtin.shell: >
-        onevm terminate --hard {{ test_vm_ha_id }}
-      failed_when: false
-      when: (test_vm_ha_id | d('')) | string | length > 0
-
-    - name: "Record VM HA failure for cluster '{{ current_cluster.name }}'"
-      ansible.builtin.set_fact:
-        verification_result: >-
-          {{ (verification_result | d({}))
-             | combine({'VM HA validation' ~ current_cluster.report_suffix: 'failed'}) }}
+    - name: "Record VM HA failure"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_failure.yml
+      vars:
+        failure_key: "VM HA validation{{ current_cluster.report_suffix }}"
 
     - name: "Show failure"
       ansible.builtin.debug:
         msg: "VM HA validation failed in cluster '{{ current_cluster.name }}', continuing with the next cluster."
+  always:
+    # Role-owned cleanup: idempotent and state-independent. Terminate by NAME
+    # (not by the registered id) so it also catches a VM whose id we never
+    # learned. Every task tolerates already-gone resources — cleanup must
+    # never abort the run.
+    - name: "Cleanup: terminate HA test VM by name"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: terminate_vm_by_name.yml
+      vars:
+        tvbn_name: "test_vm_ha{{ current_cluster.name_suffix }}"
+        tvbn_role: vm-ha
+
+    # The fenced host was cut off and powered down ON PURPOSE. Its downed
+    # interface may be our only SSH path to that node, so we deliberately do
+    # NOT try to restore the interface over SSH.
+    #
+    # A dead host left in ERROR re-triggers the host_error hook every few
+    # minutes and each re-fire re-fences the node — powering it back on
+    # manually LOSES that race (observed live: node re-powered-off 2 minutes
+    # after resume). So the dead host is set OFFLINE, which stops monitoring
+    # and with it the re-fire loop. A host that is still monitored (the test
+    # failed before fencing) is left untouched.
+    - name: "Cleanup: read the fenced host's state"
+      ansible.builtin.shell: |
+        onehost show {{ host_id }} -j 2>/dev/null | jq -r .HOST.STATE
+      become: true
+      become_user: oneadmin
+      register: _vm_ha_host_state0
+      failed_when: false
+      changed_when: false
+      when: (host_id | d('')) | string | length > 0
+
+    - name: "Cleanup: set the dead fenced host offline (stops hook re-fires)"
+      ansible.builtin.command: onehost offline {{ host_id }}
+      become: true
+      become_user: oneadmin
+      failed_when: false
+      when:
+        - (host_id | d('')) | string | length > 0
+        - ((_vm_ha_host_state0.stdout | d('')) | trim) not in ['1', '2']
+
+    # Optional automated node recovery — the power-on counterpart of the
+    # operator's fence driver: validation.vm_ha.node_power_on_cmd runs on
+    # this frontend as oneadmin with $ODV_FENCED_HOST (OpenNebula host NAME)
+    # and $ODV_FENCED_HOST_ID in the environment. The suite then waits for
+    # the node to boot, removes the stale system-datastore directory the
+    # fenced recreate left behind, re-enables the host and waits for it to
+    # be monitored again. Without the command the host stays OFFLINE and the
+    # leftover below carries the manual runbook.
+    - name: "Cleanup: automated fenced-node recovery"
+      when:
+        - (host_id | d('')) | string | length > 0
+        - ((_vm_ha_host_state0.stdout | d('')) | trim) not in ['1', '2']
+        - ((validation.vm_ha | d({})).node_power_on_cmd | d('')) | length > 0
+      block:
+        - name: "Recover: power the fenced node back on"
+          ansible.builtin.shell: "{{ validation.vm_ha.node_power_on_cmd }}"
+          become: true
+          become_user: oneadmin
+          environment:
+            ODV_FENCED_HOST: "{{ host_name | d('') }}"
+            ODV_FENCED_HOST_ID: "{{ host_id }}"
+          register: _vm_ha_power_on
+          failed_when: false
+
+        - name: "Recover: wait for the node to boot"
+          ansible.builtin.wait_for_connection:
+            timeout: "{{ (validation.vm_ha | d({})).node_boot_timeout | d(300) }}"
+          delegate_to: "{{ target_node_for_error }}"
+          register: _vm_ha_boot
+          ignore_errors: true
+          when: (target_node_for_error | d('')) | length > 0
+
+        - name: "Recover: remove the stale datastore dir left by the fenced recreate"
+          ansible.builtin.file:
+            path: "/var/lib/one/datastores/{{ _vm_ha_ds_id | d('0', true) }}/{{ test_vm_ha_id }}"
+            state: absent
+          delegate_to: "{{ target_node_for_error }}"
+          failed_when: false
+          when:
+            - (target_node_for_error | d('')) | length > 0
+            - (test_vm_ha_id | d('')) | string | length > 0
+            - not (_vm_ha_boot.failed | d(false))
+
+        - name: "Recover: re-enable the host"
+          ansible.builtin.command: onehost enable {{ host_id }}
+          become: true
+          become_user: oneadmin
+          failed_when: false
+          when:
+            - (target_node_for_error | d('')) | length > 0
+            - not (_vm_ha_boot.failed | d(false))
+
+    # HOST/STATE 1 = MONITORING_MONITORED, 2 = MONITORED — anything else
+    # after the grace loop means the host needs manual recovery. One quick
+    # probe on the manual path (the host was deliberately left OFFLINE and
+    # will not change); a real convergence window when auto-recovery ran.
+    - name: "Cleanup: check whether the fenced host is monitored again"
+      ansible.builtin.shell: |
+        st=""
+        for i in $(seq 1 {{ _vm_ha_mon_attempts }}); do
+          st=$(onehost show {{ host_id }} -j 2>/dev/null | jq -r .HOST.STATE)
+          case "$st" in 1|2) break ;; esac
+          sleep 10
+        done
+        printf '%s' "$st"
+      vars:
+        # One quick probe unless auto-recovery ran AND the node booted —
+        # otherwise the host is knowably OFFLINE and polling is wasted.
+        _vm_ha_mon_attempts: >-
+          {{ (validation.vm_ha | d({})).node_monitored_retries | d(30)
+          if ((((validation.vm_ha | d({})).node_power_on_cmd | d('')) | length > 0)
+          and not ((_vm_ha_boot | d({})).failed | d(false)))
+          else 1 }}
+      register: _vm_ha_host_state
+      failed_when: false
+      changed_when: false
+      when: (host_id | d('')) | string | length > 0
+
+    - name: "Record result: fenced host recovered automatically"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "VM HA: fenced host recovered automatically{{ current_cluster.report_suffix }}"
+        result_value: "ok"
+        result_comment: >-
+          node {{ host_name | d('?', true) }} powered back on via
+          node_power_on_cmd, stale datastore dir removal attempted, host
+          re-enabled and monitored again
+      when:
+        - (host_id | d('')) | string | length > 0
+        - ((validation.vm_ha | d({})).node_power_on_cmd | d('')) | length > 0
+        - ((_vm_ha_host_state0.stdout | d('')) | trim) not in ['1', '2']
+        - ((_vm_ha_host_state.stdout | d('')) | trim) in ['1', '2']
+
+    - name: "Leftover: fenced host did not return to a monitored state"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_leftover.yml
+      vars:
+        leftover_type: host_state
+        leftover_name: "fenced:{{ host_name | d('?', true) }}"
+        leftover_role: vm-ha
+        leftover_detail: >-
+          host fenced by VM-HA test — manual recovery required (interface
+          {{ validation.vm_ha.if_down_params.interface_name | d('?') }}
+          downed on {{ host_name | d('?', true) }}, host powered off by
+          fencing, offline attempted to stop hook re-fires; last
+          STATE={{ ((_vm_ha_host_state.stdout | d('')) | trim) or 'unreachable' }}.
+          To recover: power the node back on, wait for it to boot, run
+          'onehost enable {{ host_id }}', and remove the stale directory
+          /var/lib/one/datastores/{{ _vm_ha_ds_id | d('0', true) }}/{{ test_vm_ha_id | d('?', true) }}
+          the fenced recreate left on the node)
+      when:
+        - (host_id | d('')) | string | length > 0
+        - ((_vm_ha_host_state.stdout | d('')) | trim) not in ['1', '2']

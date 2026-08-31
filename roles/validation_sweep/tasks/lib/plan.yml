@@ -1,0 +1,41 @@
+---
+# Pure logic (unit-tested): turn the aggregated manifest into a sweep plan.
+# Input fact:  _sweep_manifest (list of manifest entries, all hosts)
+# Config:      validation.cleanup.keep_exported_images | d(false)
+# Output fact: _sweep_plan — entries deduped by (type, name[, host for
+#              host-local types]), host_state excluded (reported via
+#              odv_leftovers by the owning role), with added 'action':
+#              delete | keep-reused | keep-by-flag.
+# Rules: if ANY duplicate says 'created' the resource is ours -> delete;
+# all-'reused' -> keep-reused; images/templates are kept when the
+# keep_exported_images flag is set; the first non-empty id among dupes wins.
+
+- name: Compute sweep plan
+  ansible.builtin.set_fact:
+    _sweep_plan: >-
+      {%- set out = [] -%}
+      {%- set seen = [] -%}
+      {%- set local_types = ['file', 'package', 'process', 'ip_addr'] -%}
+      {%- set keep_images = ((((validation | d({})).cleanup | d({})).keep_exported_images | d(false)) | bool) -%}
+      {%- for e in _sweep_manifest | d([]) if e.type != 'host_state' -%}
+        {%- set key = e.type ~ '|' ~ e.name ~ '|' ~ (e.host if e.type in local_types else '') -%}
+        {%- if key not in seen -%}
+          {%- set _ = seen.append(key) -%}
+          {%- set dupes = _sweep_manifest | selectattr('type', 'equalto', e.type)
+                                          | selectattr('name', 'equalto', e.name) | list -%}
+          {%- if e.type in local_types -%}
+            {%- set dupes = dupes | selectattr('host', 'equalto', e.host) | list -%}
+          {%- endif -%}
+          {%- set created = (dupes | selectattr('disposition', 'equalto', 'created') | list | length) > 0 -%}
+          {%- if not created -%}
+            {%- set action = 'keep-reused' -%}
+          {%- elif e.type in ['image', 'template'] and keep_images -%}
+            {%- set action = 'keep-by-flag' -%}
+          {%- else -%}
+            {%- set action = 'delete' -%}
+          {%- endif -%}
+          {%- set best_id = (dupes | map(attribute='id') | select('ne', '') | list | first | d('')) -%}
+          {%- set _ = out.append(e | combine({'action': action, 'id': best_id})) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}

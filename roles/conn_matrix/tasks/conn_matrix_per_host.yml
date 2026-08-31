@@ -1,64 +1,105 @@
 ---
-- name: Set host_id, cluster and ssh_public_key for this iteration
-  ansible.builtin.set_fact:
-    host_id: "{{ item.split(',')[0] }}"
-    current_cluster: "{{ _host_id_to_cluster[item.split(',')[0]] }}"
-    ssh_public_key: >-
-      {{
-        hostvars[ groups[ frontend_group | d('frontend') ][0] ]
-        ['conn_matrix_pubkeys'][ host_name_to_hostname_cmd[item.split(',')[1]] ]
-      }}
+# One iteration of the per-host VM creation loop (the loop lives in
+# frontend_create_vms.yml; `item` is one 'HOSTID,HOSTNAME' csv line).
+# Each iteration carries its OWN rescue: a failing host records
+# 'Connectivity matrix VM creation (host id N)' and the loop continues with
+# the next host instead of skipping the rest.
+- name: Create conn-matrix VM group and VM for this host
+  block:
+    - name: Set host_id, cluster and ssh_public_key for this iteration
+      ansible.builtin.set_fact:
+        host_id: "{{ item.split(',')[0] }}"
+        current_cluster: "{{ _host_id_to_cluster[item.split(',')[0]] }}"
+        ssh_public_key: >-
+          {{
+            hostvars[ groups[ frontend_group | d('frontend') ][0] ]
+            ['conn_matrix_pubkeys'][ host_name_to_hostname_cmd[item.split(',')[1]] ]
+          }}
 
-- name: "Host id: {{ host_id }} -- Render vm group template"
-  template:
-    src: vm-group.tmpl.j2
-    dest: /tmp/vm-group-{{ host_id }}.tmpl
+    - name: "Host id: {{ host_id }} -- Render vm group template"
+      ansible.builtin.template:
+        src: vm-group.tmpl.j2
+        dest: /tmp/vm-group-{{ host_id }}.tmpl
 
-- name: "Host id: {{ host_id }} -- Create OpenNebula VM Group from template file"
-  ansible.builtin.command: onevmgroup create "/tmp/vm-group-{{ host_id }}.tmpl"
-  register: vmgroup_create
-  changed_when: "'ID' in vmgroup_create.stdout"
-  failed_when: vmgroup_create.rc != 0 and (vmgroup_create.rc != 255 or 'NAME is already taken by VMGroup' not in vmgroup_create.stderr)
+    - name: "Host id: {{ host_id }} -- Create OpenNebula VM Group from template file"
+      ansible.builtin.command: onevmgroup create "/tmp/vm-group-{{ host_id }}.tmpl"
+      register: vmgroup_create
+      changed_when: "'ID' in vmgroup_create.stdout"
+      failed_when: vmgroup_create.rc != 0 and (vmgroup_create.rc != 255 or 'NAME is already taken by VMGroup' not in vmgroup_create.stderr)
 
-- name: "Host id: {{ host_id }} -- Render vm template"
-  template:
-    src: vm.tmpl.j2
-    dest: /tmp/vm-on-host-{{ host_id }}.tmpl
-  
-- name: "Host id: {{ host_id }} -- Read file content into a variable"
-  ansible.builtin.slurp:
-    src: /tmp/vm-on-host-{{ host_id }}.tmpl
-  register: extra_template_content_raw
-  no_log: true
+    - name: "Manifest: register VM group only-host-{{ host_id }}"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: manifest_add.yml
+      vars:
+        manifest_type: vm_group
+        manifest_id: ""
+        manifest_name: "only-host-{{ host_id }}"
+        manifest_cluster: "{{ current_cluster.name | d('') }}"
+        manifest_role: conn_matrix
+        manifest_disposition: "{{ vmgroup_create.changed | ternary('created', 'reused') }}"
 
-- name: "Host id: {{ host_id }} -- Check if VM already exists"
-  ansible.builtin.command: onevm list -l ID --csv --filter NAME=conn-mtx-vm-on-host-{{ host_id }} --no-header
-  register: existing_vm
-  changed_when: false
+    - name: "Host id: {{ host_id }} -- Render vm template"
+      ansible.builtin.template:
+        src: vm.tmpl.j2
+        dest: /tmp/vm-on-host-{{ host_id }}.tmpl
 
-- name: "Host id: {{ host_id }} -- Instantiate test VM"
-  ansible.builtin.command:
-    argv:
-      - onetemplate
-      - instantiate
-      - "{{ validation.conn_matrix.market_name }}{{ current_cluster.name_suffix }}"
-      - --nic
-      - "{{ current_cluster.conn_matrix_vnet_name }}"
-      - --name
-      - "conn-mtx-vm-on-host-{{ host_id }}"
-      - --raw
-      - >-
-        {{ extra_template_content_raw.content | b64decode }}
-  register: vm_id
-  failed_when: "vm_id.rc != 0" 
-  when: existing_vm.stdout == ""
+    - name: "Host id: {{ host_id }} -- Read file content into a variable"
+      ansible.builtin.slurp:
+        src: /tmp/vm-on-host-{{ host_id }}.tmpl
+      register: extra_template_content_raw
+      no_log: true
 
-- name: "Host id: {{ host_id }} -- Wait for VM come up"
-  ansible.builtin.shell: >
-    onevm list --f ID={{vm_id.stdout.split(':')[1] | trim}} -l STAT --no-header
-  register: vm_state
-  failed_when: "vm_state.rc != 0 or 'runn' not in vm_state.stdout"
-  until: vm_state.stdout == "runn"
-  retries: 10
-  delay: 10
-  when: existing_vm.stdout == ""
+    - name: "Host id: {{ host_id }} -- Check if VM already exists"
+      ansible.builtin.command: onevm list -l ID --csv --filter NAME=conn-mtx-vm-on-host-{{ host_id }} --no-header
+      register: existing_vm
+      changed_when: false
+
+    # conn-mtx-vm-on-host-N is a distinctive name and is kept (no odv- rename);
+    # it MUST be manifest-registered instead.
+    - name: "Manifest: register VM conn-mtx-vm-on-host-{{ host_id }}"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: manifest_add.yml
+      vars:
+        manifest_type: vm
+        manifest_id: "{{ (existing_vm.stdout_lines + ['']) | first | trim }}"
+        manifest_name: "conn-mtx-vm-on-host-{{ host_id }}"
+        manifest_cluster: "{{ current_cluster.name | d('') }}"
+        manifest_role: conn_matrix
+        manifest_disposition: "{{ (existing_vm.stdout == '') | ternary('created', 'reused') }}"
+
+    - name: "Host id: {{ host_id }} -- Instantiate test VM"
+      ansible.builtin.command:
+        argv:
+          - onetemplate
+          - instantiate
+          - "{{ validation.conn_matrix.market_name }}{{ current_cluster.name_suffix }}"
+          - --nic
+          - "{{ current_cluster.conn_matrix_vnet_name }}"
+          - --name
+          - "conn-mtx-vm-on-host-{{ host_id }}"
+          - --raw
+          - >-
+            {{ extra_template_content_raw.content | b64decode }}
+      register: vm_id
+      failed_when: "vm_id.rc != 0"
+      when: existing_vm.stdout == ""
+
+    - name: "Host id: {{ host_id }} -- Wait for VM come up"
+      ansible.builtin.shell: >
+        onevm list --f ID={{vm_id.stdout.split(':')[1] | trim}} -l STAT --no-header
+      register: vm_state
+      failed_when: "vm_state.rc != 0 or 'runn' not in vm_state.stdout"
+      until: vm_state.stdout == "runn"
+      retries: 10
+      delay: 10
+      when: existing_vm.stdout == ""
+
+  rescue:
+    - name: "Record VM creation failure for host id {{ item.split(',')[0] }}"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_failure.yml
+      vars:
+        failure_key: "Connectivity matrix VM creation (host id {{ item.split(',')[0] }})"

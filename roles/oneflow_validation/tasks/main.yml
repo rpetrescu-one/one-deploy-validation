@@ -1,9 +1,25 @@
 ---
+# When cluster discovery failed (Task 3 sets odv_discovery_failed on the
+# primary frontend) the per-cluster loop below is empty; without this row the
+# report key would silently disappear. Record the skip once, on the primary.
+- name: "OneFlow: skip — cluster discovery failed"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: record_result.yml
+  vars:
+    result_key: "OneFlow smoke test"
+    result_value: "skipped — cluster discovery failed"
+  when:
+    - validation.run_one_flow | default(false) | bool
+    - hostvars[_primary_frontend]['ansible_host'] == ansible_host
+    - hostvars[groups[frontend_group | d('frontend')][0]].odv_discovery_failed | d(false)
+
 - name: OneFlow | validate per cluster
   ansible.builtin.include_tasks: per_cluster.yml
   when:
     - validation.run_one_flow | default(false) | bool
     - hostvars[_primary_frontend]['ansible_host'] == ansible_host
+    - not (hostvars[groups[frontend_group | d('frontend')][0]].odv_discovery_failed | d(false))
   loop: "{{ _one_clusters }}"
   loop_control:
     loop_var: current_cluster

@@ -1,0 +1,80 @@
+---
+# Shared service: make sure a marketplace-exported VM template exists for a
+# cluster and register template + image in the run manifest. Reuse-safe —
+# semi air-gapped sites keep their pre-registered template ('reused', never
+# swept). Wraps export_marketapp.yml.
+#
+# Inputs:
+#   ensure_app_name    - marketplace app name (e.g. validation.test_vm.vm.market_name)
+#   ensure_name        - target template/image name (usually app name + cluster suffix)
+#   ensure_ds_id       - image datastore id for the export
+#   ensure_role        - role slug for manifest attribution
+#   ensure_cluster     - cluster name for the manifest (optional)
+#   ensure_apply_extra - apply validation.test_vm.vm.template_extra to the
+#                         template (optional, default true). Set false for
+#                         templates that are NOT the generic test-VM context
+#                         (e.g. a GPU/K8s appliance template), where injecting
+#                         the test-VM CONTEXT would be wrong.
+# Facts produced (same as export_marketapp.yml):
+#   _export_template_id, _export_image_id
+
+- name: "Ensure test template '{{ ensure_name }}'"
+  ansible.builtin.include_tasks: export_marketapp.yml
+  vars:
+    _export_app_name: "{{ ensure_app_name }}"
+    _export_name: "{{ ensure_name }}"
+    _export_ds_id: "{{ ensure_ds_id }}"
+
+- name: Determine whether the export actually ran
+  ansible.builtin.set_fact:
+    _odv_exported: >-
+      {{ (_export_cmd is defined) and (_export_cmd is not skipped)
+         and ((_export_cmd.rc | d(1)) == 0) }}
+
+- name: "Manifest: register template '{{ ensure_name }}'"
+  ansible.builtin.include_tasks: manifest_add.yml
+  vars:
+    manifest_type: template
+    manifest_id: "{{ _export_template_id }}"
+    manifest_name: "{{ ensure_name }}"
+    manifest_cluster: "{{ ensure_cluster | d('') }}"
+    manifest_role: "{{ ensure_role }}"
+    manifest_disposition: "{{ 'created' if _odv_exported else 'reused' }}"
+
+- name: "Manifest: register image '{{ ensure_name }}'"
+  ansible.builtin.include_tasks: manifest_add.yml
+  vars:
+    manifest_type: image
+    manifest_id: "{{ _export_image_id }}"
+    manifest_name: "{{ ensure_name }}"
+    manifest_cluster: "{{ ensure_cluster | d('') }}"
+    manifest_role: "{{ ensure_role }}"
+    manifest_disposition: "{{ 'created' if _odv_exported else 'reused' }}"
+
+# The suite-wide template customization (validation.test_vm.vm.template_extra:
+# CONTEXT with SSH_PUBLIC_KEY, sizing, ...) is applied HERE, not in test_vm's
+# prepare: with run_test_vm disabled any test can be the first provisioner of
+# the template, and the ssh-based checks depend on the CONTEXT it adds.
+# Idempotent: --append overwrites the same attributes on re-runs.
+- name: "Apply template_extra to '{{ ensure_name }}'"
+  when:
+    - ensure_apply_extra | d(true) | bool
+    - validation.test_vm.vm.template_extra is defined
+  block:
+    - name: Write template_extra to a temporary file
+      ansible.builtin.copy:
+        content: "{{ validation.test_vm.vm.template_extra }}"
+        dest: "/tmp/odv_template_extra.txt"
+
+    - name: Update the template with template_extra
+      ansible.builtin.shell: >
+        onetemplate update --append {{ _export_template_id }} /tmp/odv_template_extra.txt
+      register: _ensure_tpl_extra
+      failed_when: _ensure_tpl_extra.rc != 0
+      become: true
+      become_user: oneadmin
+
+    - name: Remove the temporary template_extra file
+      ansible.builtin.file:
+        path: "/tmp/odv_template_extra.txt"
+        state: absent

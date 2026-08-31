@@ -1,0 +1,77 @@
+---
+# Final safety net: delete everything the validation created, report the
+# rest. Runs unconditionally on frontends + nodes (no run_* gate) as the
+# last play before the report. No-ops on an empty manifest.
+
+# A previous aborted run leaves no facts but does leave the per-host mirror
+# file — load it so a cleanup-only re-run still sweeps those leftovers.
+- name: Load persisted manifest mirror
+  ansible.builtin.slurp:
+    src: /tmp/odv_manifest.json
+  register: _sweep_mirror
+  failed_when: false
+
+# Guarded: a truncated/corrupt mirror (e.g. a run killed mid-write) would
+# otherwise blow up from_json and fail this host clean out of the sweep —
+# rescue it to a warning instead so the sweep still runs off the live facts.
+- name: Merge mirrored manifest entries into this host's manifest
+  block:
+    - name: Merge mirrored manifest entries into this host's manifest
+      ansible.builtin.set_fact:
+        odv_manifest: >-
+          {{ ((odv_manifest | d([]))
+              + ((_sweep_mirror.content | b64decode | from_json)
+                 if (_sweep_mirror.content is defined) else []))
+             | unique }}
+  rescue:
+    - name: Mirror parse failed
+      ansible.builtin.debug:
+        msg: "WARNING: /tmp/odv_manifest.json is corrupt — ignoring the mirror"
+
+- name: Aggregate manifest from all play hosts
+  ansible.builtin.set_fact:
+    _sweep_manifest: >-
+      {{ ansible_play_hosts_all
+         | map('extract', hostvars)
+         | map(attribute='odv_manifest', default=[])
+         | sum(start=[]) }}
+
+- name: Compute sweep plan
+  ansible.builtin.include_tasks: lib/plan.yml
+
+- name: Record kept resources (reused / by flag)
+  ansible.builtin.set_fact:
+    odv_sweep_results: >-
+      {{ (odv_sweep_results | d([])) + [item | combine({
+           'action': ('kept (by flag)' if item.action == 'keep-by-flag' else 'kept (reused)'),
+           'detail': '' })] }}
+  loop: "{{ _sweep_plan | selectattr('action', 'in', ['keep-reused', 'keep-by-flag']) | list }}"
+  loop_control: { label: "{{ item.type }}:{{ item.name }}" }
+  when: hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host
+
+- name: Sweep OpenNebula objects (primary frontend only)
+  ansible.builtin.include_tasks: sweep_one_objects.yml
+  when:
+    - (groups[frontend_group | d('frontend')] | d([])) | length > 0
+    - hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host
+
+- name: Sweep host-local resources (every host)
+  ansible.builtin.include_tasks: sweep_local.yml
+
+# Mirror lifecycle: rewrite (not append) the per-host mirror to hold only
+# this run's unresolved leftovers. A completed sweep must NOT leave stale
+# 'created' entries behind — a later run's plan would resurrect them from
+# the mirror and delete a same-named resource the operator legitimately
+# re-created in between runs (lib/plan.yml's created-wins dedup would
+# override that later run's own 'reused' disposition for it). Leftovers
+# stay on purpose: they are what let an aborted cleanup's survivors get
+# retried on the next run. Entries keep their manifest-entry fields; the
+# extra 'action'/'detail' keys are harmless to lib/plan.yml, which only
+# reads the manifest-entry fields it knows about.
+- name: Rewrite persisted manifest mirror to this host's unresolved leftovers only
+  ansible.builtin.copy:
+    dest: /tmp/odv_manifest.json
+    content: >-
+      {{ (odv_sweep_results | d([]) | selectattr('action', 'equalto', 'leftover') | list) | to_nice_json }}
+    mode: "0644"
+  failed_when: false

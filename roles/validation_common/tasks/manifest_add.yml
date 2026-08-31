@@ -1,0 +1,33 @@
+---
+# Registers one resource in the run manifest (per-host fact odv_manifest,
+# mirrored to /tmp/odv_manifest.json on the same host). Call it immediately
+# before the task that creates the resource — before anything else can fail —
+# so the sweep play can find the resource even after a partial run.
+#
+# Inputs (include vars):
+#   manifest_type        - vm|vnet|image|template|service|service_template|
+#                          vm_group|file|package|process|ip_addr|host_state
+#   manifest_id          - ONE numeric id as string, '' when unknown (optional)
+#   manifest_name        - resource name / path / package / process pattern
+#   manifest_cluster     - cluster name, '' when not cluster-bound (optional)
+#   manifest_role        - role slug that owns the resource
+#   manifest_disposition - created|reused (optional, default created)
+
+- name: "Manifest: {{ manifest_type }} '{{ manifest_name }}' ({{ manifest_disposition | d('created') }})"
+  ansible.builtin.set_fact:
+    odv_manifest: >-
+      {{ (odv_manifest | d([])) + [{
+           'type': manifest_type,
+           'id': (manifest_id | d('')) | string,
+           'name': manifest_name | string,
+           'cluster': manifest_cluster | d(''),
+           'role': manifest_role,
+           'disposition': manifest_disposition | d('created'),
+           'host': inventory_hostname }] }}
+
+- name: "Manifest: mirror to /tmp/odv_manifest.json"
+  ansible.builtin.copy:
+    content: "{{ odv_manifest | to_nice_json }}"
+    dest: /tmp/odv_manifest.json
+    mode: "0644"
+  changed_when: false

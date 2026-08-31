@@ -1,287 +1,703 @@
 ---
 # tasks file for OpenNebula cloud post-deployment verification
+#
+# Harness contract (always-clean / run-to-completion design):
+#   * Nothing in this file may abort the play. Every individual check runs
+#     with failed_when: false and its outcome is recorded through
+#     validation_common/record_result.yml under the check's report key.
+#   * block  = the checks.
+#   * rescue = harness bugs only (a failure in the plumbing itself); records
+#     'Core services validation' = failed via record_failure.yml.
+#   * always = unconditional restore of everything this file can touch:
+#     re-enable every registered host, (re)start every service in
+#     validation.core_services.service_list, the legacy scheduler
+#     (one_version < 6.99) and fireedge.
 
-- name: Gather facts
-  setup:
-    gather_subset:
-      - min
+- name: Core services verification harness
+  block:
+    - name: "Debug: induced failure hook"
+      ansible.builtin.fail:
+        msg: "Induced failure (validation.debug.fail_in=core_services)"
+      when: (odv_fail_in | d((validation.debug | d({})).fail_in | d(''))) == 'core_services'
 
-- name: Populate service facts
-  ansible.builtin.service_facts:
+    - name: Gather facts
+      ansible.builtin.setup:
+        gather_subset:
+          - min
 
-- name: Install ping dependencies
-  ansible.builtin.package:
-    name:
-      - jc
-      - jq
-    state: present
+    - name: Populate service facts
+      ansible.builtin.service_facts:
 
-- name: Validate xml-rpc API
-  ansible.builtin.shell: >
-    oneuser list
-  register: oneuser_result
-  failed_when: oneuser_result.rc != 0
+    - name: "Install ping dependencies (jc, jq)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: install_packages_tracked.yml
+      vars:
+        pkg_names: [jc, jq]
+        pkg_role: core-services
 
-- name: Save xml-rpc status
-  set_fact:
-    verification_result: "{{ (verification_result | default({})) | combine({'XML-RPC API status': 'ok'}) }}"
+    # ------------------------------------------------------------------ #
+    # XML-RPC API                                                        #
+    # ------------------------------------------------------------------ #
+    - name: Validate xml-rpc API
+      ansible.builtin.shell: >
+        oneuser list
+      register: oneuser_result
+      failed_when: false
 
-- name: Check services enabled
-  set_fact:
-    verification_result: "{{ verification_result | combine({ item.desc + ' is enabled': 'ok'}) }}"
-  when:
-    - item.name in ansible_facts.services
-    - ansible_facts['services'][item.name]['status'] | default('not-found') == 'enabled'
-  loop: "{{ validation.core_services.service_list }}"
+    - name: "Record: XML-RPC API status"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "XML-RPC API status"
+        result_value: "{{ 'ok' if oneuser_result.rc == 0 else 'failed' }}"
+        result_comment: "{{ '' if oneuser_result.rc == 0 else (oneuser_result.stderr | d('') | trim | truncate(800)) }}"
 
-- name: Mark missing services
-  set_fact:
-    verification_result: "{{ verification_result | combine({ item.desc + ' not installed': 'skipped - service not present' }) }}"
-  when: item.name not in ansible_facts.services
-  loop: "{{ validation.core_services.service_list }}"
+    # ------------------------------------------------------------------ #
+    # Service units: enabled / restart                                   #
+    # ------------------------------------------------------------------ #
+    - name: "Record: services enabled"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        _svc_status: "{{ ansible_facts.services[svc.name].status | d('not-found') }}"
+        result_key: "{{ svc.desc + ' is enabled' }}"
+        result_value: "{{ 'ok' if _svc_status == 'enabled' else 'failed' }}"
+        result_comment: "{{ '' if _svc_status == 'enabled' else ('unit status: ' ~ _svc_status) }}"
+      loop: "{{ validation.core_services.service_list }}"
+      loop_control:
+        loop_var: svc
+        label: "{{ svc.name }}"
+      when: svc.name in ansible_facts.services
 
-- name: Check services restart
-  ansible.builtin.service:
-    name: "{{ item.name }}"
-    state: restarted
-  register: restarted
-  loop: "{{ validation.core_services.service_list }}"
-  when: item.name in ansible_facts.services
+    - name: "Record: missing services"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "{{ svc.desc + ' not installed' }}"
+        result_value: "skipped - service not present"
+      loop: "{{ validation.core_services.service_list }}"
+      loop_control:
+        loop_var: svc
+        label: "{{ svc.name }}"
+      when: svc.name not in ansible_facts.services
 
-- name: Refresh service facts after restart
-  ansible.builtin.service_facts:
+    - name: Check services restart
+      ansible.builtin.service:
+        name: "{{ svc.name }}"
+        state: restarted
+      register: restarted
+      failed_when: false
+      loop: "{{ validation.core_services.service_list }}"
+      loop_control:
+        loop_var: svc
+        label: "{{ svc.name }}"
+      when: svc.name in ansible_facts.services
 
-- name: Check services restarted
-  set_fact:
-    verification_result: "{{ verification_result | combine({ item.desc + ' restarted': 'ok'}) }}"
-  when:
-    - item.name in ansible_facts.services
-    - ansible_facts['services'][item.name]['state'] | default('not-found') == 'running'
-  loop: "{{ validation.core_services.service_list }}"
+    - name: Refresh service facts after restart
+      ansible.builtin.service_facts:
 
-- name: Check oned version
-  ansible.builtin.shell: >
-    oned -v
-  register: oned_version
+    - name: "Record: services restarted"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        _svc_state: "{{ ansible_facts.services[svc.name].state | d('not-found') }}"
+        result_key: "{{ svc.desc + ' restarted' }}"
+        result_value: "{{ 'ok' if _svc_state == 'running' else 'failed' }}"
+        result_comment: >-
+          {{ '' if _svc_state == 'running' else
+             ('unit state: ' ~ _svc_state ~ ' ' ~
+              (restarted.results | d([]) | selectattr('svc', 'defined')
+               | selectattr('svc.name', 'eq', svc.name)
+               | map(attribute='msg', default='') | join(' '))) | trim | truncate(800) }}
+      loop: "{{ validation.core_services.service_list }}"
+      loop_control:
+        loop_var: svc
+        label: "{{ svc.name }}"
+      when: svc.name in ansible_facts.services
 
-- name: Save oned version
-  set_fact:
-    verification_result: "{{ verification_result | combine({'Oned version': oned_version.stdout}) }}"
+    # ------------------------------------------------------------------ #
+    # oned version + repositories                                        #
+    # ------------------------------------------------------------------ #
+    - name: Check oned version
+      ansible.builtin.shell: >
+        oned -v
+      register: oned_version
+      failed_when: false
 
-- name: Printout oned version
-  debug:
-    msg: "Installed oned version: {{ oned_version.stdout }}"
+    - name: "Record: oned version"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Oned version"
+        result_value: "{{ oned_version.stdout if (oned_version.rc == 0 and oned_version.stdout | trim | length > 0) else 'failed' }}"
+        result_comment: "{{ '' if oned_version.rc == 0 else (oned_version.stderr | d('') | trim | truncate(800)) }}"
 
-- name: Extract version number from oned output
-  set_fact:
-    one_version: "{{ oned_version.stdout | regex_search('OpenNebula ([0-9]+\\.[0-9]+\\.[0-9]+)', '\\1') | first }}"
+    - name: Printout oned version
+      ansible.builtin.debug:
+        msg: "Installed oned version: {{ oned_version.stdout }}"
+      when: oned_version.rc == 0
 
-- name: Verify OpenNebula private repos on the Debian-based OS
-  ansible.builtin.shell: >
-    grep -Ri opennebula /etc/apt/sources.list.d/ 2>/dev/null | head -1 | cut -d: -f1 | xargs cat | grep '^deb' | awk '{for(i=1;i<=NF;i++) if ($i ~ /^https?:\/\//) {print $i; exit}}'
-  register: debian_repos_list
-  failed_when: false
-  when: ansible_os_family == "Debian"
+    - name: Extract version number from oned output
+      ansible.builtin.set_fact:
+        one_version: "{{ oned_version.stdout | d('') | regex_search('OpenNebula ([0-9]+\\.[0-9]+\\.[0-9]+)', '\\1') | d(['0.0.0'], true) | first }}"
 
-- name: Verify OpenNebula private repos on the RH-based OS
-  ansible.builtin.shell: >
-    grep -Ri opennebula /etc/yum.repos.d/*.repo 2>/dev/null | head -1 | cut -d: -f1 | xargs cat | grep '^baseurl=' | cut -d= -f2-
-  register: rh_repos_list
-  failed_when: false
-  when: ansible_os_family == "RedHat"
+    - name: Verify OpenNebula private repos on the Debian-based OS
+      ansible.builtin.shell: >
+        grep -Ri opennebula /etc/apt/sources.list.d/ 2>/dev/null | head -1 | cut -d: -f1 | xargs cat | grep '^deb' | awk '{for(i=1;i<=NF;i++) if ($i ~ /^https?:\/\//) {print $i; exit}}'
+      register: debian_repos_list
+      failed_when: false
+      when: ansible_os_family == "Debian"
 
-- name: Save OpenNebula Debian repositories
-  set_fact:
-    verification_result: "{{ verification_result | combine({'Configured OpenNebula repository': debian_repos_list.stdout}) }}"
-  when: debian_repos_list is defined and (debian_repos_list.skipped is not defined or not debian_repos_list.skipped)
+    - name: Verify OpenNebula private repos on the RH-based OS
+      ansible.builtin.shell: >
+        grep -Ri opennebula /etc/yum.repos.d/*.repo 2>/dev/null | head -1 | cut -d: -f1 | xargs cat | grep '^baseurl=' | cut -d= -f2-
+      register: rh_repos_list
+      failed_when: false
+      when: ansible_os_family == "RedHat"
 
-- name: Save OpenNebula RedHat repositories
-  set_fact:
-    verification_result: "{{ verification_result | combine({'Configured OpenNebula repository': rh_repos_list.stdout}) }}"
-  when: rh_repos_list is defined and (rh_repos_list.skipped is not defined or not rh_repos_list.skipped)
+    - name: "Record: configured OpenNebula repository"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        _repo_out: "{{ ((debian_repos_list.stdout | d('')) if ansible_os_family == 'Debian' else (rh_repos_list.stdout | d(''))) | trim }}"
+        result_key: "Configured OpenNebula repository"
+        result_value: "{{ _repo_out if _repo_out | length > 0 else 'failed' }}"
+        result_comment: "{{ '' if _repo_out | length > 0 else 'no OpenNebula repository entry found in the OS package manager configuration' }}"
+      when: ansible_os_family in ['Debian', 'RedHat']
 
-- block:
-    - name: Verify OpenNebula scheduler can contact oned
+    # ------------------------------------------------------------------ #
+    # Legacy scheduler (one_version < 6.99)                              #
+    # ------------------------------------------------------------------ #
+    - name: Verify legacy scheduler can contact oned
+      when:
+        - one_version is version('6.99', '<')
+        - "'opennebula-scheduler.service' in ansible_facts.services"
+      block:
+        - name: Stop OpenNebula scheduler
+          ansible.builtin.service:
+            name: opennebula-scheduler
+            state: stopped
+          register: sched_stop
+          failed_when: false
+
+        - name: Start OpenNebula scheduler
+          ansible.builtin.service:
+            name: opennebula-scheduler
+            state: started
+          register: sched_start
+          failed_when: false
+
+        - name: Check scheduler log for oned contact
+          ansible.builtin.shell: |
+            sleep 3
+            grep 'oned successfully contacted' /var/log/one/sched.log
+          register: one_scheduler
+          failed_when: false
+
+        - name: "Record: OpenNebula scheduler can contact oned"
+          ansible.builtin.include_role:
+            name: validation_common
+            tasks_from: record_result.yml
+          vars:
+            result_key: "OpenNebula scheduler can contact oned"
+            result_value: "{{ 'ok' if one_scheduler.rc == 0 else 'failed' }}"
+            result_comment: >-
+              {{ '' if one_scheduler.rc == 0 else
+                 ('scheduler restart or sched.log check failed: ' ~
+                  (sched_start.msg | d('')) ~ ' ' ~ (one_scheduler.stderr | d(''))) | trim | truncate(800) }}
+
+    - name: "Record: scheduler check skipped (service not present)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "OpenNebula scheduler can contact oned"
+        result_value: "skipped - opennebula-scheduler service not present"
+      when:
+        - one_version is version('6.99', '<')
+        - "'opennebula-scheduler.service' not in ansible_facts.services"
+
+    # ------------------------------------------------------------------ #
+    # one-gate / one-flow                                                #
+    # ------------------------------------------------------------------ #
+    - name: Verify one-gate listen & port on the server
+      ansible.builtin.shell: >
+        ss -tlpn | grep $(cat /etc/one/onegate-server.conf | awk '/:port:/ {print $2}')
+      register: onegate_service
+      failed_when: false
+
+    - name: "Record: one-gate listens on the server"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "OpenNebula one-gate service listens on the server"
+        result_value: "{{ 'ok' if onegate_service.rc == 0 else 'failed' }}"
+        result_comment: >-
+          {{ '' if onegate_service.rc == 0 else
+             ('one-gate port not listening (rc=' ~ onegate_service.rc ~ ') ' ~
+              (onegate_service.stderr | d(''))) | trim | truncate(800) }}
+
+    - name: Verify one-flow stop and start
+      when: "'opennebula-flow.service' in ansible_facts.services"
+      block:
+        - name: Stop one-flow service
+          ansible.builtin.service:
+            name: opennebula-flow
+            state: stopped
+          register: oneflow_stop
+          failed_when: false
+
+        - name: Start one-flow service
+          ansible.builtin.service:
+            name: opennebula-flow
+            state: started
+          register: oneflow_start
+          failed_when: false
+
+        - name: Check one-flow service is active
+          ansible.builtin.shell: |
+            sleep 3
+            systemctl is-active opennebula-flow
+          register: oneflow_active
+          failed_when: false
+
+        - name: "Record: one-flow stops and starts"
+          ansible.builtin.include_role:
+            name: validation_common
+            tasks_from: record_result.yml
+          vars:
+            result_key: "Verify one-flow stops and starts"
+            result_value: "{{ 'ok' if oneflow_active.rc == 0 else 'failed' }}"
+            result_comment: >-
+              {{ '' if oneflow_active.rc == 0 else
+                 ('opennebula-flow is-active: ' ~ (oneflow_active.stdout | d('') | trim) ~ ' ' ~
+                  (oneflow_start.msg | d(''))) | trim | truncate(800) }}
+
+    - name: "Record: one-flow stop/start skipped (service not present)"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Verify one-flow stops and starts"
+        result_value: "skipped - opennebula-flow service not present"
+      when: "'opennebula-flow.service' not in ansible_facts.services"
+
+    - name: Verify oneflow listen & port on the server
+      ansible.builtin.shell: >
+        ss -tlpn | grep -o $(cat /etc/one/oneflow-server.conf | awk '/^:port:/ {print $2}')
+      register: oneflow_status
+      failed_when: false
+
+    - name: "Record: one-flow service port is open on the server"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Verify one-flow service port is open on the server"
+        result_value: "{{ 'ok' if oneflow_status.rc == 0 else 'failed' }}"
+        result_comment: >-
+          {{ '' if oneflow_status.rc == 0 else
+             ('one-flow port not listening (rc=' ~ oneflow_status.rc ~ ') ' ~
+              (oneflow_status.stderr | d(''))) | trim | truncate(800) }}
+
+    # ------------------------------------------------------------------ #
+    # Fireedge GUI                                                       #
+    # ------------------------------------------------------------------ #
+    - name: Verify fireedge GUI
+      when:
+        - validation.core_services.check_fireedge_ui
+        - "'opennebula-fireedge.service' in ansible_facts.services"
+      block:
+        - name: Stop fireedge service
+          ansible.builtin.service:
+            name: opennebula-fireedge
+            state: stopped
+          register: fireedge_stop
+          failed_when: false
+
+        - name: Start fireedge service
+          ansible.builtin.service:
+            name: opennebula-fireedge
+            state: started
+          register: fireedge_start
+          failed_when: false
+
+        - name: Check fireedge service is active
+          ansible.builtin.shell: |
+            sleep 3
+            systemctl status opennebula-fireedge | grep Active | grep -o '(running)'
+          register: fireedge_status
+          failed_when: false
+
+        - name: "Record: fireedge GUI stops and starts"
+          ansible.builtin.include_role:
+            name: validation_common
+            tasks_from: record_result.yml
+          vars:
+            result_key: "Verify fireedge GUI stops and starts"
+            result_value: "{{ 'ok' if 'running' in (fireedge_status.stdout | d('')) else 'failed' }}"
+            result_comment: >-
+              {{ '' if 'running' in (fireedge_status.stdout | d('')) else
+                 ('opennebula-fireedge not running after stop/start ' ~
+                  (fireedge_start.msg | d(''))) | trim | truncate(800) }}
+
+        - name: Verify fireedge service is configured to start at boot time
+          ansible.builtin.shell: >
+            systemctl is-enabled opennebula-fireedge
+          register: fireedge_enabled
+          failed_when: false
+
+        - name: "Record: fireedge GUI enabled at boot"
+          ansible.builtin.include_role:
+            name: validation_common
+            tasks_from: record_result.yml
+          vars:
+            result_key: "Verify fireedge GUI is enabled to start automatically"
+            result_value: "{{ 'ok' if fireedge_enabled.rc == 0 else 'failed' }}"
+            result_comment: "{{ '' if fireedge_enabled.rc == 0 else ('systemctl is-enabled: ' ~ (fireedge_enabled.stdout | d('') | trim)) | truncate(800) }}"
+
+        - name: Fireedge service listens on the server
+          ansible.builtin.shell: |
+            for i in 1 2 3 4 5; do
+              out=$(ss -tlpn | grep $(cat /etc/one/fireedge-server.conf | awk '/^port:/ {print $2}')) && { echo "$out"; exit 0; }
+              sleep 2
+            done
+            echo "fireedge port not listening after 5 attempts" >&2
+            exit 1
+          register: firedge_socket
+          failed_when: false
+
+        - name: "Record: fireedge GUI listens port"
+          ansible.builtin.include_role:
+            name: validation_common
+            tasks_from: record_result.yml
+          vars:
+            result_key: "Verify fireedge GUI listens port"
+            result_value: "{{ 'ok' if firedge_socket.rc == 0 else 'failed' }}"
+            result_comment: >-
+              {{ '' if firedge_socket.rc == 0 else
+                 ((firedge_socket.stderr | d('') | trim) ~ ' ' ~
+                  (firedge_socket.stdout | d('') | trim)) | trim | truncate(800) }}
+
+        - name: Connect to a fireedge server
+          ansible.builtin.shell: >
+            curl "{{ firedge_socket.stdout_lines[0].split()[3] }}"
+          register: connection_status
+          failed_when: false
+          when:
+            - firedge_socket.rc == 0
+            - firedge_socket.stdout_lines | d([]) | length > 0
+            - firedge_socket.stdout_lines[0].split() | length >= 4
+
+        - name: "Record: connection to a fireedge server"
+          ansible.builtin.include_role:
+            name: validation_common
+            tasks_from: record_result.yml
+          vars:
+            result_key: "Verify connection to a fireedge server"
+            result_value: >-
+              {{ 'skipped - fireedge port not listening' if firedge_socket.rc != 0
+                 else ('ok' if (connection_status.rc | d(1)) == 0 else 'failed') }}
+            result_comment: >-
+              {{ '' if (firedge_socket.rc != 0 or (connection_status.rc | d(1)) == 0)
+                 else (connection_status.stderr | d('curl was not attempted: could not parse the fireedge listen address') | trim | truncate(800)) }}
+
+    - name: "Record: fireedge checks skipped"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "{{ fe_key }}"
+        result_value: "skipped - fireedge UI check disabled or service not present"
+      loop:
+        - "Verify fireedge GUI stops and starts"
+        - "Verify fireedge GUI is enabled to start automatically"
+        - "Verify fireedge GUI listens port"
+        - "Verify connection to a fireedge server"
+      loop_control:
+        loop_var: fe_key
+      when: not (validation.core_services.check_fireedge_ui and 'opennebula-fireedge.service' in ansible_facts.services)
+
+    # ------------------------------------------------------------------ #
+    # Hypervisor hosts                                                   #
+    # ------------------------------------------------------------------ #
+    - name: Get registered hosts
+      ansible.builtin.shell: >
+        onehost list -j
+      register: onehost_list
+      failed_when: false
+
+    - name: Get hosts list if there is only one host
+      ignore_errors: true
+      ansible.builtin.set_fact:
+        single_host_list: "{{ onehost_list.stdout | from_json | json_query('HOST_POOL.HOST.{id: ID, hostname: NAME, state: STATE}') }}"
+      when: onehost_list.rc == 0
+
+    - name: Create host list with single host list
+      when: single_host_list is mapping and single_host_list.hostname is defined and single_host_list.hostname is not none
+      ansible.builtin.set_fact:
+        hosts_list: ["{{ single_host_list }}"]
+
+    - name: Get hosts list
+      when:
+        - hosts_list is not defined
+        - onehost_list.rc == 0
+      ansible.builtin.set_fact:
+        hosts_list: "{{ onehost_list.stdout | from_json | json_query('HOST_POOL.HOST[*].{id: ID, hostname: NAME, state: STATE}') | default([], true) }}"
+
+    - name: Default hosts list when onehost list failed
+      when: hosts_list is not defined
+      ansible.builtin.set_fact:
+        hosts_list: []
+
+    - name: Filter out empty entries from hosts list
+      ansible.builtin.set_fact:
+        hosts_list: "{{ hosts_list | select('mapping') | list }}"
+
+    - name: "Record: registered KVM hosts"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Status of the registered KVM hosts"
+        result_value: >-
+          {{ 'failed' if onehost_list.rc != 0
+             else (hosts_list if hosts_list | length > 0 else 'no hosts registered') }}
+        result_comment: "{{ '' if onehost_list.rc == 0 else (onehost_list.stderr | d('') | trim | truncate(800)) }}"
+
+    - name: "Manifest: register host state cycling"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: manifest_add.yml
+      vars:
+        manifest_type: host_state
+        manifest_id: "{{ mh.id | d('') }}"
+        manifest_name: "{{ mh.hostname | d(mh.id | d('?')) }}"
+        manifest_cluster: ""
+        manifest_role: core-services
+        manifest_disposition: created
+      loop: "{{ hosts_list }}"
+      loop_control:
+        loop_var: mh
+        label: "{{ mh.hostname | d(mh.id | d('?')) }}"
+
+    - name: Set host offline and then set online
+      become: true
+      become_user: oneadmin
       ansible.builtin.shell: |
-        systemctl stop opennebula-scheduler && systemctl start opennebula-scheduler
-        sleep 3
-        grep 'oned successfully contacted' /var/log/one/sched.log
-      register: one_scheduler
-      failed_when: one_scheduler.rc != 0
+        set -e
+        onehost disable "{{ ch.id }}"
+        sleep 5
+        onehost enable "{{ ch.id }}"
+        onehost forceupdate "{{ ch.id }}"
+        for i in $(seq 1 30); do
+          st=$(onehost list -f ID={{ ch.id }} -l STAT --no-header | tr -d ' ')
+          [ "$st" = "on" ] && { onehost show "{{ ch.id }}" -j; exit 0; }
+          sleep 10
+        done
+        echo "host {{ ch.id }} did not return to 'on' within 300s" >&2
+        exit 1
+      register: host_monitoring
+      failed_when: false
+      loop: "{{ hosts_list }}"
+      loop_control:
+        loop_var: ch
+        label: "{{ ch.hostname | d(ch.id) }}"
 
-    - name: Save OpenNebula scheduler can contact oned
-      set_fact:
-        verification_result: "{{ verification_result | combine({'OpenNebula scheduler can contact oned': 'ok'}) }}"
-  when: one_version is version('6.99', '<')
+    - name: "Record: hosts offline/online cycle"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        _cycle_bad: "{{ host_monitoring.results | d([]) | selectattr('rc', 'defined') | selectattr('rc', 'ne', 0) | list }}"
+        result_key: "Put hosts offline and then set online. Hosts status"
+        result_value: >-
+          {{ 'skipped - no hosts registered' if hosts_list | length == 0
+             else ('ok' if _cycle_bad | length == 0 else 'failed') }}
+        result_comment: >-
+          {{ '' if (hosts_list | length == 0 or _cycle_bad | length == 0)
+             else (_cycle_bad | map(attribute='stderr', default='') | join('; ') | trim | truncate(800)) }}
 
-- name: Verify one-gate listen & port on the server
-  ansible.builtin.shell: >
-    ss -tlpn | grep $(cat /etc/one/onegate-server.conf | awk '/:port:/ {print $2}')
-  register: onegate_service
+    # ------------------------------------------------------------------ #
+    # Datastores + marketplaces                                          #
+    # ------------------------------------------------------------------ #
+    - name: Get datastores list
+      ansible.builtin.shell: >
+        onedatastore list -j
+      register: datastore_list
+      failed_when: false
 
-- name: Save one-gate listen & port on the server
-  set_fact:
-    verification_result: "{{ verification_result | combine({'OpenNebula one-gate service listens on the server': 'ok'}) }}"
+    - name: Normalize datastore pool
+      ansible.builtin.set_fact:
+        core_ds_pool: "{{ [_ds_raw] if _ds_raw is mapping else (_ds_raw | d([], true)) }}"
+      vars:
+        _ds_raw: "{{ (datastore_list.stdout | from_json | json_query('DATASTORE_POOL.DATASTORE')) if datastore_list.rc == 0 else [] }}"
 
-- name: Save one-flow listen & port on the server
-  set_fact:
-    verification_result: "{{ verification_result | combine({'Verify one-flow stops and starts': 'ok'}) }}"
+    - name: "Record: datastores list"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Datastores list"
+        result_value: "{{ 'failed' if datastore_list.rc != 0 else (core_ds_pool | map(attribute='NAME', default='?') | list) }}"
+        result_comment: "{{ '' if datastore_list.rc == 0 else (datastore_list.stderr | d('') | trim | truncate(800)) }}"
 
-- name: Verify oneflow listen & port on the server
-  ansible.builtin.shell: >
-    ss -tlpn | grep -o $(cat /etc/one/oneflow-server.conf | awk '/^:port:/ {print $2}')
-  register: oneflow_status
-  failed_when: oneflow_status.rc != 0
+    - name: "Record: datastore capacity"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        _ds_nonsys: "{{ core_ds_pool | selectattr('NAME', 'defined') | rejectattr('NAME', 'eq', 'system') | list }}"
+        _ds_min_free: "{{ ((_ds_nonsys | map(attribute='FREE_MB', default='0') | map('int') | list) + [0]) | min }}"
+        _ds_ok: "{{ datastore_list.rc == 0 and (_ds_min_free | int) >= 0 }}"
+        result_key: "Datastore capacity more than 0"
+        result_value: "{{ 'ok' if _ds_ok | bool else 'failed' }}"
+        result_comment: >-
+          {{ '' if _ds_ok | bool else
+             ('onedatastore list rc=' ~ datastore_list.rc ~ '; non-system FREE_MB values: ' ~
+              (_ds_nonsys | map(attribute='FREE_MB', default='?') | join(','))) | truncate(800) }}
 
-- name: Save one-flow listen & port on the server
-  set_fact:
-    verification_result: "{{ verification_result | combine({'Verify one-flow service port is open on the server': 'ok'}) }}"
+    - name: Check marketplace
+      ansible.builtin.shell: >
+        onemarket list -j
+      register: marketplace_list
+      failed_when: false
 
-- block:
-    - name: Verify fireedge GUI stops and starts
+    - name: Normalize marketplace pool
+      ansible.builtin.set_fact:
+        core_market_pool: "{{ [_mk_raw] if _mk_raw is mapping else (_mk_raw | d([], true)) }}"
+      vars:
+        _mk_raw: "{{ (marketplace_list.stdout | from_json | json_query('MARKETPLACE_POOL.MARKETPLACE')) if marketplace_list.rc == 0 else [] }}"
+
+    - name: "Record: registered marketplaces"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        result_key: "Registered marketplaces"
+        result_value: >-
+          {{ 'failed' if (marketplace_list.rc != 0 or core_market_pool | length == 0)
+             else (core_market_pool | map(attribute='NAME', default='?') | list) }}
+        result_comment: >-
+          {{ '' if (marketplace_list.rc == 0 and core_market_pool | length > 0)
+             else ('onemarket list rc=' ~ marketplace_list.rc ~ '; no marketplaces registered or command failed: ' ~
+                   (marketplace_list.stderr | d('') | trim)) | truncate(800) }}
+
+    # Aggregate harness key: the individual checks above use failed_when:
+    # false + record_result, so a failed CHECK never throws — this rollup
+    # gives the Execution summary one authoritative ok/failed row (mirrors
+    # the other retrofitted roles).
+    - name: Record core services aggregate result
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_result.yml
+      vars:
+        # Two precise, disjoint patterns instead of one unanchored regex: the
+        # static branch lists this file's non-service report keys; the
+        # service branch is built from THIS run's service_list descriptions
+        # so a foreign role's key ending in ' is enabled'/' restarted'/
+        # ' not installed' can never flip this rollup. When service_list is
+        # empty _core_svc_re degrades to '^$', which matches no real key
+        # (never a false positive) instead of the unguarded '^()...$'.
+        _core_static_re: >-
+          ^(XML-RPC API status|Oned version|Configured OpenNebula repository|OpenNebula scheduler|OpenNebula one-gate|Verify one-flow|Verify fireedge|Verify connection to a fireedge server|Status of the registered KVM hosts|Put hosts offline|Datastores list|Datastore capacity|Registered marketplaces)
+        _core_svc_descs: "{{ (validation.core_services.service_list | d([])) | map(attribute='desc') | map('regex_escape') | list }}"
+        _core_svc_re: >-
+          {{ ('^(' ~ (_core_svc_descs | join('|')) ~ ')( is enabled| restarted| not installed)$') if _core_svc_descs | length > 0 else '^$' }}
+        _core_failed_all: >-
+          {{ (verification_result | d({})) | dict2items
+             | selectattr('value', 'string')
+             | selectattr('value', 'match', 'failed')
+             | map(attribute='key')
+             | list }}
+        _core_failed_keys: >-
+          {{ (_core_failed_all | select('search', _core_static_re) | list)
+             + (_core_failed_all | select('search', _core_svc_re) | list) }}
+        result_key: "Core services validation"
+        result_value: "{{ 'failed' if _core_failed_keys | length > 0 else 'ok' }}"
+        result_comment: "{{ '' if _core_failed_keys | length == 0 else ('failed checks: ' ~ (_core_failed_keys | join(', '))) | truncate(800) }}"
+
+  rescue:
+    - name: Record core services validation failure
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_failure.yml
+      vars:
+        failure_key: "Core services validation"
+
+  always:
+    # Enable ONLY hosts that are actually disabled/offline: `onehost enable`
+    # on an already-enabled host resets its monitoring to INIT, which left
+    # the whole cluster momentarily unschedulable right after this role and
+    # starved the next test's VM (observed live: vm-ha pending on "No hosts
+    # enabled to run VMs"). A forceupdate follows any real enable so the
+    # host is monitored again as fast as possible.
+    - name: "Always: re-enable every registered host"
+      become: true
+      become_user: oneadmin
       ansible.builtin.shell: |
-        systemctl stop opennebula-fireedge && systemctl start opennebula-fireedge
-        sleep 3
-        systemctl status opennebula-fireedge | grep Active | grep -o '(running)'
-      register: fireedge_status
-      failed_when: "'running' not in fireedge_status.stdout"
+        st=$(onehost list -f ID={{ eh.id }} -l STAT --no-header | tr -d ' ')
+        case "$st" in
+          dsbl|off|offline|disabled)
+            onehost enable "{{ eh.id }}" && onehost forceupdate "{{ eh.id }}"
+            echo "re-enabled (was $st)" ;;
+          *) echo "left untouched (state $st)" ;;
+        esac
+      register: core_reenable
+      failed_when: false
+      loop: "{{ hosts_list | d([]) }}"
+      loop_control:
+        loop_var: eh
+        label: "{{ eh.hostname | d(eh.id | d('?')) }}"
 
-    - name: Verify fireedge GUI stops & starts
-      set_fact:
-        verification_result: "{{ verification_result | combine({'Verify fireedge GUI stops and starts': 'ok'}) }}"
+    - name: "Always: record hosts that could not be re-enabled"
+      ansible.builtin.include_role:
+        name: validation_common
+        tasks_from: record_leftover.yml
+      vars:
+        leftover_type: host_state
+        leftover_name: "{{ reh.eh.hostname | d(reh.eh.id | d('?')) }}"
+        leftover_role: core-services
+        leftover_detail: "onehost enable rc={{ reh.rc | d('?') }}: {{ reh.stderr | d('') | trim }}"
+      loop: "{{ core_reenable.results | d([]) }}"
+      loop_control:
+        loop_var: reh
+        label: "{{ reh.eh.hostname | d(reh.eh.id | d('?')) }}"
+      when:
+        - reh.rc is defined
+        - reh.rc != 0
 
-    - name: Verify fireedge service is configured to start at boot time
-      ansible.builtin.shell: >
-        systemctl status opennebula-fireedge | grep enabled
-      register: fireedge_enabled
-      failed_when: "'enabled' not in fireedge_enabled.stdout"
+    - name: "Always: ensure core services are started"
+      ansible.builtin.service:
+        name: "{{ svc.name }}"
+        state: started
+      failed_when: false
+      loop: "{{ validation.core_services.service_list }}"
+      loop_control:
+        loop_var: svc
+        label: "{{ svc.name }}"
+      when: svc.name in (ansible_facts.services | d({}))
 
-    - name: Verify fireedge GUI enabled
-      set_fact:
-        verification_result: "{{ verification_result | combine({'Verify fireedge GUI is enabled to start automatically': 'ok'}) }}"
+    - name: "Always: ensure legacy scheduler is started"
+      ansible.builtin.service:
+        name: opennebula-scheduler
+        state: started
+      failed_when: false
+      when:
+        - (one_version | d('999.0.0')) is version('6.99', '<')
+        - "'opennebula-scheduler.service' in (ansible_facts.services | d({}))"
 
-    - name: Fireedge service listens on the server
-      ansible.builtin.shell: >
-        ss -tlpn | grep $(cat /etc/one/fireedge-server.conf | awk '/^port:/ {print $2}')
-      register: firedge_socket
-      failed_when: firedge_socket.rc != 0
-      retries: 5
-      delay: 2
-      until: firedge_socket.rc == 0
-
-    - name: Verify fireedge GUI listens on the server
-      set_fact:
-        verification_result: "{{ verification_result | combine({'Verify fireedge GUI listens port': 'ok'}) }}"
-
-    - name: Connect to a fireedge server
-      ansible.builtin.shell: >
-        curl "{{ firedge_socket.stdout.split()[3] }}"
-      register: connection_status
-      failed_when: connection_status.rc != 0
-
-    - name: Verify connection to a fireedge server
-      set_fact:
-        verification_result: "{{ verification_result | combine({'Verify connection to a fireedge server': 'ok'}) }}"
-  when:
-    - validation.core_services.check_fireedge_ui
-    - "'opennebula-fireedge.service' in ansible_facts.services"
-
-- name: Get registered hosts
-  ansible.builtin.shell: >
-    onehost list -j
-  register: onehost_list
-  failed_when: onehost_list.rc != 0
-
-- name: Get hosts list if there is only one host
-  ignore_errors: true
-  set_fact:
-    single_host_list: "{{ onehost_list.stdout | from_json | json_query('HOST_POOL.HOST.{id: ID, hostname: NAME, state: STATE}') }}"
-  failed_when: onehost_list.rc != 0
-
-- name: Create host list with single host list
-  when: single_host_list is mapping and single_host_list.hostname is defined and single_host_list.hostname is not none
-  set_fact:
-    hosts_list: ["{{ single_host_list }}"]
-
-- name: Get hosts list
-  when: hosts_list is not defined
-  set_fact:
-    hosts_list: "{{ onehost_list.stdout | from_json | json_query('HOST_POOL.HOST[*].{id: ID, hostname: NAME, state: STATE}') | default([]) }}"
-  failed_when: onehost_list.rc != 0
-
-- name: Filter out empty entries from hosts list
-  set_fact:
-    hosts_list: "{{ hosts_list | select('mapping') | list }}"
-
-- name: Verify hosts list
-  set_fact:
-    verification_result: "{{ verification_result | combine({'Status of the registered KVM hosts': hosts_list if hosts_list | length > 0 else 'no hosts registered' }) }}"
-
-- name: Set host offline and then set online
-  become: true
-  become_user: oneadmin
-  ansible.builtin.shell: |
-    set -e
-    onehost disable "{{ item.id }}"
-    sleep 5
-    onehost enable "{{ item.id }}"
-    onehost forceupdate "{{ item.id }}"
-    for i in $(seq 1 30); do
-      st=$(onehost list -f ID={{ item.id }} -l STAT --no-header | tr -d ' ')
-      [ "$st" = "on" ] && { onehost show "{{ item.id }}" -j; exit 0; }
-      sleep 10
-    done
-    echo "host {{ item.id }} did not return to 'on' within 300s" >&2
-    exit 1
-  register: host_monitoring
-  loop: "{{ hosts_list }}"
-  when:
-    - hosts_list | length > 0
-    - hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host
-
-- name: Get host status
-  debug:
-    msg: "{{ host_monitoring }}"
-  when: hosts_list | length > 0
-
-- name: Verify host offline and then set online
-  set_fact:
-    verification_result: "{{ verification_result | combine({'Put hosts offline and then set online. Hosts status': 'ok' if hosts_list | length > 0 else 'skipped - no hosts registered' }) }}"
-
-- name: Get datastores list
-  ansible.builtin.shell: >
-    onedatastore list -j
-  register: datastore_list
-  failed_when: datastore_list.rc != 0
-
-- name: Verify datastores list
-  set_fact:
-    verification_result: "{{ verification_result | combine({'Datastores list': datastore_list.stdout | from_json | json_query('DATASTORE_POOL.DATASTORE[*].NAME')}) }}"
-
-- name: Get DS capacity
-  assert:
-    that:
-      - item['FREE_MB'] | int >= 0
-    quiet: true
-    fail_msg: "{{ item['NAME'] }} datastore has no free space ({{ item['FREE_MB'] }}MB is available)"
-  when: item['NAME'] != 'system'
-  loop: "{{ datastore_list.stdout | from_json | json_query('DATASTORE_POOL.DATASTORE') }}"
-
-- name: Verify DS capacity
-  set_fact:
-    verification_result: "{{ verification_result | combine({'Datastore capacity more than 0': 'ok'}) }}"
-
-- name: Check marketplace
-  ansible.builtin.shell: >
-    onemarket list -j
-  register: marketplace_list
-  failed_when: marketplace_list.stdout | from_json | json_query('MARKETPLACE_POOL.MARKETPLACE') | length == 0
-
-- name: Verify Marketplaces
-  set_fact:
-    verification_result: "{{ verification_result | combine({'Registered marketplaces': marketplace_list.stdout | from_json | json_query('MARKETPLACE_POOL.MARKETPLACE[*].NAME')}) }}"
-
-- name: Get marketplace status
-  debug:
-    msg: "{{ marketplace_list.stdout | from_json | json_query('MARKETPLACE_POOL.MARKETPLACE') | length }}"
-
+    - name: "Always: ensure fireedge is started"
+      ansible.builtin.service:
+        name: opennebula-fireedge
+        state: started
+      failed_when: false
+      when: "'opennebula-fireedge.service' in (ansible_facts.services | d({}))"

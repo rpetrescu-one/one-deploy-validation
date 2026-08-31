@@ -14,9 +14,11 @@
             validation.vm_ha: {{ validation.vm_ha | d({}) | to_nice_json }} 
         - The host may become unreachable and/or shut down.
         - VM HA recovery will be triggered and tested.
-        - The affected host is not recovered automatically.
-      
+        - {{ 'The affected host will be recovered automatically after the test (node_power_on_cmd is set).' if (((validation.vm_ha | d({})).node_power_on_cmd | d('')) | length > 0) else 'The affected host is NOT recovered automatically (set validation.vm_ha.node_power_on_cmd to enable that).' }}
+
+      Set validation.vm_ha.auto_confirm: true to skip this prompt on unattended runs.
       Press Enter to continue, or Ctrl+C to abort.
+  when: not (_vm_ha_auto_confirm | bool)
 
 - name: Execute the selected produce error method
   ansible.builtin.include_tasks: vm_ha_produce_error_{{ _produce_error_method }}.yml

@@ -1,6 +1,13 @@
 ---
 #################### TEST CONFIGURATION VARIABLES ####################
-# Zone name
-
+# Zone name (override per inventory with validation.fe_ha.one_zone_name)
 one_zone_name: OpenNebula
 
+# Directories whose file contents are compared across all FE nodes
+# (override per inventory with validation.fe_ha.one_config_path)
+one_config_path:
+  - /etc/one
+
+# Seconds each VIP reachability check waits for <one_vip>:2633
+# (override per inventory with validation.fe_ha.vip_timeout)
+one_vip_timeout: 120

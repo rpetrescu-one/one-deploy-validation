@@ -1,5 +1,20 @@
 ---
 # Generate SSH key pair and expose public key as fact
+- name: "Manifest: register conn-matrix ssh keypair"
+  ansible.builtin.include_role:
+    name: validation_common
+    tasks_from: manifest_add.yml
+  vars:
+    manifest_type: file
+    manifest_id: ""
+    manifest_name: "{{ item }}"
+    manifest_cluster: ""
+    manifest_role: conn_matrix
+    manifest_disposition: created
+  loop:
+    - "{{ ansible_env.HOME }}/.ssh/conn-matrix"
+    - "{{ ansible_env.HOME }}/.ssh/conn-matrix.pub"
+
 - name: Generate SSH key pair for conn-matrix
   ansible.builtin.command: ssh-keygen -t rsa -b 4096 -N "" -f $HOME/.ssh/conn-matrix -q
   args:

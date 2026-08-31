@@ -1,10 +1,29 @@
 ---
 - hosts: all
+  tags: [always]
   vars:
     _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
   roles:
     - role: validation_common
       when: not (_gb_pre | bool)
+
+# Pre-run sweep: clean up the PREVIOUS run's unresolved leftovers (e.g. a
+# leftover err-state image) before any test role gets a chance to run —
+# fixes a catch-22 where such a leftover blocks THIS run's own marketplace
+# export. Primary frontend only, same as the other primary-frontend-gated
+# tasks below.
+- hosts: "{{ frontend_group | d('frontend') }}"
+  tags: [always]
+  vars:
+    _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
+  tasks:
+    - name: Pre-run sweep of previous-run leftovers
+      ansible.builtin.include_role:
+        name: validation_sweep
+        tasks_from: preclean.yml
+      when:
+        - not (_gb_pre | bool)
+        - hostvars[groups[frontend_group | d('frontend')][0]]['ansible_host'] == ansible_host
 
 - hosts: "{{ node_group | d('node') }}"
   vars:
@@ -13,8 +32,10 @@
       {{ (not (_gb_pre | bool))
          and ('baremetal' in ((gpu_benchmark | d({})).llm_backends | d([]))) }}
   tasks:
+    # import_role (static) so the gpu_benchmark tag reaches the role's tasks
+    # (a dynamic include_role would leave `-t gpu_benchmark` running nothing).
     - name: Run bare-metal GPU baseline (pre-deploy phase or live re-measure)
-      ansible.builtin.include_role:
+      ansible.builtin.import_role:
         name: gpu-benchmark
         tasks_from: baremetal/main.yml
       when:
@@ -28,10 +49,12 @@
     _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
   roles:
     - role: test_vm
+      tags: [test_vm]
       when:
         - validation.run_test_vm | d(true)
         - not (_gb_pre | bool)
     - role: storage-benchmark
+      tags: [storage_benchmark]
       when:
         - validation.run_storage_benchmark | d(true)
         - not (_gb_pre | bool)
@@ -47,62 +70,40 @@
         - not (_gb_pre | bool)
       tags:
         - ldap_auth
-    - role: validation_frontend
-      when: not (_gb_pre | bool)
     - role: network_validation
+      tags: [network_validation]
       when:
         - validation.networks_verification | d(true)
         - not (_gb_pre | bool)
 
 # Run connectivity tests between virtual machines
 - hosts: "{{ node_group | d('node') }},{{ frontend_group | d('frontend') }}"
+  tags: [conn_matrix]
   gather_facts: true
   vars:
     _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
   roles:
     - role: conn_matrix
       when:
-        - validation.run_conn_matrix | d(true)
+        - validation.run_conn_matrix | d(false)
         - not (_gb_pre | bool)
 
 # Run network tests on the hypervisor hosts
 - hosts: "{{ node_group | d('node') }}"
+  tags: [network_benchmark]
   vars:
     _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
   roles:
     - role: network-benchmark
       when: not (_gb_pre | bool)
 
-# VM HA Validation
+# Will launch OneFlow Smoke test. Runs BEFORE the core-services checks:
+# those restart oned/opennebula-flow, and on an HA zone restarting the
+# LEADER's oned destabilizes monitoring/flow-server state for minutes —
+# oneflow scheduled right after it fails on transients (observed live:
+# one.document.info errors, DEPLOYING stalls). Flow first, restarts after.
 - hosts: "{{ frontend_group | d('frontend') }}"
-  vars:
-    _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
-  tasks:
-    - name: VM HA Validation
-      include_role:
-        name: vm-ha
-      when:
-        - validation.run_vm_ha | d(false)
-        - not (_gb_pre | bool)
-
-# Cleanup the test VMs
-- hosts: "{{ frontend_group | d('frontend') }}"
-  vars:
-    _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
-  roles:
-    - role: cleanup_test_vm
-      when: not (_gb_pre | bool)
-
-# Will launch validation framework on the frontends
-- hosts: "{{ frontend_group | d('frontend') }}"
-  vars:
-    _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
-  roles:
-    - role: validation
-      when: not (_gb_pre | bool)
-
-# Will launch OneFlow Smoke test
-- hosts: "{{ frontend_group | d('frontend') }}"
+  tags: [one_flow]
   vars:
     _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
   tasks:
@@ -118,8 +119,35 @@
         - debug:
             msg: "Proceeding to the next role"
 
+# Will launch validation framework on the frontends
+- hosts: "{{ frontend_group | d('frontend') }}"
+  tags: [core_services]
+  vars:
+    _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
+  roles:
+    - role: validation
+      when: not (_gb_pre | bool)
+
+# VM HA Validation — destructive (fences a hypervisor): runs AFTER every
+# non-destructive test so a powered-off node cannot fail their checks
+# (observed: the core-services host-cycle check failing on the fenced host).
+- hosts: "{{ frontend_group | d('frontend') }}"
+  vars:
+    _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
+  tasks:
+    # import_role (static) — with a dynamic include_role the tag does NOT
+    # propagate to the role's tasks and `-t vm_ha` silently runs nothing.
+    - name: VM HA Validation
+      tags: [vm_ha]
+      ansible.builtin.import_role:
+        name: vm-ha
+      when:
+        - validation.run_vm_ha | d(false)
+        - not (_gb_pre | bool)
+
 # Run FE HA verification only when variable run_fe_ha is set to true
 - hosts: "{{ frontend_group | d('frontend') }}"
+  tags: [fe_ha]
   vars:
     _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
   roles:
@@ -130,6 +158,7 @@
 
 # Run Federation validation when variable run_federation is set to true
 - hosts: "{{ frontend_group | d('frontend') }}"
+  tags: [federation]
   vars:
     _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
   roles:
@@ -138,7 +167,19 @@
         - validation.run_federation | d(false)
         - not (_gb_pre | bool)
 
+# Final cleanup sweep — always runs, regardless of test flags or failures.
+# Deletes everything the run created (per the manifest + name conventions)
+# and records removed/kept/leftover rows for the report.
+- hosts: "{{ frontend_group | d('frontend') }},{{ node_group | d('node') }}"
+  tags: [always]
+  vars:
+    _gb_pre: "{{ (gpu_benchmark_phase | d((gpu_benchmark | d({})).phase | d('post'), true)) == 'pre' }}"
+  roles:
+    - role: validation_sweep
+      when: not (_gb_pre | bool)
+
 - hosts: localhost
+  tags: [always]
   gather_facts: false
   become: false
   vars:
@@ -240,6 +281,36 @@
         - "'baremetal' in ((gpu_benchmark | d({})).llm_backends | d([]))"
         - hostvars[item].verification_result is defined
 
+    - name: Fold node-host network benchmark verification results into the report
+      # The network-benchmark role records its per-host keys ('Network benchmark ...')
+      # on the NODE hosts; the report only reads frontend facts, so fold them in
+      # (same pattern as the 'GPU baseline' fold above).
+      ansible.builtin.set_fact:
+        report_verification_result: >-
+          {{ (report_verification_result | default({}))
+             | combine(hostvars[item].verification_result | default({}) | dict2items
+                       | selectattr('key', 'search', 'Network benchmark') | items2dict) }}
+        report_verification_comments: >-
+          {{ (report_verification_comments | default({}))
+             | combine(hostvars[item].verification_comments | default({}) | dict2items
+                       | selectattr('key', 'search', 'Network benchmark') | items2dict) }}
+      loop: "{{ groups[node_group | d('node')] }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - hostvars[item].verification_result is defined
+
+    - name: Collect run manifest, sweep results and leftovers from all hosts
+      # Audit-trail aggregation for the 'Execution & Cleanup Summary' section.
+      # Every fact defaults to [] so hosts that registered nothing are no-ops.
+      ansible.builtin.set_fact:
+        report_manifest: "{{ (report_manifest | default([])) + (hostvars[item].odv_manifest | default([])) }}"
+        report_sweep_results: "{{ (report_sweep_results | default([])) + (hostvars[item].odv_sweep_results | default([])) }}"
+        report_leftovers: "{{ (report_leftovers | default([])) + (hostvars[item].odv_leftovers | default([])) }}"
+      loop: "{{ groups['all'] }}"
+      loop_control:
+        label: "{{ item }}"
+
     - name: Collect federation results from all frontend hosts
       # Build a map of frontend -> verification_result for federation checks
       ansible.builtin.set_fact:
@@ -301,8 +372,12 @@
         verification_comments: "{{ report_verification_comments }}"
         network_verification_results: "{{ report_network_verification_results }}"
         conn_results_matrix: "{{ hostvars[report_frontend_host].conn_results_matrix | default({}) }}"
+        report_manifest: "{{ hostvars['localhost'].report_manifest | default([]) }}"
+        report_sweep_results: "{{ hostvars['localhost'].report_sweep_results | default([]) }}"
+        report_leftovers: "{{ hostvars['localhost'].report_leftovers | default([]) }}"
         template_report_architecture: "{{ discovered_report_architecture | default({}) }}"
         template_report_customer: "{{ prompt_report_customer }}"
+        report_run_tags: "{{ ansible_run_tags | d(['all']) }}"
         template_report_document_version: "{{ prompt_report_document_version }}"
         template_report_abstract: "{{ prompt_report_abstract }}"
         template_report_default_abstract: "{{ report_default_abstract }}"
